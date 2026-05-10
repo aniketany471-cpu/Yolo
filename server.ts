@@ -130,6 +130,12 @@ db.exec(`
     violation TEXT
   );
 
+  CREATE TABLE IF NOT EXISTS sudo_users (
+    id TEXT PRIMARY KEY,
+    userId TEXT,
+    createdAt INTEGER
+  );
+
   CREATE TABLE IF NOT EXISTS conversations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chatId TEXT,
@@ -137,6 +143,8 @@ db.exec(`
     content TEXT,
     timestamp INTEGER
   );
+  CREATE INDEX IF NOT EXISTS idx_conv_chat ON conversations(chatId);
+  CREATE INDEX IF NOT EXISTS idx_conv_ts ON conversations(timestamp);
 `);
 
 // Migration for existing databases
@@ -776,6 +784,7 @@ class TaskQueue {
   private queue: (() => Promise<any>)[] = [];
   private activeCount = 0;
   private maxConcurrent = 2;
+  private readonly TASK_TIMEOUT = 120000; // 2 minute safety timeout
 
   constructor(maxConcurrent: number) {
     this.maxConcurrent = maxConcurrent;
@@ -784,10 +793,17 @@ class TaskQueue {
   async add<T>(task: () => Promise<T>): Promise<T> {
     return new Promise((resolve, reject) => {
       this.queue.push(async () => {
+        let timer: any;
+        const timeoutPromise = new Promise((_, rej) => {
+          timer = setTimeout(() => rej(new Error("Task execution timed out")), this.TASK_TIMEOUT);
+        });
+
         try {
-          const result = await task();
-          resolve(result);
+          const result = await Promise.race([task(), timeoutPromise]);
+          clearTimeout(timer);
+          resolve(result as T);
         } catch (e) {
+          clearTimeout(timer);
           reject(e);
         }
       });
@@ -802,6 +818,8 @@ class TaskQueue {
     if (task) {
       try {
         await task();
+      } catch (err) {
+        console.error("[TaskQueue] Task failed:", err);
       } finally {
         this.activeCount--;
         this.process();
@@ -825,10 +843,13 @@ class PermissionManager {
   static getLevel(userId: string, myId: string, config: any): PermissionLevel {
     if (userId === myId) return PermissionLevel.OWNER;
     const admins = (config.adminUsers || "").split(',').map((s: any) => s.trim()).filter(Boolean);
-    const sudos = (config.sudoUsers || "").split(',').map((s: any) => s.trim()).filter(Boolean);
-    
     if (admins.includes(userId)) return PermissionLevel.ADMIN;
-    if (sudos.includes(userId)) return PermissionLevel.SUDO;
+
+    try {
+      const isSudo = db.prepare("SELECT 1 FROM sudo_users WHERE userId = ?").get(userId);
+      if (isSudo) return PermissionLevel.SUDO;
+    } catch(e) {}
+    
     return PermissionLevel.PUBLIC;
   }
 
@@ -968,19 +989,16 @@ async function handleGif(client: TelegramClient, message: any, config: any, stat
 }
 
 async function handleSudoManagement(client: TelegramClient, message: any, myId: string, cmd: string, targetId: string) {
-  const config = db.prepare("SELECT * FROM config WHERE id = 1").get() as any;
-  const sudos = (config.sudoUsers || "").split(',').map((s: any) => s.trim()).filter(Boolean);
-  
   if (cmd === 'add') {
-    if (sudos.includes(targetId)) return client.sendMessage(message.chatId, { message: "✅ User is already a sudo user." });
-    sudos.push(targetId);
-    db.prepare("UPDATE config SET sudoUsers = ? WHERE id = 1").run(sudos.join(','));
+    const exists = db.prepare("SELECT 1 FROM sudo_users WHERE userId = ?").get(targetId);
+    if (exists) return client.sendMessage(message.chatId, { message: "✅ User is already a sudo user." });
+    const id = Math.random().toString(36).substring(2);
+    db.prepare("INSERT INTO sudo_users (id, userId, createdAt) VALUES (?, ?, ?)").run(id, targetId, Date.now());
     await client.sendMessage(message.chatId, { message: `✅ User \`${targetId}\` added to sudoers.` });
   } else {
-    const index = sudos.indexOf(targetId);
-    if (index === -1) return client.sendMessage(message.chatId, { message: "❌ User is not a sudo user." });
-    sudos.splice(index, 1);
-    db.prepare("UPDATE config SET sudoUsers = ? WHERE id = 1").run(sudos.join(','));
+    const exists = db.prepare("SELECT 1 FROM sudo_users WHERE userId = ?").get(targetId);
+    if (!exists) return client.sendMessage(message.chatId, { message: "❌ User is not a sudo user." });
+    db.prepare("DELETE FROM sudo_users WHERE userId = ?").run(targetId);
     await client.sendMessage(message.chatId, { message: `✅ User \`${targetId}\` removed from sudoers.` });
   }
 }
@@ -1024,9 +1042,12 @@ class SmartStatus {
       console.warn("SmartStatus: Client is null, cannot update status.");
       return;
     }
+    if (!text || text.trim() === "") return;
+
     try {
       const chat = await this.getChat();
       const pMode = options.parseMode || 'markdown';
+      
       if (!this.messageId) {
         const msg = await this.client.sendMessage(chat, { 
           message: text,
@@ -1035,10 +1056,17 @@ class SmartStatus {
         });
         this.messageId = msg.id;
       } else {
+        // Only edit if content is different (simple check)
         await this.client.editMessage(chat, { 
           message: this.messageId, 
           text, 
           parseMode: pMode 
+        }).catch(err => {
+          // If edit fails (e.g. message deleted or same content), try sending new
+          if (err.message?.includes('MESSAGE_ID_INVALID') || err.message?.includes('MESSAGE_NOT_MODIFIED')) {
+             return; // Ignore or handle as needed
+          }
+          console.error("SmartStatus Edit Error:", err.message);
         });
       }
     } catch (e) {
@@ -1047,37 +1075,31 @@ class SmartStatus {
   }
 
   async finish(text: string, options: { parseMode?: any, replyTo?: any } = {}) {
-    if (!this.client) {
-      console.warn("SmartStatus: Client is null, cannot finish status.");
-      return;
-    }
+    if (!this.client || !text) return;
     try {
       const chat = await this.getChat();
+      const pMode = options.parseMode || 'markdown';
+      
       if (!this.messageId) {
         const msg = await this.client.sendMessage(chat, { 
           message: text, 
-          parseMode: options.parseMode,
-          replyTo: options.replyTo 
+          parseMode: pMode,
+          replyTo: options.replyTo || this.replyTo || undefined 
         });
         this.messageId = msg.id;
       } else {
         await this.client.editMessage(chat, { 
           message: this.messageId, 
           text, 
-          parseMode: options.parseMode
+          parseMode: pMode
+        }).catch(async () => {
+           // Fallback to send new
+           await this.client?.sendMessage(chat, { message: text, parseMode: pMode, replyTo: options.replyTo || this.replyTo || undefined });
         });
       }
       this.autoDelete = false;
     } catch (e) {
       console.error("SmartStatus Finish Error:", e);
-      try {
-        const chat = await this.getChat();
-        await this.client.sendMessage(chat, { 
-          message: text, 
-          parseMode: options.parseMode,
-          replyTo: options.replyTo 
-        });
-      } catch (e2) {}
     }
   }
 
@@ -1110,9 +1132,282 @@ async function startServer() {
   
   app.use(express.json());
 
-  // === TELEGRAM LOGIC ===
+  // === API ROUTES FIRST (to avoid blocking routes by Telegram logic) ===
+  app.get("/api/state", (req, res) => {
+    try {
+      const messages = db.prepare("SELECT * FROM messages ORDER BY createdAt DESC LIMIT 50").all();
+      const targets = db.prepare("SELECT * FROM targets").all();
+      const config = db.prepare("SELECT * FROM config WHERE id = 1").get() as any;
+      const logs = db.prepare("SELECT * FROM logs ORDER BY timestamp DESC LIMIT 100").all();
+      const sudoUsers = db.prepare("SELECT * FROM sudo_users").all();
+      
+      const payload = {
+         messages,
+         targets,
+         config,
+         logs,
+         sudoUsers,
+         isRunning: getIsRunning(),
+         diagnostics: {
+           isListenerActive,
+           lastEventTimestamp,
+           clientReady: !!client,
+           aiConfigured: !!(config?.geminiKey || config?.groqKey || config?.openRouterKey || process.env.GEMINI_API_KEY)
+         }
+      };
+      res.json(payload);
+    } catch(e) {
+      console.error(`[ERR] /api/state:`, e);
+      res.status(500).json({ status: "error", error: String(e) });
+    }
+  });
+
+  app.post("/api/action", (req, res) => {
+    const { action } = req.body;
+    try {
+      if (action === "start") startAutomationLoop();
+      else if (action === "stop") setIsRunning(false);
+      res.json({ success: true, isRunning: getIsRunning() });
+    } catch (e) {
+      res.status(500).json({ error: String(e) });
+    }
+  });
+
+  app.post("/api/messages", (req, res) => {
+    const { text } = req.body;
+    if (!text) return res.status(400).json({ error: "Missing text" });
+    const id = Math.random().toString(36).substring(2);
+    db.prepare("INSERT INTO messages (id, text, createdAt) VALUES (?, ?, ?)").run(id, text, Date.now());
+    res.json({ success: true, id });
+  });
+
+  app.delete("/api/messages/:id", (req, res) => {
+    db.prepare("DELETE FROM messages WHERE id = ?").run(req.params.id);
+    res.json({ success: true });
+  });
+
+  app.post("/api/targets", (req, res) => {
+    const { name, type } = req.body;
+    if (!name) return res.status(400).json({ error: "Missing name" });
+    const id = Math.random().toString(36).substring(2);
+    db.prepare("INSERT INTO targets (id, name, type) VALUES (?, ?, ?)").run(id, name, type || 'group');
+    res.json({ success: true, id });
+  });
+
+  app.delete("/api/targets/:id", (req, res) => {
+    db.prepare("DELETE FROM targets WHERE id = ?").run(req.params.id);
+    res.json({ success: true });
+  });
+
+  app.post("/api/config", async (req, res) => {
+    const updates = req.body;
+    const allowed = [
+      'minDelaySeconds', 'maxDelaySeconds', 'adminUsers', 'aiEnabled', 'aiProvider', 
+      'geminiKey', 'groqKey', 'openRouterKey', 'bluesmindsApiKey', 'autoDeleteCommands', 
+      'autoDeleteDelay', 'autoReplyDM', 'autoReplyMention', 'typingSimulation', 
+      'conversationMemory', 'autoReplyDelayMin', 'autoReplyDelayMax', 'nsfwEnabled', 
+      'searchEnabled', 'searchProvider', 'searchApiKey', 'aiMode', 'formattingEnabled',
+      'autoReplyPersonality', 'nsfwPersonality', 'activeModel', 'deepThinking'
+    ];
+    
+    for (const key of Object.keys(updates)) {
+      if (allowed.includes(key)) {
+        db.prepare(`UPDATE config SET ${key} = ? WHERE id = 1`).run(updates[key]);
+      }
+    }
+    
+    // Check if we need to reload Telegram Session
+    if (updates.telegramStringSession || updates.telegramApiId || updates.telegramApiHash) {
+       // Trigger async reload
+       loadTelethon();
+    }
+    
+    res.json({ success: true });
+  });
+
+  app.get("/api/nsfw/data", (req, res) => {
+    const users = db.prepare("SELECT * FROM user_nsfw_prefs").all();
+    const logs = db.prepare("SELECT * FROM nsfw_logs ORDER BY timestamp DESC LIMIT 100").all();
+    res.json({ users, logs });
+  });
+
+  app.post("/api/nsfw/users/:userId/toggle", (req, res) => {
+    const { userId } = req.params;
+    const { enabled } = req.body;
+    db.prepare("INSERT OR REPLACE INTO user_nsfw_prefs (userId, nsfwEnabled, ageConfirmed, updatedAt) VALUES (?, ?, 1, ?)")
+      .run(userId, enabled ? 1 : 0, Date.now());
+    res.json({ success: true });
+  });
+
+  app.delete("/api/nsfw/logs", (req, res) => {
+    db.prepare("DELETE FROM nsfw_logs").run();
+    res.json({ success: true });
+  });
+
+  app.delete("/api/logs", (req, res) => {
+    db.prepare("DELETE FROM logs").run();
+    res.json({ success: true });
+  });
+
+  app.get("/api/exports", (req, res) => {
+    const list = db.prepare("SELECT * FROM exports ORDER BY createdAt DESC").all();
+    res.json(list);
+  });
+
+  app.delete("/api/exports/:id", (req, res) => {
+    const exp = db.prepare("SELECT filename FROM exports WHERE id = ?").get() as any;
+    if (exp) {
+      const type = db.prepare("SELECT type FROM exports WHERE id = ?").get() as any;
+      const dir = type?.type === 'music' ? musicDir : exportsDir;
+      fs.remove(path.join(dir, exp.filename)).catch(() => {});
+    }
+    db.prepare("DELETE FROM exports WHERE id = ?").run(req.params.id);
+    res.json({ success: true });
+  });
+
+  app.get("/api/exports/download/:id", (req, res) => {
+    const exp = db.prepare("SELECT * FROM exports WHERE id = ?").get() as any;
+    if (!exp) return res.status(404).send("File not found");
+    const dir = exp.type === 'music' ? musicDir : exportsDir;
+    res.download(path.join(dir, exp.filename));
+  });
+
+  app.post("/api/exports/pdf-images", upload.array('images', 20), async (req, res) => {
+    const files = req.files as Express.Multer.File[];
+    if (!files || files.length === 0) return res.status(400).json({ error: "No images uploaded" });
+
+    const id = Math.random().toString(36).substring(2);
+    const filename = `images_converted_${id}.pdf`;
+    const filepath = path.join(exportsDir, filename);
+
+    await taskQueue.add(async () => {
+      const doc = new PDFDocument({ autoFirstPage: false });
+      const stream = fs.createWriteStream(filepath);
+      doc.pipe(stream);
+
+      for (const file of files) {
+        try {
+          const img = await sharp(file.path).toBuffer();
+          const imgObj = await sharp(img).metadata();
+          doc.addPage({ size: [imgObj.width || 595, imgObj.height || 842] });
+          doc.image(img, 0, 0, { width: imgObj.width, height: imgObj.height });
+          await fs.remove(file.path);
+        } catch (e) {
+          console.error("PDF Image add error:", e);
+        }
+      }
+      doc.end();
+      await new Promise<void>((resolve, reject) => {
+        stream.on("finish", resolve);
+        stream.on("error", reject);
+      });
+
+      db.prepare("INSERT INTO exports (id, filename, filepath, createdAt, type, status) VALUES (?, ?, ?, ?, ?, ?)")
+        .run(id, filename, filepath, Date.now(), 'image-to-pdf', 'success');
+      
+      addLog(`Converted ${files.length} images to PDF: ${filename}`, "success");
+    });
+
+    res.json({ success: true, id, filename });
+  });
+
+  app.post("/api/music/download", async (req, res) => {
+    const { query } = req.body;
+    if (!query) return res.status(400).json({ error: "No query provided" });
+    try {
+      const searchString = query.toLowerCase().includes('audio') || query.toLowerCase().includes('lyric') ? query : query + ' audio';
+      const r = await yts(searchString);
+      const video = r.videos.find(v => !v.title.toLowerCase().includes('music video') && !v.title.toLowerCase().includes('official video')) || r.videos[0];
+      if (!video) return res.status(404).json({ error: "No results found" });
+
+      const id = Math.random().toString(36).substring(2);
+      const filename = `music_${id}.mp3`;
+      const filepath = path.join(musicDir, filename);
+
+      taskQueue.add(async () => {
+        try {
+          await downloadYoutube(video.url, filepath);
+          db.prepare("INSERT INTO exports (id, filename, filepath, createdAt, type, status) VALUES (?, ?, ?, ?, ?, ?)")
+            .run(id, filename, filepath, Date.now(), 'music', 'success');
+          addLog(`Downloaded music via dashboard: ${video.title}`, "success");
+
+          if (client) {
+              const defaultTarget = db.prepare("SELECT name FROM targets LIMIT 1").get() as any;
+              if (defaultTarget) {
+                 try {
+                    await client.sendMessage(defaultTarget.name, { 
+                      message: `🎵 **${video.title}**\n👤 ${video.author.name}`, 
+                      file: filepath,
+                      attributes: [new Api.DocumentAttributeAudio({ title: video.title, performer: video.author.name, duration: video.duration.seconds, voice: false })]
+                    });
+                 } catch (e) {}
+              }
+          }
+        } catch (err) {
+          console.error("Music download task error:", err);
+        }
+      });
+
+      res.json({ success: true, id, filename, title: video.title, author: video.author.name, thumbnail: video.image });
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ error: String(e) });
+    }
+  });
+
+  app.post("/api/sudo-users", (req, res) => {
+    const { userId } = req.body;
+    if (!userId) return res.status(400).json({ error: "Missing userId" });
+    const id = Math.random().toString(36).substring(2);
+    db.prepare("INSERT INTO sudo_users (id, userId, createdAt) VALUES (?, ?, ?)").run(id, userId, Date.now());
+    res.json({ success: true, id });
+  });
+
+  app.delete("/api/sudo-users/:id", (req, res) => {
+    db.prepare("DELETE FROM sudo_users WHERE id = ?").run(req.params.id);
+    res.json({ success: true });
+  });
+
+  app.get("/api/youtubedl/check", async (req, res) => {
+    try {
+       const result = await youtubedl('--version');
+       res.json({ version: result });
+    } catch (e) {
+       res.status(500).json({ error: "yt-dlp binary not found or not working." });
+    }
+  });
+
+  // API 404 handler - ensures API errors return JSON, not the SPA fallback HTML
+  app.use("/api/*", (req, res) => {
+    res.status(404).json({ error: `API route ${req.originalUrl} not found` });
+  });
+
+  // Vite middleware for development
+  if (process.env.NODE_ENV !== "production") {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(__dirname, 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  }
+
+  // === LISTEN EARLY (to prevent "Failed to fetch" connection errors) ===
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+    console.log(`AI Configuration Check:`);
+    console.log(`- GEMINI_API_KEY: ${process.env.GEMINI_API_KEY ? 'Present' : 'MISSING'}`);
+  });
+
+  // === TELEGRAM LOGIC (Run in background) ===
   let client: TelegramClient | null = null;
   let runningLoop = false;
+  let isConnecting = false;
   
   const getIsRunning = () => {
     const row = db.prepare("SELECT isRunning FROM config WHERE id = 1").get() as any;
@@ -1354,7 +1649,7 @@ async function startServer() {
       }
       
       doc.end();
-      await new Promise((res) => stream.on('finish', res));
+      await new Promise<void>((resolve) => stream.on('finish', () => resolve()));
 
       await status.update(`📤 Uploading PDF...`);
       await client.sendMessage(message.chatId, { file: filepath, replyTo: message.id });
@@ -1587,25 +1882,30 @@ async function maybeHandleAutoReply(client: TelegramClient, message: any, config
         const textRaw = (message.message || "").trim();
         const text = textRaw.toLowerCase();
         const senderId = message.senderId?.toString();
+        const chatIdStr = message.chatId?.toString();
+        const isMe = message.out || (myId && senderId === myId);
         
         let config = db.prepare("SELECT * FROM config WHERE id = 1").get() as any;
         const admins = config?.adminUsers ? config.adminUsers.split(',').map((s: string) => s.trim()) : [];
-        const isMe = message.out || (myId && senderId === myId);
-        const isAuthorized = isMe || (senderId && admins.includes(senderId));
+        // Use PermissionManager for robust checks
+        const auth = await PermissionManager.check(text, senderId || "", chatIdStr || "", myId);
 
-        console.log(`[BOT] Incoming: "${textRaw.substring(0, 30)}" from ${senderId}, isMe: ${isMe}, isAuth: ${isAuthorized}`);
+        console.log(`[BOT] Incoming: "${textRaw.substring(0, 30)}" from ${senderId}, Level: ${auth.level}, Allowed: ${auth.allowed}`);
         
+        // 1. Universal / Diagnostics
         if (text === '/aitest' || text === '.aitest' || text === '/ping' || text === '.ping' || text === '/debug' || text === '.debug') {
-          console.log(`[BOT] Diagnostic command triggered: ${text} from ${senderId}`);
-          addLog(`Diagnostic: ${text} from ${senderId}`, "info");
+          if (isMe || auth.level >= PermissionLevel.SUDO) {
+             console.log(`[BOT] Diagnostic command triggered: ${text} from ${senderId}`);
+             addLog(`Diagnostic: ${text} from ${senderId}`, "info");
+          }
         }
 
-        // Handler for all messages regarding Auto-Reply (even for admins)
+        // 2. Auto-Reply Logic
         if (!isMe) {
           await maybeHandleAutoReply(client, message, config, myId, myUsername);
         }
 
-        // === NSFW MODE COMMANDS (Any user in private chat) ===
+        // 3. NSFW MODE
         if (config.nsfwEnabled === 1 && message.isPrivate && !isMe) {
           if (text === '/nsfw on' || text === '.nsfw on') {
             const userPref = db.prepare("SELECT * FROM user_nsfw_prefs WHERE userId = ?").get(senderId) as any;
@@ -1638,6 +1938,7 @@ async function maybeHandleAutoReply(client: TelegramClient, message: any, config
           }
         }
 
+        // 4. Basic Diagnostic (Public)
         if (text === '/ping' || text === '.ping') {
            await client?.sendMessage(message.chatId, { message: '🏓 **Pong!** Bot is alive.', replyTo: message.id });
            return;
@@ -1647,98 +1948,140 @@ async function maybeHandleAutoReply(client: TelegramClient, message: any, config
            const debugInfo = `🔍 **Bot Debug Info**
 - **Listener:** ${isListenerActive ? '✅ Active' : '❌ Inactive'}
 - **AI Enabled:** ${config.aiEnabled === 1 ? '✅ Yes' : '❌ No'}
-- **Provider:** ${config.aiProvider} (${config.aiProvider === 'gemini' ? 'gemini-3-flash-preview' : config.aiProvider === 'groq' ? 'llama3-8b' : 'gemini-2.0-flash'})
+- **Provider:** ${config.aiProvider}
 - **My ID:** ${myId}
-- **Is Admin:** ${isAuthorized ? '✅ Yes' : '❌ No'}
-- **Your ID:** ${senderId}
+- **Your Level:** ${auth.level}
 - **Uptime:** ${Math.floor(process.uptime() / 60)}m`;
            await client?.sendMessage(message.chatId, { message: debugInfo, replyTo: message.id });
            return;
         }
 
-        if (!isAuthorized) {
+        // 5. PUBLIC COMMANDS CHECK
+        const cmdName = text.replace('/', '').replace('.', '').split(' ')[0];
+        const isPublicCommand = ['ans', 'music', 'song', 'gif', 'sticker', 'pdf', 'summarize', 'translate', 'help', 'commands'].includes(cmdName);
+
+        if (isPublicCommand) {
+          if (!auth.allowed && !isMe) {
+            if (auth.reason) await client.sendMessage(message.chatId, { message: auth.reason, replyTo: message.id });
+            return;
+          }
+          
+          // Anti-Spam (Public Users only)
+          if (!isMe && auth.level === PermissionLevel.PUBLIC && senderId) {
+            const now = Date.now();
+            const lastUsed = userCooldowns.get(senderId) || 0;
+            const cooldown = (config.perUserCooldown || 10) * 1000;
+            if (now - lastUsed < cooldown) {
+                const remain = Math.ceil((cooldown - (now - lastUsed)) / 1000);
+                await client.sendMessage(message.chatId, { message: `⏳ **Cooldown:** Please wait ${remain}s.`, replyTo: message.id });
+                return;
+            }
+            userCooldowns.set(senderId, now);
+          }
+
+          if (text === '/commands' || text === '.commands' || text === '/help' || text === '.help') {
+            await CommandProcessor.process(client, message, config, myId, 'help', textRaw, async (status) => {
+              const helpMsg = `🤖 **Bot Commands**
+
+**Public Commands** 👤
+• \`/ans\` - Reply to get AI answer
+• \`/music\` - Search & download song
+• \`/gif <query>\` - Search & send GIF
+• \`/sticker\` - Reply to photo for sticker
+• \`/pdf\` - Reply to text for PDF
+• \`/summarize\` - Reply to chat history
+• \`/translate <lang>\` - Translate text
+
+**Admin Commands** 🔐
+• \`/startbot\` - Resume automation
+• \`/stopbot\` - Pause automation
+• \`/sudoadd <id>\` - Add sudo user
+• \`/sudoremove <id>\` - Remove sudo user
+• \`/model <name>\` - Change AI model
+• \`/exportchat <n>\` - Export chat logs
+
+_Visit the dashboard for advanced configuration._`;
+              await status.finish(helpMsg);
+            });
+            return;
+          }
+
+          if (text.startsWith('/ans') || text.startsWith('.ans')) {
+            await CommandProcessor.process(client, message, config, myId, 'ans', textRaw, async (status) => {
+              if (!message.replyToMsgId) return status.fail('Reply to a message with /ans');
+              const repl = await client!.getMessages(message.chatId, { ids: [message.replyToMsgId] });
+              const promptText = (repl[0]?.message || "").trim();
+              if (!promptText) return status.fail('No text content in replied message.');
+              await status.update(`🧠 Thinking...`);
+              await taskQueue.add(async () => {
+                const aiRes = await getAIResponse(promptText, config, message.chatId?.toString(), senderId);
+                if (aiRes) {
+                  const formatted = formatAiMessage(aiRes);
+                  await status.finish(formatted.text, { parseMode: formatted.parseMode, replyTo: repl[0].id });
+                } else {
+                  await status.fail('AI failed to respond.');
+                }
+              });
+            });
+            return;
+          }
+
+          if (text.startsWith('/music ') || text.startsWith('.music ') || text.startsWith('/song ') || text.startsWith('.song ')) {
+            await CommandProcessor.process(client, message, config, myId, 'music', textRaw, async (status) => {
+              await handleMusicCommand(message, textRaw, status);
+            });
+            return;
+          }
+
+          if (text.startsWith('/gif ') || text.startsWith('.gif ')) {
+            await CommandProcessor.process(client, message, config, myId, 'gif', textRaw, async (status) => {
+              const query = textRaw.split(/\s+/).slice(1).join(' ');
+              await handleGif(client!, message, config, status, query);
+            });
+            return;
+          }
+
+          if (text === '/sticker' || text === '.sticker') {
+            await CommandProcessor.process(client, message, config, myId, 'sticker', textRaw, async (status) => {
+              await handleStickerCommand(client!, message, status);
+            });
+            return;
+          }
+
+          if (text === '/pdf' || text === '.pdf') {
+            await CommandProcessor.process(client, message, config, myId, 'pdf', textRaw, async (status) => {
+              await handlePdfCommand(client!, message, status);
+            });
+            return;
+          }
+
+          if (text.startsWith('/summarize') || text.startsWith('.summarize')) {
+            await CommandProcessor.process(client, message, config, myId, 'summarize', textRaw, async (status) => {
+               await handleSummarize(client!, message, config, status);
+            });
+            return;
+          }
+
+          if (text.startsWith('/translate') || text.startsWith('.translate')) {
+            await CommandProcessor.process(client, message, config, myId, 'translate', textRaw, async (status) => {
+               const args = textRaw.split(/\s+/).slice(1).join(' ');
+               await handleTranslate(client!, message, config, status, args);
+            });
+            return;
+          }
+        }
+
+        // 6. PROTECTED / ADMIN COMMANDS
+        if (!auth.allowed && !isMe) {
           if (text.startsWith('/') || text.startsWith('.')) {
-             console.log(`[BOT] Ignored unauthorized command from ${senderId}`);
-             addLog(`Ignored unauthorized command "${text.substring(0, 20)}" from ${senderId}`, "warn");
+             console.log(`[BOT] Blocked protected command "${cmdName}" from ${senderId}`);
           }
           return;
         }
 
-        // === PUBLIC / SHARED COMMANDS ===
-        if (text.startsWith('/ans') || text.startsWith('.ans')) {
-          await CommandProcessor.process(client, message, config, myId, 'ans', textRaw, async (status) => {
-            if (!message.replyToMsgId) return status.fail('Reply to a message with /ans');
-            const repl = await client!.getMessages(message.chatId, { ids: [message.replyToMsgId] });
-            const promptText = (repl[0]?.message || "").trim();
-            if (!promptText) return status.fail('No text content in replied message.');
-            await status.update(`🧠 Thinking...`);
-            await taskQueue.add(async () => {
-              const aiRes = await getAIResponse(promptText, config, message.chatId?.toString(), senderId);
-              if (aiRes) {
-                const formatted = formatAiMessage(aiRes);
-                await status.finish(formatted.text, { parseMode: formatted.parseMode, replyTo: repl[0].id });
-              } else {
-                await status.fail('AI failed to respond.');
-              }
-            });
-          });
-          return;
-        }
-
-        if (text.startsWith('/music ') || text.startsWith('.music ') || text.startsWith('/song ') || text.startsWith('.song ')) {
-          await CommandProcessor.process(client, message, config, myId, 'music', textRaw, async (status) => {
-            await handleMusicCommand(message, textRaw, status);
-          });
-          return;
-        }
-
-        if (text.startsWith('/gif ') || text.startsWith('.gif ')) {
-          await CommandProcessor.process(client, message, config, myId, 'gif', textRaw, async (status) => {
-            const query = textRaw.split(/\s+/).slice(1).join(' ');
-            await handleGif(client!, message, config, status, query);
-          });
-          return;
-        }
-
-        if (text === '/stcr' || text === '.stcr' || text === '/sticker') {
-          await CommandProcessor.process(client, message, config, myId, 'sticker', textRaw, async (status) => {
-            // Re-use current sticker logic but wrapped
-            await handleStickerCommand(client!, message, status);
-          });
-          return;
-        }
-
-        if (text === '/pdf' || text === '.pdf') {
-          await CommandProcessor.process(client, message, config, myId, 'pdf', textRaw, async (status) => {
-            await handlePdfCommand(client!, message, status);
-          });
-          return;
-        }
-
-        if (text.startsWith('/summarize') || text.startsWith('.summarize')) {
-          await CommandProcessor.process(client, message, config, myId, 'summarize', textRaw, async (status) => {
-             await handleSummarize(client!, message, config, status);
-          });
-          return;
-        }
-
-        if (text.startsWith('/translate') || text.startsWith('.translate')) {
-          await CommandProcessor.process(client, message, config, myId, 'translate', textRaw, async (status) => {
-             const args = textRaw.split(/\s+/).slice(1).join(' ');
-             await handleTranslate(client!, message, config, status, args);
-          });
-          return;
-        }
-
-        // === ADMIN / OWNER COMMANDS ===
-        const authCheck = await PermissionManager.check(text, senderId, message.chatId?.toString(), myId);
-        if (!authCheck.allowed && (text.startsWith('/') || text.startsWith('.'))) {
-          // Special cases already handled? No, most admin stuff is below.
-        }
-
         if (text === '/startbot' || text === '.startbot') {
-          if (authCheck.level < PermissionLevel.ADMIN) return;
           await CommandProcessor.process(client, message, config, myId, 'startbot', textRaw, async (status) => {
+            setIsRunning(true);
             startAutomationLoop();
             await status.finish("✅ Bot automation started.");
           });
@@ -1746,7 +2089,6 @@ async function maybeHandleAutoReply(client: TelegramClient, message: any, config
         }
 
         if (text === '/stopbot' || text === '.stopbot') {
-            if (authCheck.level < PermissionLevel.ADMIN) return;
             await CommandProcessor.process(client, message, config, myId, 'stopbot', textRaw, async (status) => {
               setIsRunning(false);
               await status.finish("🛑 Bot automation stopped.");
@@ -1755,289 +2097,164 @@ async function maybeHandleAutoReply(client: TelegramClient, message: any, config
         }
 
         if (text.startsWith('/sudoadd ')) {
-          if (authCheck.level < PermissionLevel.OWNER) return;
           const target = textRaw.split(/\s+/)[1]?.trim();
           if (target) await handleSudoManagement(client!, message, myId, 'add', target);
           return;
         }
 
         if (text.startsWith('/sudoremove ')) {
-          if (authCheck.level < PermissionLevel.OWNER) return;
           const target = textRaw.split(/\s+/)[1]?.trim();
           if (target) await handleSudoManagement(client!, message, myId, 'remove', target);
           return;
         }
 
-        // Anti-Spam Check
-        if (!isMe && senderId) {
-          const now = Date.now();
-          const lastUsed = userCooldowns.get(senderId) || 0;
-          const userCooldown = (config.perUserCooldown || 10) * 1000;
-          if (now - lastUsed < userCooldown) return;
-          userCooldowns.set(senderId, now);
-        }
-
-        // Global Command Cooldown
-        if (text.startsWith('/') || text.startsWith('.')) {
-          const now = Date.now();
-          const cmd = text.split(' ')[0];
-          const lastUsed = commandCooldowns.get(cmd) || 0;
-          const globalCooldown = (config.globalCooldown || 3) * 1000;
-          if (now - lastUsed < globalCooldown) return;
-          commandCooldowns.set(cmd, now);
-        }
-
-        if (text === '/commands' || text === '.commands' || text === '/help' || text === '.help') {
-          await maybeDeleteCommand(client, message, config);
-          const helpMsg = `🤖 **Userbot Commands**
-
-**Automation**
-• \`/startsend\` - Start broadcasting
-• \`/stopsend\` - Stop broadcasting
-• \`/addmsg <text>\` - Add msg to pool
-• \`/addtarget <target>\` - Add target chat
-
-**AI & Smart**
-• \`/ans\` - Reply to a message for AI answer
-• \`/img <prompt>\` - Generate AI image (Flux) 🎨
-• \`/stcr\` - Reply to message/photo for sticker
-• \`/aitest\` - Test AI availability & event system
-• \`/model <name>\` - Set active BluesMinds model
-• \`/models\` - List available BluesMinds models
-• \`/setmodel\` - Alias for /model
-
-**PDF & Tools**
-• \`/exportchat <limit>\` - Export chat to PDF
-• \`/pdf\` - Reply to text to make PDF
-• \`/photo2pdf\` - Reply to photo to convert to PDF
-
-**General**
-• \`/commands\` - Show this list
-`;
-          await client?.sendMessage(message.chatId, { message: helpMsg });
-        } else if (text.startsWith('/img ') || text.startsWith('.img ')) {
-          await maybeDeleteCommand(client, message, config);
-          const prompt = text.substring(5).trim();
-          if (!prompt) {
-             await client?.sendMessage(message.chatId, { message: "❌ **Usage:** `/img <vivid description>`", replyTo: message.id });
-             return;
-          }
-
-          const status = new SmartStatus(client, message.chatId);
-          await status.update("🎨 **Generating your image...** (Flux)");
-
-          try {
-            if (!config.bluesmindsApiKey) {
-              await status.fail("❌ **API Key Missing:** BluesMinds key is required for image generation.");
-              return;
+        if (text.startsWith('/model ') || text.startsWith('.model ') || text.startsWith('/setmodel ') || text.startsWith('.setmodel ')) {
+            const parts = textRaw.split(/\s+/);
+            const modelName = parts[1]?.trim();
+            if (!modelName) {
+                await client.sendMessage(message.chatId, { message: "❌ **Usage:** `/model <model-name>`", replyTo: message.id });
+                return;
             }
-
-            const imageUrl = await generateImage(prompt, config.bluesmindsApiKey);
-            if (imageUrl) {
-              await status.update("📤 **Sending image...**");
-              await client?.sendMessage(message.chatId, {
-                file: imageUrl,
-                message: `✨ **Generated Image**\n\nPrompt: _${prompt}_`,
-                replyTo: message.id
-              });
-              await status.finish("✅ **Image Generated Successfully!**");
-            } else {
-              await status.fail("❌ **Generation Failed:** The AI could not create this image. Try a different prompt.");
-            }
-          } catch (e: any) {
-             console.error("[BOT] Image Gen Error:", e);
-             await status.fail(`❌ **Error:** ${e.message || "Failed to generate image"}`);
-          }
-        } else if (text === '/aitest' || text === '.aitest') {
-          await maybeDeleteCommand(client, message, config);
-          const status = new SmartStatus(client, message.chatId);
-          if (client) await status.update(`🧪 Running diagnostic tests...`);
-          
-          try {
-            await status.update(`🔍 Checking AI configuration...`);
-            const aiRes = await getAIResponse("Say 'AI is working' if you can read this.", config, message.chatId?.toString());
-            
-            if (aiRes) {
-              await status.finish(`✅ **Diagnostic Success**
-- Telegram Listener: **ACTIVE**
-- AI Engine: **WORKING**
-- Provider: **${config.aiProvider}**
-- Output: _"${aiRes}"_`, { parseMode: 'markdown' });
-            } else {
-              await status.fail(`❌ AI Engine failed to return a response. Check API keys and Provider selection in dashboard.`);
-            }
-          } catch (e: any) {
-            console.error("[BOT] Aitest Error:", e);
-            await status.fail(`❌ Diagnostic failed: ${e.message}`);
-          }
-        } else if (text.startsWith('/model ') || text.startsWith('.model ') || text.startsWith('/setmodel ') || text.startsWith('.setmodel ')) {
-          await maybeDeleteCommand(client, message, config);
-          const newModel = text.split(' ')[1]?.trim();
-          if (!newModel) {
-            await client?.sendMessage(message.chatId, { message: "❌ **Usage:** `/model <model_id>`" });
+            db.prepare("UPDATE config SET activeModel = ? WHERE id = 1").run(modelName);
+            await client.sendMessage(message.chatId, { message: `✅ **Model set to:** \`${modelName}\``, replyTo: message.id });
             return;
-          }
-          
-          db.prepare("UPDATE config SET activeModel = ?, aiProvider = 'bluesminds' WHERE id = 1").run(newModel);
-          // Refresh local config
-          config = db.prepare("SELECT * FROM config WHERE id = 1").get();
-          
-          await client?.sendMessage(message.chatId, { 
-            message: `✅ **Model Updated**\n\nActive Model: \`${newModel}\`\nProvider: **BluesMinds**`,
-            parseMode: 'markdown'
-          });
-        } else if (text === '/models' || text === '.models') {
-          await maybeDeleteCommand(client, message, config);
-          const status = new SmartStatus(client, message.chatId);
-          await status.update("📡 **Fetching models from BluesMinds...**");
-          
-          try {
-            if (!config.bluesmindsApiKey) {
-              await status.fail("❌ **BluesMinds API Key** is not set in settings.");
-              return;
-            }
-            
-            const response = await fetch("https://api.bluesminds.com/v1/models", {
-              headers: { "Authorization": `Bearer ${config.bluesmindsApiKey}` }
-            });
-            
-            if (response.ok) {
-              const data = await response.json();
-              const models = data.data?.map((m: any) => `• \`${m.id}\``).join('\n') || "No models found.";
-              await status.finish(`🤖 **Available Models**\n\n${models}`, { parseMode: 'markdown' });
-            } else {
-              // Fallback to common models if listing fails
-              const fallbackModels = [
-                "• \`gemini-1.5-pro\`",
-                "• \`gemini-2.0-flash-exp\`",
-                "• \`deepseek-chat\`",
-                "• \`gpt-4o\`",
-                "• \`claude-3-5-sonnet\`"
-              ].join('\n');
-              await status.finish(`🤖 **Common Models** (Listing failed)\n\n${fallbackModels}\n\n_Manual input suggested: \`/model <name>\`_`, { parseMode: 'markdown' });
-            }
-          } catch (e) {
-            await status.fail("❌ Failed to fetch models. Check network or API key.");
-          }
-        } else if (text === '/startsend' || text === '.startsend') {
-          await maybeDeleteCommand(client, message, config);
-          startAutomationLoop();
-          await client?.sendMessage(message.chatId, { message: '✅ Automation loop started.' });
-        } else if (text === '/stopsend' || text === '.stopsend') {
-          await maybeDeleteCommand(client, message, config);
-          setIsRunning(false);
-          await client?.sendMessage(message.chatId, { message: '🛑 Automation loop stopped.' });
-        } else if (text.startsWith('/addmsg ') || text.startsWith('.addmsg ')) {
-          await maybeDeleteCommand(client, message, config);
-          const newMsg = text.substring(8);
-          const id = Math.random().toString(36).substring(2);
-          db.prepare("INSERT INTO messages (id, text, createdAt) VALUES (?, ?, ?)").run(id, newMsg, Date.now());
-          await client?.sendMessage(message.chatId, { message: '✅ Message added to database.' });
-        } else if (text.startsWith('/addtarget ') || text.startsWith('.addtarget ')) {
-          await maybeDeleteCommand(client, message, config);
-          const targetName = text.substring(11).trim();
-          const id = Math.random().toString(36).substring(2);
-          db.prepare("INSERT INTO targets (id, name, type) VALUES (?, ?, ?)").run(id, targetName, 'group'); // Default to group
-          await client?.sendMessage(message.chatId, { message: `✅ Target ${targetName} added.` });
-        } else if (text.startsWith('/exportchat')) {
-          await maybeDeleteCommand(client, message, config);
-          const parts = text.split(' ');
-          const limit = parseInt(parts[1]) || 50;
-          const status = new SmartStatus(client, message.chatId);
-          if (client) await status.update(`⏳ Exporting ${limit} messages...`);
-          
-          try {
-            const history = await client?.getMessages(message.chatId, { limit });
-            if (history && history.length > 0) {
-              await status.update(`⏳ Waiting in queue...`);
-              
-              await taskQueue.add(async () => {
-                await status.update(`⚙️ Generating PDF...`);
-                const doc = new PDFDocument();
-                const id = Math.random().toString(36).substring(2);
-                const filename = `chat_export_${id}.pdf`;
-                const filepath = path.join(exportsDir, filename);
-                const stream = fs.createWriteStream(filepath);
-                doc.pipe(stream);
-                
-                doc.fontSize(16).text(`Export for Chat ${message.chatId}`, { underline: true });
-                doc.moveDown();
-                
-                const sortedHistory = [...history].reverse();
-                for (const msg of sortedHistory) {
-                  if (msg.message) {
-                    const date = new Date(msg.date * 1000).toLocaleString();
-                    const sender = msg.senderId ? msg.senderId.toString() : 'Unknown';
-                    doc.fontSize(10).fillColor('gray').text(`[${date}] ${sender}:`);
-                    doc.fontSize(12).fillColor('black').text(msg.message);
-                    doc.moveDown(0.5);
-                  }
-                }
-                doc.end();
-                
-                await new Promise<void>((resolve, reject) => {
-                  stream.on("finish", resolve);
-                  stream.on("error", reject);
-                });
+        }
 
-                db.prepare("INSERT INTO exports (id, filename, filepath, createdAt, type, status) VALUES (?, ?, ?, ?, ?, ?)")
-                  .run(id, filename, filepath, Date.now(), 'chat-export', 'success');
-                
-                await status.update(`📤 Uploading PDF...`);
-                await client?.sendMessage(message.chatId, { message: '✅ Chat export complete!', file: filepath });
-                await status.done(null, 0);
-                addLog(`Exported ${sortedHistory.length} messages to ${filename}`, "success");
-              });
-            } else {
-              await status.fail('No messages found to export.');
-            }
-          } catch(err) {
-             await status.fail(`Export failed: ${String(err)}`);
-             addLog(`Chat export failed: ${String(err)}`, "error");
-          }
-        } else if (text === '/pdf' || text === '.pdf') {
-          await maybeDeleteCommand(client, message, config);
-          if (message.replyToMsgId) {
-            const status = new SmartStatus(client, message.chatId);
-            if (client) await status.update(`⏳ Processing message...`);
+        if (text === '/models' || text === '.models') {
+            await CommandProcessor.process(client, message, config, myId, 'models', textRaw, async (status) => {
+                await status.update("📡 **Fetching models...**");
+                try {
+                    const response = await fetch("https://api.bluesminds.com/v1/models", {
+                        headers: { "Authorization": `Bearer ${config.bluesmindsApiKey}` }
+                    });
+                    if (response.ok) {
+                        const data = await response.json();
+                        const mStr = data.data?.map((m: any) => `• \`${m.id}\``).join('\n') || "No models.";
+                        await status.finish(`🤖 **Models**\n\n${mStr}`);
+                    } else { await status.fail("API Error"); }
+                } catch (e) { await status.fail("Failed to fetch."); }
+            });
+            return;
+        }
+
+        if (text.startsWith('/exportchat')) {
+          await CommandProcessor.process(client, message, config, myId, 'exportchat', textRaw, async (status) => {
+            const parts = text.split(' ');
+            const limit = parseInt(parts[1]) || 50;
+            await status.update(`⏳ Exporting ${limit} messages...`);
             
             try {
-              const repl = await client?.getMessages(message.chatId, { ids: [message.replyToMsgId] });
-              if (repl && repl.length > 0 && repl[0].message) {
-                await status.update(`⚙️ Generating PDF...`);
-                const doc = new PDFDocument();
-                const id = Math.random().toString(36).substring(2);
-                const filename = `msg_export_${id}.pdf`;
-                const filepath = path.join(exportsDir, filename);
-                const stream = fs.createWriteStream(filepath);
-                doc.pipe(stream);
+              const history = await client?.getMessages(message.chatId, { limit });
+              if (history && history.length > 0) {
+                await status.update(`⏳ Waiting in queue...`);
                 
-                doc.fontSize(12).fillColor('black').text(repl[0].message);
-                doc.end();
-                
-                await new Promise<void>((resolve, reject) => {
-                  stream.on("finish", resolve);
-                  stream.on("error", reject);
-                });
+                await taskQueue.add(async () => {
+                  await status.update(`⚙️ Generating PDF...`);
+                  const doc = new PDFDocument();
+                  const id = Math.random().toString(36).substring(2);
+                  const filename = `chat_export_${id}.pdf`;
+                  const filepath = path.join(exportsDir, filename);
+                  const stream = fs.createWriteStream(filepath);
+                  doc.pipe(stream);
+                  
+                  doc.fontSize(16).text(`Export for Chat ${message.chatId}`, { underline: true });
+                  doc.moveDown();
+                  
+                  const sortedHistory = [...history].reverse();
+                  for (const msg of sortedHistory) {
+                    if (msg.message) {
+                      const date = new Date(msg.date * 1000).toLocaleString();
+                      const sender = msg.senderId ? msg.senderId.toString() : 'Unknown';
+                      doc.fontSize(10).fillColor('gray').text(`[${date}] ${sender}:`);
+                      doc.fontSize(12).fillColor('black').text(msg.message);
+                      doc.moveDown(0.5);
+                    }
+                  }
+                  doc.end();
+                  
+                  await new Promise<void>((resolve, reject) => {
+                    stream.on("finish", resolve);
+                    stream.on("error", reject);
+                  });
 
-                db.prepare("INSERT INTO exports (id, filename, filepath, createdAt, type, status) VALUES (?, ?, ?, ?, ?, ?)")
-                  .run(id, filename, filepath, Date.now(), 'msg-export', 'success');
-                
-                await status.update(`📤 Uploading...`);
-                await client?.sendMessage(message.chatId, { message: '✅ PDF complete!', file: filepath, replyTo: message.id });
-                await status.done(null, 0);
-                addLog(`Exported message to ${filename}`, "success");
-            } else {
-              await status.fail('No messages.');
+                  db.prepare("INSERT INTO exports (id, filename, filepath, createdAt, type, status) VALUES (?, ?, ?, ?, ?, ?)")
+                    .run(id, filename, filepath, Date.now(), 'chat-export', 'success');
+                  
+                  await status.update(`📤 Uploading PDF...`);
+                  await client?.sendMessage(message.chatId, { message: '✅ Chat export complete!', file: filepath });
+                  await status.done(null, 0);
+                  addLog(`Exported ${sortedHistory.length} messages to ${filename}`, "success");
+                });
+              } else {
+                await status.fail('No messages found to export.');
+              }
+            } catch(err) {
+               await status.fail(`Export failed: ${String(err)}`);
+               addLog(`Chat export failed: ${String(err)}`, "error");
             }
           });
           return;
+        }
+
+        // 7. BROADCAST COMMANDS
+        if (text === '/startsend' || text === '.startsend') {
+          setIsRunning(true);
+          startAutomationLoop();
+          await client?.sendMessage(message.chatId, { message: '🚀 Automation loop started. Check Logs for progress.' });
+        } else if (text === '/stopsend' || text === '.stopsend') {
+          setIsRunning(false);
+          await client?.sendMessage(message.chatId, { message: '🛑 Automation loop stopped.' });
+        } else if (text.startsWith('/addmsg ') || text.startsWith('.addmsg ')) {
+          const newMsg = textRaw.substring(8).trim();
+          if (newMsg) {
+            const id = Math.random().toString(36).substring(2);
+            db.prepare("INSERT INTO messages (id, text, createdAt) VALUES (?, ?, ?)").run(id, newMsg, Date.now());
+            await client?.sendMessage(message.chatId, { message: '✅ Message added to database.' });
+          }
+        } else if (text.startsWith('/addtarget ') || text.startsWith('.addtarget ')) {
+          const targetName = textRaw.substring(11).trim();
+          if (targetName) {
+            const id = Math.random().toString(36).substring(2);
+            db.prepare("INSERT INTO targets (id, name, type) VALUES (?, ?, ?)").run(id, targetName, 'group');
+            await client?.sendMessage(message.chatId, { message: `✅ Target ${targetName} added.` });
+          }
         }
       };
 
       client.addEventHandler(messageHandler, new NewMessage({ incoming: true, outgoing: true }));
       isListenerActive = true;
       addLog("Telegram listener attached successfully.", "success");
+
+  // Maintenance Task: Cleanup old files and old DB records
+  setInterval(async () => {
+    try {
+      const now = Date.now();
+      const oneWeekAgo = now - (7 * 24 * 60 * 60 * 1000);
+      
+      // Cleanup conversation history older than 7 days
+      db.prepare("DELETE FROM conversations WHERE timestamp < ?").run(oneWeekAgo);
+      
+      // Cleanup files in exports and music directories
+      for (const dir of [exportsDir, musicDir]) {
+        const files = await fs.readdir(dir);
+        for (const file of files) {
+          const filePath = path.join(dir, file);
+          const stats = await fs.stat(filePath);
+          if (stats.mtimeMs < oneWeekAgo) {
+            await fs.remove(filePath).catch(() => {});
+          }
+        }
+      }
+
+      // Memory Cleanup: clear cooldown maps if they get too large
+      if (userCooldowns.size > 5000) userCooldowns.clear();
+      if (commandCooldowns.size > 1000) commandCooldowns.clear();
+      
+      console.log("[Maintenance] Cleanup complete.");
+    } catch (e) {
+      console.error("[Maintenance] Error:", e);
+    }
+  }, 3600000); // Hourly
 
       // Connection Status Listeners
       client.addEventHandler((event: any) => {
@@ -2115,342 +2332,6 @@ async function maybeHandleAutoReply(client: TelegramClient, message: any, config
       // Initial logs setup at boot
       addLog("Backend server initialized.", "info");
     }
-  });
-
-
-  // === API ROUTES ===
-  app.get("/api/state", (req, res) => {
-    try {
-      const messages = db.prepare("SELECT * FROM messages ORDER BY createdAt DESC").all();
-      const targets = db.prepare("SELECT * FROM targets").all();
-      const config = db.prepare("SELECT * FROM config WHERE id = 1").get() as any;
-      const logs = db.prepare("SELECT * FROM logs ORDER BY timestamp DESC LIMIT 100").all();
-      
-      const payload = {
-         messages,
-         targets,
-         config,
-         logs,
-         isRunning: getIsRunning(),
-         diagnostics: {
-           isListenerActive,
-           lastEventTimestamp,
-           clientReady: !!client,
-           aiConfigureds: !!(config?.geminiKey || config?.groqKey || config?.openRouterKey || process.env.GEMINI_API_KEY)
-         }
-      };
-      res.json(payload);
-    } catch(e) {
-      console.error(`[ERR] /api/state:`, e);
-      res.status(500).json({ error: String(e) });
-    }
-  });
-
-  app.post("/api/action", (req, res) => {
-    const { action } = req.body;
-    if (action === "start") {
-      startAutomationLoop();
-    } else if (action === "stop") {
-      setIsRunning(false);
-    }
-    res.json({ success: true, isRunning: getIsRunning() });
-  });
-
-  app.post("/api/messages", (req, res) => {
-    const { text } = req.body;
-    const id = Math.random().toString(36).substring(2);
-    db.prepare("INSERT INTO messages (id, text, createdAt) VALUES (?, ?, ?)").run(id, text, Date.now());
-    res.json({ id, text, createdAt: Date.now() });
-  });
-
-  app.delete("/api/messages/:id", (req, res) => {
-    db.prepare("DELETE FROM messages WHERE id = ?").run(req.params.id);
-    res.json({ success: true });
-  });
-
-  app.post("/api/targets", (req, res) => {
-    const { name, type } = req.body;
-    const id = Math.random().toString(36).substring(2);
-    db.prepare("INSERT INTO targets (id, name, type) VALUES (?, ?, ?)").run(id, name, type);
-    res.json({ id, name, type });
-  });
-
-  app.delete("/api/targets/:id", (req, res) => {
-    db.prepare("DELETE FROM targets WHERE id = ?").run(req.params.id);
-    res.json({ success: true });
-  });
-
-  app.post("/api/config", async (req, res) => {
-    const { 
-      minDelaySeconds, maxDelaySeconds, adminUsers, youtube_cookies,
-      globalCooldown, perUserCooldown, maxConcurrentTasks,
-      aiEnabled, aiProvider, geminiKey, groqKey, openRouterKey,
-      autoDeleteCommands, autoDeleteDelay, autoDeleteWhitelist,
-      autoReplyDM, autoReplyMention, typingSimulation,
-      conversationMemory, autoReplyDelayMin, autoReplyDelayMax,
-      autoReplyPersonality, autoReplyWhitelist, autoReplyBlacklist,
-      telegramApiId, telegramApiHash, telegramStringSession,
-      nsfwEnabled, nsfwPersonality,
-      searchEnabled, searchProvider, searchApiKey,
-      aiMode, formattingEnabled, cleanupEnabled,
-      bluesmindsApiKey, activeModel
-    } = req.body;
-    
-    const adminStr = Array.isArray(adminUsers) ? adminUsers.join(",") : adminUsers;
-    db.prepare(`
-      UPDATE config SET 
-        minDelaySeconds = ?, maxDelaySeconds = ?, adminUsers = ?, youtube_cookies = ?,
-        globalCooldown = ?, perUserCooldown = ?, maxConcurrentTasks = ?,
-        aiEnabled = ?, aiProvider = ?, geminiKey = ?, groqKey = ?, openRouterKey = ?,
-        autoDeleteCommands = ?, autoDeleteDelay = ?, autoDeleteWhitelist = ?,
-        autoReplyDM = ?, autoReplyMention = ?, typingSimulation = ?,
-        conversationMemory = ?, autoReplyDelayMin = ?, autoReplyDelayMax = ?,
-        autoReplyPersonality = ?, autoReplyWhitelist = ?, autoReplyBlacklist = ?,
-        telegramApiId = ?, telegramApiHash = ?, telegramStringSession = ?,
-        nsfwEnabled = ?, nsfwPersonality = ?,
-        searchEnabled = ?, searchProvider = ?, searchApiKey = ?,
-        aiMode = ?, formattingEnabled = ?, cleanupEnabled = ?,
-        bluesmindsApiKey = ?, activeModel = ?
-      WHERE id = 1
-    `).run(
-      minDelaySeconds, maxDelaySeconds, adminStr, youtube_cookies || '',
-      globalCooldown ?? 3, perUserCooldown ?? 10, maxConcurrentTasks ?? 2,
-      aiEnabled ?? 1, aiProvider ?? 'gemini', geminiKey || null, groqKey || null, openRouterKey || null,
-      autoDeleteCommands ?? 0, autoDeleteDelay ?? 0, autoDeleteWhitelist || '',
-      autoReplyDM ?? 0, autoReplyMention ?? 0, typingSimulation ?? 1,
-      conversationMemory ?? 1, autoReplyDelayMin ?? 3, autoReplyDelayMax ?? 15,
-      autoReplyPersonality || 'You are a modern Telegram AI assistant. Reply intelligently, naturally, and concisely. Avoid robotic greetings, filler text, and generic explanations. Format responses beautifully for Telegram. Use short readable paragraphs. Always prioritize useful and accurate answers.', 
-      autoReplyWhitelist || '', autoReplyBlacklist || '',
-      telegramApiId || '', telegramApiHash || '', telegramStringSession || '',
-      nsfwEnabled ?? 0, nsfwPersonality || 'You are a flirty, mature, and consenting adult friend.',
-      searchEnabled ?? 0, searchProvider || 'tavily', searchApiKey || '',
-      aiMode || 'intelligent', formattingEnabled ?? 1, cleanupEnabled ?? 1,
-      bluesmindsApiKey || '', activeModel || 'gemini-1.5-flash'
-    );
-    
-    if (maxConcurrentTasks) {
-      taskQueue.setMaxConcurrent(maxConcurrentTasks);
-    }
-
-    if (youtube_cookies) {
-      fs.writeFileSync(youtubeCookiesPath, youtube_cookies);
-    } else if (fs.existsSync(youtubeCookiesPath)) {
-      try { fs.unlinkSync(youtubeCookiesPath); } catch(e) {}
-    }
-
-    // If Telegram credentials changed, try reconnecting
-    if (telegramApiId || telegramApiHash || telegramStringSession) {
-      addLog("Telegram credentials updated, attempting reconnect...", "info");
-      loadTelethon(); 
-    }
-
-    res.json({ success: true });
-  });
-
-  app.get("/api/ai/models", async (req, res) => {
-    try {
-      const config = db.prepare("SELECT bluesmindsApiKey FROM config WHERE id = 1").get() as any;
-      if (!config?.bluesmindsApiKey) return res.status(401).json({ error: "No API Key" });
-      
-      const response = await fetch("https://api.bluesminds.com/v1/models", {
-        headers: { "Authorization": `Bearer ${config.bluesmindsApiKey}` }
-      });
-      if (!response.ok) throw new Error("API Failed");
-      const data = await response.json();
-      res.json(data);
-    } catch (e) {
-      res.status(500).json({ error: "Failed to fetch" });
-    }
-  });
-
-  app.get("/api/nsfw/data", (req, res) => {
-    try {
-      const logs = db.prepare("SELECT * FROM nsfw_logs ORDER BY timestamp DESC LIMIT 100").all();
-      const users = db.prepare("SELECT * FROM user_nsfw_prefs ORDER BY updatedAt DESC").all();
-      res.json({ logs, users });
-    } catch (e) {
-      res.status(500).json({ error: String(e) });
-    }
-  });
-
-  app.post("/api/nsfw/users/:userId/toggle", (req, res) => {
-    try {
-      const { nsfwEnabled } = req.body;
-      db.prepare("UPDATE user_nsfw_prefs SET nsfwEnabled = ?, updatedAt = ? WHERE userId = ?")
-        .run(nsfwEnabled ? 1 : 0, Date.now(), req.params.userId);
-      res.json({ success: true });
-    } catch (e) {
-      res.status(500).json({ error: String(e) });
-    }
-  });
-
-  app.delete("/api/nsfw/logs", (req, res) => {
-    try {
-      db.prepare("DELETE FROM nsfw_logs").run();
-      res.json({ success: true });
-    } catch (e) {
-      res.status(500).json({ error: String(e) });
-    }
-  });
-
-  app.get("/api/youtubedl/check", async (req, res) => {
-     try {
-       const result = await youtubedl('--version');
-       res.json({ success: true, version: result });
-     } catch (e) {
-       res.status(500).json({ error: String(e) });
-     }
-  });
-  
-  app.delete("/api/logs", (req, res) => {
-    db.prepare("DELETE FROM logs").run();
-    res.json({ success: true });
-  });
-
-  // === EXPORTS API ===
-  app.get("/api/exports", (req, res) => {
-    try {
-      const exports = db.prepare("SELECT * FROM exports ORDER BY createdAt DESC").all();
-      res.json({ exports });
-    } catch (e) {
-      res.status(500).json({ error: String(e) });
-    }
-  });
-
-  app.delete("/api/exports/:id", (req, res) => {
-    try {
-      const exp = db.prepare("SELECT * FROM exports WHERE id = ?").get(req.params.id) as any;
-      if (exp) {
-        if (fs.existsSync(exp.filepath)) fs.unlinkSync(exp.filepath);
-        db.prepare("DELETE FROM exports WHERE id = ?").run(req.params.id);
-      }
-      res.json({ success: true });
-    } catch (e) {
-      res.status(500).json({ error: String(e) });
-    }
-  });
-
-  app.get("/api/exports/download/:id", (req, res) => {
-    const exp = db.prepare("SELECT * FROM exports WHERE id = ?").get(req.params.id) as any;
-    if (exp && fs.existsSync(exp.filepath)) {
-      res.download(exp.filepath, exp.filename);
-    } else {
-      res.status(404).send("File not found");
-    }
-  });
-
-  app.post("/api/exports/pdf-images", upload.array('images', 20), async (req, res) => {
-    try {
-      const files = req.files as Express.Multer.File[];
-      if (!files || files.length === 0) return res.status(400).json({ error: "No files uploaded" });
-
-      await taskQueue.add(async () => {
-        const doc = new PDFDocument({ autoFirstPage: false });
-        const id = Math.random().toString(36).substring(2);
-        const filename = `images_export_${id}.pdf`;
-        const filepath = path.join(exportsDir, filename);
-        const stream = fs.createWriteStream(filepath);
-        doc.pipe(stream);
-
-        for (const file of files) {
-          try {
-            const img = await sharp(file.path).toBuffer();
-            const imgObj = await sharp(img).metadata();
-            doc.addPage({ size: [imgObj.width || 595, imgObj.height || 842] });
-            doc.image(img, 0, 0);
-          } catch (err) {
-            console.error("Failed to process image", err);
-          }
-          // Cleanup temp file
-          if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
-        }
-        
-        doc.end();
-
-        await new Promise<void>((resolve, reject) => {
-          stream.on("finish", resolve);
-          stream.on("error", reject);
-        });
-
-        db.prepare("INSERT INTO exports (id, filename, filepath, createdAt, type, status) VALUES (?, ?, ?, ?, ?, ?)")
-          .run(id, filename, filepath, Date.now(), 'image-to-pdf', 'success');
-          
-        addLog(`PDF generated from dashboard: ${filename}`, "success");
-        res.json({ success: true, id, filename });
-      });
-
-    } catch (e) {
-      console.error(e);
-      addLog(`Failed to generate PDF: ${String(e)}`, "error");
-      res.status(500).json({ error: String(e) });
-    }
-  });
-
-  app.post("/api/music/download", async (req, res) => {
-    const { query } = req.body;
-    if (!query) return res.status(400).json({ error: "No query provided" });
-    try {
-      const searchString = query.toLowerCase().includes('audio') || query.toLowerCase().includes('lyric') ? query : query + ' audio';
-      const r = await yts(searchString);
-      const video = r.videos.find(v => !v.title.toLowerCase().includes('music video') && !v.title.toLowerCase().includes('official video')) || r.videos[0];
-      if (!video) return res.status(404).json({ error: "No results found" });
-
-      const id = Math.random().toString(36).substring(2);
-      const filename = `music_${id}.mp3`;
-      const filepath = path.join(musicDir, filename);
-
-      await taskQueue.add(async () => {
-        try {
-          await downloadYoutube(video.url, filepath);
-
-          db.prepare("INSERT INTO exports (id, filename, filepath, createdAt, type, status) VALUES (?, ?, ?, ?, ?, ?)")
-            .run(id, filename, filepath, Date.now(), 'music', 'success');
-          addLog(`Downloaded music via dashboard: ${video.title}`, "success");
-
-          if (client) {
-              const defaultTarget = db.prepare("SELECT name FROM targets LIMIT 1").get() as any;
-              if (defaultTarget) {
-                 try {
-                    await client.sendMessage(defaultTarget.name, { 
-                      message: `🎵 **${video.title}**\n👤 ${video.author.name}`, 
-                      file: filepath,
-                      attributes: [new Api.DocumentAttributeAudio({ title: video.title, performer: video.author.name, duration: video.duration.seconds, voice: false })]
-                    });
-                 } catch (e) {}
-              }
-          }
-
-          res.json({ success: true, id, filename, title: video.title, author: video.author.name, thumbnail: video.image });
-        } catch (err) {
-          throw err;
-        }
-      });
-    } catch (e) {
-      console.error(e);
-      addLog(`Failed to download music: ${String(e)}`, "error");
-      res.status(500).json({ error: String(e) });
-    }
-  });
-
-  // Vite middleware for development
-  if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(__dirname, 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
-  }
-
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
-    console.log(`AI Configuration Check:`);
-    console.log(`- GEMINI_API_KEY: ${process.env.GEMINI_API_KEY ? 'Present (Len: ' + process.env.GEMINI_API_KEY.length + ')' : 'MISSING'}`);
   });
 }
 
