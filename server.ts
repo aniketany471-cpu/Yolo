@@ -1625,6 +1625,15 @@ async function startServer() {
   app.use(express.json());
 
   // === API ROUTES FIRST (to avoid blocking routes by Telegram logic) ===
+  app.get("/api/health", (req, res) => {
+    res.json({
+      status: "ok",
+      uptime: process.uptime(),
+      telegramConnected: client?.connected || false,
+      timestamp: Date.now(),
+    });
+  });
+
   app.get("/api/state", (req, res) => {
     try {
       const messages = db
@@ -2016,10 +2025,14 @@ async function startServer() {
     message: string,
     type: "info" | "success" | "warn" | "error" = "info",
   ) => {
-    const id = Math.random().toString(36).substring(2);
-    db.prepare(
-      "INSERT INTO logs (id, timestamp, message, type) VALUES (?, ?, ?, ?)",
-    ).run(id, Date.now(), message, type);
+    try {
+      const id = Math.random().toString(36).substring(2);
+      db.prepare(
+        "INSERT INTO logs (id, timestamp, message, type) VALUES (?, ?, ?, ?)",
+      ).run(id, Date.now(), message, type);
+    } catch (e) {
+      console.error("[Log Error]:", e);
+    }
   };
 
   const downloadYoutube = async (url: string, output: string) => {
@@ -2061,6 +2074,10 @@ async function startServer() {
         const writer = fs.createWriteStream(output);
         stream.stream.pipe(writer);
         await new Promise<void>((resolve, reject) => {
+          stream.stream.on("error", (e) => {
+            writer.destroy();
+            reject(e);
+          });
           writer.on("finish", () => resolve());
           writer.on("error", reject);
         });
@@ -2617,6 +2634,9 @@ async function startServer() {
       } catch (e) {}
     }
 
+    if (isConnecting) return false;
+    isConnecting = true;
+
     try {
       addLog("Attempting to connect to Telegram...", "info");
       const stringSession = new StringSession(stringSessionStr);
@@ -2625,8 +2645,9 @@ async function startServer() {
         parseInt(apiId.toString()),
         apiHash,
         {
-          connectionRetries: 5,
+          connectionRetries: 10,
           useWSS: false,
+          autoReconnect: true,
         },
       );
 
@@ -2639,198 +2660,217 @@ async function startServer() {
 
       // Set up Userbot logic
       const messageHandler = async (event: any) => {
-        if (!client) return;
-        const message = event.message;
-        if (!message || !message.message) return;
+        try {
+          if (!client) return;
+          const message = event.message;
+          if (!message || !message.message) return;
 
-        const textRaw = (message.message || "").trim();
-        const text = textRaw.toLowerCase();
-        const senderId = message.senderId?.toString();
-        const chatIdStr = message.chatId?.toString();
-        const isMe = message.out || (myId && senderId === myId);
+          const textRaw = (message.message || "").trim();
+          const text = textRaw.toLowerCase();
+          const senderId = message.senderId?.toString();
+          const chatIdStr = message.chatId?.toString();
+          const isMe = message.out || (myId && senderId === myId);
 
-        let config = db
-          .prepare("SELECT * FROM config WHERE id = 1")
-          .get() as any;
-        const admins = config?.adminUsers
-          ? config.adminUsers.split(",").map((s: string) => s.trim())
-          : [];
-        // Use PermissionManager for robust checks
-        const auth = await PermissionManager.check(
-          text,
-          senderId || "",
-          chatIdStr || "",
-          myId,
-        );
+          let config = db
+            .prepare("SELECT * FROM config WHERE id = 1")
+            .get() as any;
+          const admins = config?.adminUsers
+            ? config.adminUsers.split(",").map((s: string) => s.trim())
+            : [];
+          // Use PermissionManager for robust checks
+          const auth = await PermissionManager.check(
+            text,
+            senderId || "",
+            chatIdStr || "",
+            myId,
+          );
 
-        console.log(
-          `[BOT] Incoming: "${textRaw.substring(0, 30)}" from ${senderId}, Level: ${auth.level}, Allowed: ${auth.allowed}`,
-        );
+          console.log(
+            `[BOT] Incoming: "${textRaw.substring(0, 30)}" from ${senderId}, Level: ${auth.level}, Allowed: ${auth.allowed}`,
+          );
 
-        // 1. Universal / Diagnostics
-        if (
-          text === "/aitest" ||
-          text === ".aitest" ||
-          text === "/ping" ||
-          text === ".ping" ||
-          text === "/debug" ||
-          text === ".debug"
-        ) {
-          if (isMe || auth.level >= PermissionLevel.SUDO) {
-            console.log(
-              `[BOT] Diagnostic command triggered: ${text} from ${senderId}`,
-            );
-            addLog(`Diagnostic: ${text} from ${senderId}`, "info");
+          if (!auth.allowed) {
+            if (auth.reason && !isMe) {
+              await client
+                ?.sendMessage(message.chatId, {
+                  message: auth.reason,
+                  replyTo: message.id,
+                })
+                .catch(() => {});
+            }
+            return;
           }
-        }
 
-        // 2. Auto-Reply Logic
-        if (!isMe) {
-          await maybeHandleAutoReply(client, message, config, myId, myUsername);
-        }
+          // 1. Universal / Diagnostics
+          if (
+            text === "/aitest" ||
+            text === ".aitest" ||
+            text === "/ping" ||
+            text === ".ping" ||
+            text === "/debug" ||
+            text === ".debug"
+          ) {
+            if (isMe || auth.level >= PermissionLevel.SUDO) {
+              console.log(
+                `[BOT] Diagnostic command triggered: ${text} from ${senderId}`,
+              );
+              addLog(`Diagnostic: ${text} from ${senderId}`, "info");
+            }
+          }
 
-        // 3. NSFW MODE
-        if (config.nsfwEnabled === 1 && message.isPrivate && !isMe) {
-          if (text === "/nsfw on" || text === ".nsfw on") {
-            const userPref = db
-              .prepare("SELECT * FROM user_nsfw_prefs WHERE userId = ?")
-              .get(senderId) as any;
-            if (userPref?.ageConfirmed === 1) {
+          // 2. Auto-Reply Logic
+          if (!isMe) {
+            await maybeHandleAutoReply(
+              client,
+              message,
+              config,
+              myId,
+              myUsername,
+            );
+          }
+
+          // 3. NSFW MODE
+          if (config.nsfwEnabled === 1 && message.isPrivate && !isMe) {
+            if (text === "/nsfw on" || text === ".nsfw on") {
+              const userPref = db
+                .prepare("SELECT * FROM user_nsfw_prefs WHERE userId = ?")
+                .get(senderId) as any;
+              if (userPref?.ageConfirmed === 1) {
+                db.prepare(
+                  "INSERT OR REPLACE INTO user_nsfw_prefs (userId, nsfwEnabled, ageConfirmed, updatedAt) VALUES (?, 1, 1, ?)",
+                ).run(senderId, Date.now());
+                await client.sendMessage(message.chatId, {
+                  message:
+                    "🔞 **Mature Mode Activated.** Your AI friend is now in mature chat mode. Rest assured, this is a private conversation between consenting adults only.",
+                  replyTo: message.id,
+                });
+              } else {
+                await client.sendMessage(message.chatId, {
+                  message:
+                    "⚠️ **Age Verification Required**\n\nThis mode is for adults only (18+). By clicking the button below or typing `/confirmage`, you confirm that you are at least 18 years old and consent to mature AI conversations.\n\n_This feature is private and disabled in groups._",
+                  replyTo: message.id,
+                });
+              }
+              return;
+            }
+            if (text === "/nsfw off" || text === ".nsfw off") {
+              db.prepare(
+                "INSERT OR REPLACE INTO user_nsfw_prefs (userId, nsfwEnabled, ageConfirmed, updatedAt) VALUES (?, 0, 1, ?)",
+              ).run(senderId, Date.now());
+              await client.sendMessage(message.chatId, {
+                message:
+                  "✅ **Mature Mode Deactivated.** Returning to standard conversational mode.",
+                replyTo: message.id,
+              });
+              return;
+            }
+            if (text === "/nsfw status" || text === ".nsfw status") {
+              const userPref = db
+                .prepare(
+                  "SELECT nsfwEnabled FROM user_nsfw_prefs WHERE userId = ?",
+                )
+                .get(senderId) as any;
+              const status =
+                userPref?.nsfwEnabled === 1 ? "Active 🔞" : "Inactive 👤";
+              await client.sendMessage(message.chatId, {
+                message: `🔞 **Mature Mode Status:** ${status}`,
+                replyTo: message.id,
+              });
+              return;
+            }
+            if (text === "/confirmage" || text === ".confirmage") {
               db.prepare(
                 "INSERT OR REPLACE INTO user_nsfw_prefs (userId, nsfwEnabled, ageConfirmed, updatedAt) VALUES (?, 1, 1, ?)",
               ).run(senderId, Date.now());
               await client.sendMessage(message.chatId, {
                 message:
-                  "🔞 **Mature Mode Activated.** Your AI friend is now in mature chat mode. Rest assured, this is a private conversation between consenting adults only.",
+                  "✅ **Age Confirmed.** Mature Mode has been enabled for you. Type `/nsfw off` anytime to disable it.",
                 replyTo: message.id,
               });
-            } else {
-              await client.sendMessage(message.chatId, {
-                message:
-                  "⚠️ **Age Verification Required**\n\nThis mode is for adults only (18+). By clicking the button below or typing `/confirmage`, you confirm that you are at least 18 years old and consent to mature AI conversations.\n\n_This feature is private and disabled in groups._",
-                replyTo: message.id,
-              });
+              return;
             }
-            return;
           }
-          if (text === "/nsfw off" || text === ".nsfw off") {
-            db.prepare(
-              "INSERT OR REPLACE INTO user_nsfw_prefs (userId, nsfwEnabled, ageConfirmed, updatedAt) VALUES (?, 0, 1, ?)",
-            ).run(senderId, Date.now());
-            await client.sendMessage(message.chatId, {
-              message:
-                "✅ **Mature Mode Deactivated.** Returning to standard conversational mode.",
-              replyTo: message.id,
-            });
-            return;
-          }
-          if (text === "/nsfw status" || text === ".nsfw status") {
-            const userPref = db
-              .prepare(
-                "SELECT nsfwEnabled FROM user_nsfw_prefs WHERE userId = ?",
-              )
-              .get(senderId) as any;
-            const status =
-              userPref?.nsfwEnabled === 1 ? "Active 🔞" : "Inactive 👤";
-            await client.sendMessage(message.chatId, {
-              message: `🔞 **Mature Mode Status:** ${status}`,
-              replyTo: message.id,
-            });
-            return;
-          }
-          if (text === "/confirmage" || text === ".confirmage") {
-            db.prepare(
-              "INSERT OR REPLACE INTO user_nsfw_prefs (userId, nsfwEnabled, ageConfirmed, updatedAt) VALUES (?, 1, 1, ?)",
-            ).run(senderId, Date.now());
-            await client.sendMessage(message.chatId, {
-              message:
-                "✅ **Age Confirmed.** Mature Mode has been enabled for you. Type `/nsfw off` anytime to disable it.",
-              replyTo: message.id,
-            });
-            return;
-          }
-        }
 
-        // 4. Basic Diagnostic (Public)
-        if (text === "/ping" || text === ".ping") {
-          await client?.sendMessage(message.chatId, {
-            message: "🏓 **Pong!** Bot is alive.",
-            replyTo: message.id,
-          });
-          return;
-        }
+          // 4. Basic Diagnostic (Public)
+          if (text === "/ping" || text === ".ping") {
+            await client?.sendMessage(message.chatId, {
+              message: "🏓 **Pong!** Bot is alive.",
+              replyTo: message.id,
+            });
+            return;
+          }
 
-        if (text === "/debug" || text === ".debug") {
-          const debugInfo = `🔍 **Bot Debug Info**
+          if (text === "/debug" || text === ".debug") {
+            const debugInfo = `🔍 **Bot Debug Info**
 - **Listener:** ${isListenerActive ? "✅ Active" : "❌ Inactive"}
 - **AI Enabled:** ${config.aiEnabled === 1 ? "✅ Yes" : "❌ No"}
 - **Provider:** ${config.aiProvider}
 - **My ID:** ${myId}
 - **Your Level:** ${auth.level}
 - **Uptime:** ${Math.floor(process.uptime() / 60)}m`;
-          await client?.sendMessage(message.chatId, {
-            message: debugInfo,
-            replyTo: message.id,
-          });
-          return;
-        }
-
-        // 5. PUBLIC COMMANDS CHECK
-        const cmdName = text.replace("/", "").replace(".", "").split(" ")[0];
-        const isPublicCommand = [
-          "ans",
-          "music",
-          "song",
-          "gif",
-          "sticker",
-          "pdf",
-          "summarize",
-          "translate",
-          "help",
-          "commands",
-        ].includes(cmdName);
-
-        if (isPublicCommand) {
-          if (!auth.allowed && !isMe) {
-            if (auth.reason)
-              await client.sendMessage(message.chatId, {
-                message: auth.reason,
-                replyTo: message.id,
-              });
+            await client?.sendMessage(message.chatId, {
+              message: debugInfo,
+              replyTo: message.id,
+            });
             return;
           }
 
-          // Anti-Spam (Public Users only)
-          if (!isMe && auth.level === PermissionLevel.PUBLIC && senderId) {
-            const now = Date.now();
-            const lastUsed = userCooldowns.get(senderId) || 0;
-            const cooldown = (config.perUserCooldown || 10) * 1000;
-            if (now - lastUsed < cooldown) {
-              const remain = Math.ceil((cooldown - (now - lastUsed)) / 1000);
-              await client.sendMessage(message.chatId, {
-                message: `⏳ **Cooldown:** Please wait ${remain}s.`,
-                replyTo: message.id,
-              });
+          // 5. PUBLIC COMMANDS CHECK
+          const cmdName = text.replace("/", "").replace(".", "").split(" ")[0];
+          const isPublicCommand = [
+            "ans",
+            "music",
+            "song",
+            "gif",
+            "sticker",
+            "pdf",
+            "summarize",
+            "translate",
+            "help",
+            "commands",
+          ].includes(cmdName);
+
+          if (isPublicCommand) {
+            if (!auth.allowed && !isMe) {
+              if (auth.reason)
+                await client.sendMessage(message.chatId, {
+                  message: auth.reason,
+                  replyTo: message.id,
+                });
               return;
             }
-            userCooldowns.set(senderId, now);
-          }
 
-          if (
-            text === "/commands" ||
-            text === ".commands" ||
-            text === "/help" ||
-            text === ".help"
-          ) {
-            await CommandProcessor.process(
-              client,
-              message,
-              config,
-              myId,
-              "help",
-              textRaw,
-              async (status) => {
-                const helpMsg = `🤖 **Bot Commands**
+            // Anti-Spam (Public Users only)
+            if (!isMe && auth.level === PermissionLevel.PUBLIC && senderId) {
+              const now = Date.now();
+              const lastUsed = userCooldowns.get(senderId) || 0;
+              const cooldown = (config.perUserCooldown || 10) * 1000;
+              if (now - lastUsed < cooldown) {
+                const remain = Math.ceil((cooldown - (now - lastUsed)) / 1000);
+                await client.sendMessage(message.chatId, {
+                  message: `⏳ **Cooldown:** Please wait ${remain}s.`,
+                  replyTo: message.id,
+                });
+                return;
+              }
+              userCooldowns.set(senderId, now);
+            }
+
+            if (
+              text === "/commands" ||
+              text === ".commands" ||
+              text === "/help" ||
+              text === ".help"
+            ) {
+              await CommandProcessor.process(
+                client,
+                message,
+                config,
+                myId,
+                "help",
+                textRaw,
+                async (status) => {
+                  const helpMsg = `🤖 **Bot Commands**
 
 **Public Commands** 👤
 • \`/ans\` - Reply to get AI answer
@@ -2850,395 +2890,418 @@ async function startServer() {
 • \`/exportchat <n>\` - Export chat logs
 
 _Visit the dashboard for advanced configuration._`;
-                await status.finish(helpMsg);
-              },
-            );
+                  await status.finish(helpMsg);
+                },
+              );
+              return;
+            }
+
+            if (text.startsWith("/ans") || text.startsWith(".ans")) {
+              await CommandProcessor.process(
+                client,
+                message,
+                config,
+                myId,
+                "ans",
+                textRaw,
+                async (status) => {
+                  if (!message.replyToMsgId)
+                    return status.fail("Reply to a message with /ans");
+                  const repl = await client.getMessages(message.chatId, {
+                    ids: [message.replyToMsgId],
+                  });
+                  const promptText = (repl[0]?.message || "").trim();
+                  if (!promptText)
+                    return status.fail("No text content in replied message.");
+                  await status.update(`🧠 Thinking...`);
+                  await taskQueue.add(async () => {
+                    const aiRes = await getAIResponse(
+                      promptText,
+                      config,
+                      message.chatId?.toString(),
+                      senderId,
+                    );
+                    if (aiRes) {
+                      const formatted = formatAiMessage(aiRes);
+                      await status.finish(formatted.text, {
+                        parseMode: formatted.parseMode,
+                        replyTo: repl[0].id,
+                      });
+                    } else {
+                      await status.fail("AI failed to respond.");
+                    }
+                  });
+                },
+              );
+              return;
+            }
+
+            if (
+              text.startsWith("/music ") ||
+              text.startsWith(".music ") ||
+              text.startsWith("/song ") ||
+              text.startsWith(".song ")
+            ) {
+              await CommandProcessor.process(
+                client,
+                message,
+                config,
+                myId,
+                "music",
+                textRaw,
+                async (status) => {
+                  await handleMusicCommand(message, textRaw, status);
+                },
+              );
+              return;
+            }
+
+            if (text.startsWith("/gif ") || text.startsWith(".gif ")) {
+              await CommandProcessor.process(
+                client,
+                message,
+                config,
+                myId,
+                "gif",
+                textRaw,
+                async (status) => {
+                  const queryString = textRaw.split(/\s+/).slice(1).join(" ");
+                  await handleGif(client, message, config, status, queryString);
+                },
+              );
+              return;
+            }
+
+            if (text === "/sticker" || text === ".sticker") {
+              await CommandProcessor.process(
+                client,
+                message,
+                config,
+                myId,
+                "sticker",
+                textRaw,
+                async (status) => {
+                  await handleStickerCommand(client, message, status);
+                },
+              );
+              return;
+            }
+
+            if (text === "/pdf" || text === ".pdf") {
+              await CommandProcessor.process(
+                client,
+                message,
+                config,
+                myId,
+                "pdf",
+                textRaw,
+                async (status) => {
+                  await handlePdfCommand(client, message, status);
+                },
+              );
+              return;
+            }
+
+            if (
+              text.startsWith("/summarize") ||
+              text.startsWith(".summarize")
+            ) {
+              await CommandProcessor.process(
+                client,
+                message,
+                config,
+                myId,
+                "summarize",
+                textRaw,
+                async (status) => {
+                  await handleSummarize(client, message, config, status);
+                },
+              );
+              return;
+            }
+
+            if (
+              text.startsWith("/translate") ||
+              text.startsWith(".translate")
+            ) {
+              await CommandProcessor.process(
+                client,
+                message,
+                config,
+                myId,
+                "translate",
+                textRaw,
+                async (status) => {
+                  const args = textRaw.split(/\s+/).slice(1).join(" ");
+                  await handleTranslate(client, message, config, status, args);
+                },
+              );
+              return;
+            }
+          }
+
+          // 6. PROTECTED / ADMIN COMMANDS
+          if (!auth.allowed && !isMe) {
+            if (text.startsWith("/") || text.startsWith(".")) {
+              console.log(
+                `[BOT] Blocked protected command "${cmdName}" from ${senderId}`,
+              );
+            }
             return;
           }
 
-          if (text.startsWith("/ans") || text.startsWith(".ans")) {
+          if (text === "/startbot" || text === ".startbot") {
             await CommandProcessor.process(
               client,
               message,
               config,
               myId,
-              "ans",
+              "startbot",
               textRaw,
               async (status) => {
-                if (!message.replyToMsgId)
-                  return status.fail("Reply to a message with /ans");
-                const repl = await client.getMessages(message.chatId, {
-                  ids: [message.replyToMsgId],
-                });
-                const promptText = (repl[0]?.message || "").trim();
-                if (!promptText)
-                  return status.fail("No text content in replied message.");
-                await status.update(`🧠 Thinking...`);
-                await taskQueue.add(async () => {
-                  const aiRes = await getAIResponse(
-                    promptText,
-                    config,
-                    message.chatId?.toString(),
-                    senderId,
-                  );
-                  if (aiRes) {
-                    const formatted = formatAiMessage(aiRes);
-                    await status.finish(formatted.text, {
-                      parseMode: formatted.parseMode,
-                      replyTo: repl[0].id,
-                    });
-                  } else {
-                    await status.fail("AI failed to respond.");
-                  }
-                });
+                setIsRunning(true);
+                startAutomationLoop();
+                await status.finish("✅ Bot automation started.");
               },
             );
+            return;
+          }
+
+          if (text === "/stopbot" || text === ".stopbot") {
+            await CommandProcessor.process(
+              client,
+              message,
+              config,
+              myId,
+              "stopbot",
+              textRaw,
+              async (status) => {
+                setIsRunning(false);
+                await status.finish("🛑 Bot automation stopped.");
+              },
+            );
+            return;
+          }
+
+          if (text.startsWith("/sudoadd ")) {
+            const target = textRaw.split(/\s+/)[1]?.trim();
+            if (target)
+              await handleSudoManagement(client, message, myId, "add", target);
+            return;
+          }
+
+          if (text.startsWith("/sudoremove ")) {
+            const target = textRaw.split(/\s+/)[1]?.trim();
+            if (target)
+              await handleSudoManagement(
+                client,
+                message,
+                myId,
+                "remove",
+                target,
+              );
             return;
           }
 
           if (
-            text.startsWith("/music ") ||
-            text.startsWith(".music ") ||
-            text.startsWith("/song ") ||
-            text.startsWith(".song ")
+            text.startsWith("/model ") ||
+            text.startsWith(".model ") ||
+            text.startsWith("/setmodel ") ||
+            text.startsWith(".setmodel ")
           ) {
-            await CommandProcessor.process(
-              client,
-              message,
-              config,
-              myId,
-              "music",
-              textRaw,
-              async (status) => {
-                await handleMusicCommand(message, textRaw, status);
-              },
+            const parts = textRaw.split(/\s+/);
+            const modelName = parts[1]?.trim();
+            if (!modelName) {
+              await client.sendMessage(message.chatId, {
+                message: "❌ **Usage:** `/model <model-name>`",
+                replyTo: message.id,
+              });
+              return;
+            }
+            db.prepare("UPDATE config SET activeModel = ? WHERE id = 1").run(
+              modelName,
             );
-            return;
-          }
-
-          if (text.startsWith("/gif ") || text.startsWith(".gif ")) {
-            await CommandProcessor.process(
-              client,
-              message,
-              config,
-              myId,
-              "gif",
-              textRaw,
-              async (status) => {
-                const queryString = textRaw.split(/\s+/).slice(1).join(" ");
-                await handleGif(client, message, config, status, queryString);
-              },
-            );
-            return;
-          }
-
-          if (text === "/sticker" || text === ".sticker") {
-            await CommandProcessor.process(
-              client,
-              message,
-              config,
-              myId,
-              "sticker",
-              textRaw,
-              async (status) => {
-                await handleStickerCommand(client, message, status);
-              },
-            );
-            return;
-          }
-
-          if (text === "/pdf" || text === ".pdf") {
-            await CommandProcessor.process(
-              client,
-              message,
-              config,
-              myId,
-              "pdf",
-              textRaw,
-              async (status) => {
-                await handlePdfCommand(client, message, status);
-              },
-            );
-            return;
-          }
-
-          if (text.startsWith("/summarize") || text.startsWith(".summarize")) {
-            await CommandProcessor.process(
-              client,
-              message,
-              config,
-              myId,
-              "summarize",
-              textRaw,
-              async (status) => {
-                await handleSummarize(client, message, config, status);
-              },
-            );
-            return;
-          }
-
-          if (text.startsWith("/translate") || text.startsWith(".translate")) {
-            await CommandProcessor.process(
-              client,
-              message,
-              config,
-              myId,
-              "translate",
-              textRaw,
-              async (status) => {
-                const args = textRaw.split(/\s+/).slice(1).join(" ");
-                await handleTranslate(client, message, config, status, args);
-              },
-            );
-            return;
-          }
-        }
-
-        // 6. PROTECTED / ADMIN COMMANDS
-        if (!auth.allowed && !isMe) {
-          if (text.startsWith("/") || text.startsWith(".")) {
-            console.log(
-              `[BOT] Blocked protected command "${cmdName}" from ${senderId}`,
-            );
-          }
-          return;
-        }
-
-        if (text === "/startbot" || text === ".startbot") {
-          await CommandProcessor.process(
-            client,
-            message,
-            config,
-            myId,
-            "startbot",
-            textRaw,
-            async (status) => {
-              setIsRunning(true);
-              startAutomationLoop();
-              await status.finish("✅ Bot automation started.");
-            },
-          );
-          return;
-        }
-
-        if (text === "/stopbot" || text === ".stopbot") {
-          await CommandProcessor.process(
-            client,
-            message,
-            config,
-            myId,
-            "stopbot",
-            textRaw,
-            async (status) => {
-              setIsRunning(false);
-              await status.finish("🛑 Bot automation stopped.");
-            },
-          );
-          return;
-        }
-
-        if (text.startsWith("/sudoadd ")) {
-          const target = textRaw.split(/\s+/)[1]?.trim();
-          if (target)
-            await handleSudoManagement(client, message, myId, "add", target);
-          return;
-        }
-
-        if (text.startsWith("/sudoremove ")) {
-          const target = textRaw.split(/\s+/)[1]?.trim();
-          if (target)
-            await handleSudoManagement(client, message, myId, "remove", target);
-          return;
-        }
-
-        if (
-          text.startsWith("/model ") ||
-          text.startsWith(".model ") ||
-          text.startsWith("/setmodel ") ||
-          text.startsWith(".setmodel ")
-        ) {
-          const parts = textRaw.split(/\s+/);
-          const modelName = parts[1]?.trim();
-          if (!modelName) {
             await client.sendMessage(message.chatId, {
-              message: "❌ **Usage:** `/model <model-name>`",
+              message: `✅ **Model set to:** \`${modelName}\``,
               replyTo: message.id,
             });
             return;
           }
-          db.prepare("UPDATE config SET activeModel = ? WHERE id = 1").run(
-            modelName,
-          );
-          await client.sendMessage(message.chatId, {
-            message: `✅ **Model set to:** \`${modelName}\``,
-            replyTo: message.id,
-          });
-          return;
-        }
 
-        if (text === "/models" || text === ".models") {
-          await CommandProcessor.process(
-            client,
-            message,
-            config,
-            myId,
-            "models",
-            textRaw,
-            async (status) => {
-              await status.update("📡 **Fetching models...**");
-              try {
-                const response = await fetch(
-                  "https://api.bluesminds.com/v1/models",
-                  {
-                    headers: {
-                      Authorization: `Bearer ${config.bluesmindsApiKey}`,
+          if (text === "/models" || text === ".models") {
+            await CommandProcessor.process(
+              client,
+              message,
+              config,
+              myId,
+              "models",
+              textRaw,
+              async (status) => {
+                await status.update("📡 **Fetching models...**");
+                try {
+                  const response = await fetch(
+                    "https://api.bluesminds.com/v1/models",
+                    {
+                      headers: {
+                        Authorization: `Bearer ${config.bluesmindsApiKey}`,
+                      },
                     },
-                  },
-                );
-                if (response.ok) {
-                  const data = await response.json();
-                  const mStr =
-                    data.data?.map((m: any) => `• \`${m.id}\``).join("\n") ||
-                    "No models.";
-                  await status.finish(`🤖 **Models**\n\n${mStr}`);
-                } else {
-                  await status.fail("API Error");
+                  );
+                  if (response.ok) {
+                    const data = await response.json();
+                    const mStr =
+                      data.data?.map((m: any) => `• \`${m.id}\``).join("\n") ||
+                      "No models.";
+                    await status.finish(`🤖 **Models**\n\n${mStr}`);
+                  } else {
+                    await status.fail("API Error");
+                  }
+                } catch (e) {
+                  await status.fail("Failed to fetch.");
                 }
-              } catch (e) {
-                await status.fail("Failed to fetch.");
-              }
-            },
-          );
-          return;
-        }
+              },
+            );
+            return;
+          }
 
-        if (text.startsWith("/exportchat")) {
-          await CommandProcessor.process(
-            client,
-            message,
-            config,
-            myId,
-            "exportchat",
-            textRaw,
-            async (status) => {
-              const parts = text.split(" ");
-              const limit = parseInt(parts[1]) || 50;
-              await status.update(`⏳ Exporting ${limit} messages...`);
+          if (text.startsWith("/exportchat")) {
+            await CommandProcessor.process(
+              client,
+              message,
+              config,
+              myId,
+              "exportchat",
+              textRaw,
+              async (status) => {
+                const parts = text.split(" ");
+                const limit = parseInt(parts[1]) || 50;
+                await status.update(`⏳ Exporting ${limit} messages...`);
 
-              try {
-                const history = await client?.getMessages(message.chatId, {
-                  limit,
-                });
-                if (history && history.length > 0) {
-                  await status.update(`⏳ Waiting in queue...`);
-
-                  await taskQueue.add(async () => {
-                    await status.update(`⚙️ Generating PDF...`);
-                    const doc = new PDFDocument();
-                    const id = Math.random().toString(36).substring(2);
-                    const filename = `chat_export_${id}.pdf`;
-                    const filepath = path.join(exportsDir, filename);
-                    const stream = fs.createWriteStream(filepath);
-                    doc.pipe(stream);
-
-                    doc.fontSize(16).text(`Export for Chat ${message.chatId}`, {
-                      underline: true,
-                    });
-                    doc.moveDown();
-
-                    const sortedHistory = [...history].reverse();
-                    for (const msg of sortedHistory) {
-                      if (msg.message) {
-                        const date = new Date(msg.date * 1000).toLocaleString();
-                        const sender = msg.senderId
-                          ? msg.senderId.toString()
-                          : "Unknown";
-                        doc
-                          .fontSize(10)
-                          .fillColor("gray")
-                          .text(`[${date}] ${sender}:`);
-                        doc.fontSize(12).fillColor("black").text(msg.message);
-                        doc.moveDown(0.5);
-                      }
-                    }
-                    doc.end();
-
-                    await new Promise<void>((resolve, reject) => {
-                      stream.on("finish", resolve);
-                      stream.on("error", reject);
-                    });
-
-                    db.prepare(
-                      "INSERT INTO exports (id, filename, filepath, createdAt, type, status) VALUES (?, ?, ?, ?, ?, ?)",
-                    ).run(
-                      id,
-                      filename,
-                      filepath,
-                      Date.now(),
-                      "chat-export",
-                      "success",
-                    );
-
-                    await status.update(`📤 Uploading PDF...`);
-                    await client?.sendMessage(message.chatId, {
-                      message: "✅ Chat export complete!",
-                      file: filepath,
-                    });
-                    await status.done(null, 0);
-                    addLog(
-                      `Exported ${sortedHistory.length} messages to ${filename}`,
-                      "success",
-                    );
+                try {
+                  const history = await client?.getMessages(message.chatId, {
+                    limit,
                   });
-                } else {
-                  await status.fail("No messages found to export.");
-                }
-              } catch (err) {
-                await status.fail(`Export failed: ${String(err)}`);
-                addLog(`Chat export failed: ${String(err)}`, "error");
-              }
-            },
-          );
-          return;
-        }
+                  if (history && history.length > 0) {
+                    await status.update(`⏳ Waiting in queue...`);
 
-        // 7. BROADCAST COMMANDS
-        if (text === "/startsend" || text === ".startsend") {
-          setIsRunning(true);
-          startAutomationLoop();
-          await client?.sendMessage(message.chatId, {
-            message: "🚀 Automation loop started. Check Logs for progress.",
-          });
-        } else if (text === "/stopsend" || text === ".stopsend") {
-          setIsRunning(false);
-          await client?.sendMessage(message.chatId, {
-            message: "🛑 Automation loop stopped.",
-          });
-        } else if (text.startsWith("/addmsg ") || text.startsWith(".addmsg ")) {
-          const newMsg = textRaw.substring(8).trim();
-          if (newMsg) {
-            const id = Math.random().toString(36).substring(2);
-            db.prepare(
-              "INSERT INTO messages (id, text, createdAt) VALUES (?, ?, ?)",
-            ).run(id, newMsg, Date.now());
-            await client?.sendMessage(message.chatId, {
-              message: "✅ Message added to database.",
-            });
+                    await taskQueue.add(async () => {
+                      await status.update(`⚙️ Generating PDF...`);
+                      const doc = new PDFDocument();
+                      const id = Math.random().toString(36).substring(2);
+                      const filename = `chat_export_${id}.pdf`;
+                      const filepath = path.join(exportsDir, filename);
+                      const stream = fs.createWriteStream(filepath);
+                      doc.pipe(stream);
+
+                      doc
+                        .fontSize(16)
+                        .text(`Export for Chat ${message.chatId}`, {
+                          underline: true,
+                        });
+                      doc.moveDown();
+
+                      const sortedHistory = [...history].reverse();
+                      for (const msg of sortedHistory) {
+                        if (msg.message) {
+                          const date = new Date(
+                            msg.date * 1000,
+                          ).toLocaleString();
+                          const sender = msg.senderId
+                            ? msg.senderId.toString()
+                            : "Unknown";
+                          doc
+                            .fontSize(10)
+                            .fillColor("gray")
+                            .text(`[${date}] ${sender}:`);
+                          doc.fontSize(12).fillColor("black").text(msg.message);
+                          doc.moveDown(0.5);
+                        }
+                      }
+                      doc.end();
+
+                      await new Promise<void>((resolve, reject) => {
+                        stream.on("finish", resolve);
+                        stream.on("error", reject);
+                      });
+
+                      db.prepare(
+                        "INSERT INTO exports (id, filename, filepath, createdAt, type, status) VALUES (?, ?, ?, ?, ?, ?)",
+                      ).run(
+                        id,
+                        filename,
+                        filepath,
+                        Date.now(),
+                        "chat-export",
+                        "success",
+                      );
+
+                      await status.update(`📤 Uploading PDF...`);
+                      await client?.sendMessage(message.chatId, {
+                        message: "✅ Chat export complete!",
+                        file: filepath,
+                      });
+                      await status.done(null, 0);
+                      addLog(
+                        `Exported ${sortedHistory.length} messages to ${filename}`,
+                        "success",
+                      );
+                    });
+                  } else {
+                    await status.fail("No messages found to export.");
+                  }
+                } catch (err) {
+                  await status.fail(`Export failed: ${String(err)}`);
+                  addLog(`Chat export failed: ${String(err)}`, "error");
+                }
+              },
+            );
+            return;
           }
-        } else if (
-          text.startsWith("/addtarget ") ||
-          text.startsWith(".addtarget ")
-        ) {
-          const targetName = textRaw.substring(11).trim();
-          if (targetName) {
-            const id = Math.random().toString(36).substring(2);
-            db.prepare(
-              "INSERT INTO targets (id, name, type) VALUES (?, ?, ?)",
-            ).run(id, targetName, "group");
+
+          // 7. BROADCAST COMMANDS
+          if (text === "/startsend" || text === ".startsend") {
+            setIsRunning(true);
+            startAutomationLoop();
             await client?.sendMessage(message.chatId, {
-              message: `✅ Target ${targetName} added.`,
+              message: "🚀 Automation loop started. Check Logs for progress.",
             });
+          } else if (text === "/stopsend" || text === ".stopsend") {
+            setIsRunning(false);
+            await client?.sendMessage(message.chatId, {
+              message: "🛑 Automation loop stopped.",
+            });
+          } else if (
+            text.startsWith("/addmsg ") ||
+            text.startsWith(".addmsg ")
+          ) {
+            const newMsg = textRaw.substring(8).trim();
+            if (newMsg) {
+              const id = Math.random().toString(36).substring(2);
+              db.prepare(
+                "INSERT INTO messages (id, text, createdAt) VALUES (?, ?, ?)",
+              ).run(id, newMsg, Date.now());
+              await client?.sendMessage(message.chatId, {
+                message: "✅ Message added to database.",
+              });
+            }
+          } else if (
+            text.startsWith("/addtarget ") ||
+            text.startsWith(".addtarget ")
+          ) {
+            const targetName = textRaw.substring(11).trim();
+            if (targetName) {
+              const id = Math.random().toString(36).substring(2);
+              db.prepare(
+                "INSERT INTO targets (id, name, type) VALUES (?, ?, ?)",
+              ).run(id, targetName, "group");
+              await client?.sendMessage(message.chatId, {
+                message: `✅ Target ${targetName} added.`,
+              });
+            }
           }
+        } catch (err: any) {
+          console.error("[BOT] Error in messageHandler:", err);
+          addLog(`Handler Error: ${err.message || String(err)}`, "error");
         }
       };
 
@@ -3296,6 +3359,8 @@ _Visit the dashboard for advanced configuration._`;
       );
       client = null;
       return false;
+    } finally {
+      isConnecting = false;
     }
   };
 
