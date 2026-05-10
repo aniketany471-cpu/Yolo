@@ -1537,23 +1537,21 @@ class SmartStatus {
         });
         this.messageId = msg.id;
       } else {
-        // Only edit if content is different (simple check)
-        await this.client
-          .editMessage(chat, {
+        try {
+          await this.client.editMessage(chat, {
             message: this.messageId,
             text,
             parseMode: pMode,
-          })
-          .catch((err) => {
-            // If edit fails (e.g. message deleted or same content), try sending new
-            if (
-              err.message?.includes("MESSAGE_ID_INVALID") ||
-              err.message?.includes("MESSAGE_NOT_MODIFIED")
-            ) {
-              return; // Ignore or handle as needed
-            }
-            console.error("SmartStatus Edit Error:", err.message);
           });
+        } catch (err: any) {
+          if (
+            err.message?.includes("MESSAGE_ID_INVALID") ||
+            err.message?.includes("MESSAGE_NOT_MODIFIED")
+          ) {
+            return;
+          }
+          console.error("SmartStatus Edit Error:", err.message);
+        }
       }
     } catch (e) {
       console.error("SmartStatus Update Error:", e);
@@ -1574,20 +1572,20 @@ class SmartStatus {
         });
         this.messageId = msg.id;
       } else {
-        await this.client
-          .editMessage(chat, {
+        try {
+          await this.client.editMessage(chat, {
             message: this.messageId,
             text,
             parseMode: pMode,
-          })
-          .catch(async () => {
-            // Fallback to send new
-            await this.client?.sendMessage(chat, {
-              message: text,
-              parseMode: pMode,
-              replyTo: options.replyTo || this.replyTo || undefined,
-            });
           });
+        } catch (e) {
+          // Fallback to send new
+          await this.client?.sendMessage(chat, {
+            message: text,
+            parseMode: pMode,
+            replyTo: options.replyTo || this.replyTo || undefined,
+          });
+        }
       }
       this.autoDelete = false;
     } catch (e) {
@@ -3143,11 +3141,9 @@ _Visit the dashboard for advanced configuration._`;
                     const stream = fs.createWriteStream(filepath);
                     doc.pipe(stream);
 
-                    doc
-                      .fontSize(16)
-                      .text(`Export for Chat ${message.chatId}`, {
-                        underline: true,
-                      });
+                    doc.fontSize(16).text(`Export for Chat ${message.chatId}`, {
+                      underline: true,
+                    });
                     doc.moveDown();
 
                     const sortedHistory = [...history].reverse();
