@@ -837,12 +837,12 @@ const PermissionLevel = {
   SUDO: 1,
   ADMIN: 2,
   OWNER: 3
-} as const;
+};
 
-type PermissionLevel = typeof PermissionLevel[keyof typeof PermissionLevel];
+type PermissionLevelValue = number;
 
 class PermissionManager {
-  static getLevel(userId: string, myId: string, config: any): PermissionLevel {
+  static getLevel(userId: string, myId: string, config: any): number {
     if (userId === myId) return PermissionLevel.OWNER;
     const admins = (config.adminUsers || "").split(',').map((s: any) => s.trim()).filter(Boolean);
     if (admins.includes(userId)) return PermissionLevel.ADMIN;
@@ -855,7 +855,7 @@ class PermissionManager {
     return PermissionLevel.PUBLIC;
   }
 
-  static async check(command: string, userId: string, chatId: string, myId: string): Promise<{ allowed: boolean, reason?: string, level: PermissionLevel }> {
+  static async check(command: string, userId: string, chatId: string, myId: string): Promise<{ allowed: boolean, reason?: string, level: number }> {
     const config = db.prepare("SELECT * FROM config WHERE id = 1").get() as any;
     const level = this.getLevel(userId, myId, config);
     
@@ -2009,9 +2009,9 @@ _Visit the dashboard for advanced configuration._`;
           }
 
           if (text.startsWith('/ans') || text.startsWith('.ans')) {
-            await CommandProcessor.process(client, message, config, myId, 'ans', textRaw, async (status) => {
+            await CommandProcessor.process(client!, message, config, myId, 'ans', textRaw, async (status) => {
               if (!message.replyToMsgId) return status.fail('Reply to a message with /ans');
-              const repl = await client.getMessages(message.chatId, { ids: [message.replyToMsgId] });
+              const repl = await client!.getMessages(message.chatId, { ids: [message.replyToMsgId] });
               const promptText = (repl[0]?.message || "").trim();
               if (!promptText) return status.fail('No text content in replied message.');
               await status.update(`🧠 Thinking...`);
@@ -2029,45 +2029,45 @@ _Visit the dashboard for advanced configuration._`;
           }
 
           if (text.startsWith('/music ') || text.startsWith('.music ') || text.startsWith('/song ') || text.startsWith('.song ')) {
-            await CommandProcessor.process(client, message, config, myId, 'music', textRaw, async (status) => {
+            await CommandProcessor.process(client!, message, config, myId, 'music', textRaw, async (status) => {
               await handleMusicCommand(message, textRaw, status);
             });
             return;
           }
 
           if (text.startsWith('/gif ') || text.startsWith('.gif ')) {
-            await CommandProcessor.process(client, message, config, myId, 'gif', textRaw, async (status) => {
-              const query = textRaw.split(/\s+/).slice(1).join(' ');
-              await handleGif(client, message, config, status, query);
+            await CommandProcessor.process(client!, message, config, myId, 'gif', textRaw, async (status) => {
+              const queryString = textRaw.split(/\s+/).slice(1).join(' ');
+              await handleGif(client!, message, config, status, queryString);
             });
             return;
           }
 
           if (text === '/sticker' || text === '.sticker') {
-            await CommandProcessor.process(client, message, config, myId, 'sticker', textRaw, async (status) => {
-              await handleStickerCommand(client, message, status);
+            await CommandProcessor.process(client!, message, config, myId, 'sticker', textRaw, async (status) => {
+              await handleStickerCommand(client!, message, status);
             });
             return;
           }
 
           if (text === '/pdf' || text === '.pdf') {
-            await CommandProcessor.process(client, message, config, myId, 'pdf', textRaw, async (status) => {
-              await handlePdfCommand(client, message, status);
+            await CommandProcessor.process(client!, message, config, myId, 'pdf', textRaw, async (status) => {
+              await handlePdfCommand(client!, message, status);
             });
             return;
           }
 
           if (text.startsWith('/summarize') || text.startsWith('.summarize')) {
-            await CommandProcessor.process(client, message, config, myId, 'summarize', textRaw, async (status) => {
-               await handleSummarize(client, message, config, status);
+            await CommandProcessor.process(client!, message, config, myId, 'summarize', textRaw, async (status) => {
+               await handleSummarize(client!, message, config, status);
             });
             return;
           }
 
           if (text.startsWith('/translate') || text.startsWith('.translate')) {
-            await CommandProcessor.process(client, message, config, myId, 'translate', textRaw, async (status) => {
+            await CommandProcessor.process(client!, message, config, myId, 'translate', textRaw, async (status) => {
                const args = textRaw.split(/\s+/).slice(1).join(' ');
-               await handleTranslate(client, message, config, status, args);
+               await handleTranslate(client!, message, config, status, args);
             });
             return;
           }
@@ -2082,7 +2082,7 @@ _Visit the dashboard for advanced configuration._`;
         }
 
         if (text === '/startbot' || text === '.startbot') {
-          await CommandProcessor.process(client, message, config, myId, 'startbot', textRaw, async (status) => {
+          await CommandProcessor.process(client!, message, config, myId, 'startbot', textRaw, async (status) => {
             setIsRunning(true);
             startAutomationLoop();
             await status.finish("✅ Bot automation started.");
@@ -2091,7 +2091,7 @@ _Visit the dashboard for advanced configuration._`;
         }
 
         if (text === '/stopbot' || text === '.stopbot') {
-            await CommandProcessor.process(client, message, config, myId, 'stopbot', textRaw, async (status) => {
+            await CommandProcessor.process(client!, message, config, myId, 'stopbot', textRaw, async (status) => {
               setIsRunning(false);
               await status.finish("🛑 Bot automation stopped.");
             });
@@ -2100,13 +2100,13 @@ _Visit the dashboard for advanced configuration._`;
 
         if (text.startsWith('/sudoadd ')) {
           const target = textRaw.split(/\s+/)[1]?.trim();
-          if (target) await handleSudoManagement(client, message, myId, 'add', target);
+          if (target) await handleSudoManagement(client!, message, myId, 'add', target);
           return;
         }
 
         if (text.startsWith('/sudoremove ')) {
           const target = textRaw.split(/\s+/)[1]?.trim();
-          if (target) await handleSudoManagement(client, message, myId, 'remove', target);
+          if (target) await handleSudoManagement(client!, message, myId, 'remove', target);
           return;
         }
 
