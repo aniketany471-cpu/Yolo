@@ -832,12 +832,14 @@ class TaskQueue {
   }
 }
 
-enum PermissionLevel {
-  PUBLIC = 0,
-  SUDO = 1,
-  ADMIN = 2,
-  OWNER = 3
-}
+const PermissionLevel = {
+  PUBLIC: 0,
+  SUDO: 1,
+  ADMIN: 2,
+  OWNER: 3
+} as const;
+
+type PermissionLevel = typeof PermissionLevel[keyof typeof PermissionLevel];
 
 class PermissionManager {
   static getLevel(userId: string, myId: string, config: any): PermissionLevel {
@@ -2009,7 +2011,7 @@ _Visit the dashboard for advanced configuration._`;
           if (text.startsWith('/ans') || text.startsWith('.ans')) {
             await CommandProcessor.process(client, message, config, myId, 'ans', textRaw, async (status) => {
               if (!message.replyToMsgId) return status.fail('Reply to a message with /ans');
-              const repl = await client!.getMessages(message.chatId, { ids: [message.replyToMsgId] });
+              const repl = await client.getMessages(message.chatId, { ids: [message.replyToMsgId] });
               const promptText = (repl[0]?.message || "").trim();
               if (!promptText) return status.fail('No text content in replied message.');
               await status.update(`🧠 Thinking...`);
@@ -2036,28 +2038,28 @@ _Visit the dashboard for advanced configuration._`;
           if (text.startsWith('/gif ') || text.startsWith('.gif ')) {
             await CommandProcessor.process(client, message, config, myId, 'gif', textRaw, async (status) => {
               const query = textRaw.split(/\s+/).slice(1).join(' ');
-              await handleGif(client!, message, config, status, query);
+              await handleGif(client, message, config, status, query);
             });
             return;
           }
 
           if (text === '/sticker' || text === '.sticker') {
             await CommandProcessor.process(client, message, config, myId, 'sticker', textRaw, async (status) => {
-              await handleStickerCommand(client!, message, status);
+              await handleStickerCommand(client, message, status);
             });
             return;
           }
 
           if (text === '/pdf' || text === '.pdf') {
             await CommandProcessor.process(client, message, config, myId, 'pdf', textRaw, async (status) => {
-              await handlePdfCommand(client!, message, status);
+              await handlePdfCommand(client, message, status);
             });
             return;
           }
 
           if (text.startsWith('/summarize') || text.startsWith('.summarize')) {
             await CommandProcessor.process(client, message, config, myId, 'summarize', textRaw, async (status) => {
-               await handleSummarize(client!, message, config, status);
+               await handleSummarize(client, message, config, status);
             });
             return;
           }
@@ -2065,7 +2067,7 @@ _Visit the dashboard for advanced configuration._`;
           if (text.startsWith('/translate') || text.startsWith('.translate')) {
             await CommandProcessor.process(client, message, config, myId, 'translate', textRaw, async (status) => {
                const args = textRaw.split(/\s+/).slice(1).join(' ');
-               await handleTranslate(client!, message, config, status, args);
+               await handleTranslate(client, message, config, status, args);
             });
             return;
           }
@@ -2098,13 +2100,13 @@ _Visit the dashboard for advanced configuration._`;
 
         if (text.startsWith('/sudoadd ')) {
           const target = textRaw.split(/\s+/)[1]?.trim();
-          if (target) await handleSudoManagement(client!, message, myId, 'add', target);
+          if (target) await handleSudoManagement(client, message, myId, 'add', target);
           return;
         }
 
         if (text.startsWith('/sudoremove ')) {
           const target = textRaw.split(/\s+/)[1]?.trim();
-          if (target) await handleSudoManagement(client!, message, myId, 'remove', target);
+          if (target) await handleSudoManagement(client, message, myId, 'remove', target);
           return;
         }
 
