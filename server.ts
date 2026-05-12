@@ -1620,7 +1620,7 @@ const commandCooldowns = new Map<string, number>();
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT || 3000);
 
   app.use(express.json());
 
@@ -2100,11 +2100,13 @@ async function startServer() {
   ) {
     const query = text.split(" ").slice(1).join(" ").trim();
     if (!query) {
-      if (status) await status.fail("Usage: /music <song name>");
-      else
+      if (status) {
+        await status.fail("Usage: /music <song name>");
+      } else {
         await client?.sendMessage(message.chatId, {
           message: "❌ Usage: /music <song name>",
         });
+      }
       return;
     }
 
