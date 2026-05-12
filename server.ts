@@ -2100,11 +2100,13 @@ async function startServer() {
   ) {
     const query = text.split(" ").slice(1).join(" ").trim();
     if (!query) {
-      if (status) await status.fail("Usage: /music <song name>");
-      else
+      if (status) {
+        await status.fail("Usage: /music <song name>");
+      } else {
         await client?.sendMessage(message.chatId, {
           message: "❌ Usage: /music <song name>",
         });
+      }
       return;
     }
 
