@@ -21,9 +21,14 @@ const MatureSettings: React.FC = () => {
   const { config, updateConfig, nsfwLogs, nsfwUsers, toggleNSFWUser, clearNSFWLogs } = useAppContext();
   const [activeTab, setActiveTab] = useState<'settings' | 'users' | 'logs'>('settings');
   const [searchTerm, setSearchTerm] = useState('');
+  const [nsfwPersonality, setNsfwPersonality] = useState(config.nsfwPersonality || '');
 
   const filteredUsers = nsfwUsers.filter(u => u.userId.toLowerCase().includes(searchTerm.toLowerCase()));
   const filteredLogs = nsfwLogs.filter(l => l.userId.toLowerCase().includes(searchTerm.toLowerCase()) || l.message.toLowerCase().includes(searchTerm.toLowerCase()));
+
+  React.useEffect(() => {
+    setNsfwPersonality(config.nsfwPersonality || '');
+  }, [config.nsfwPersonality]);
 
   const toggleNSFWGlobal = () => {
     updateConfig({ nsfwEnabled: config.nsfwEnabled === 1 ? 0 : 1 });
@@ -101,8 +106,9 @@ const MatureSettings: React.FC = () => {
                 <div>
                   <label className="block text-sm font-medium text-gray-300 mb-2">NSFW AI Personality</label>
                   <textarea
-                    value={config.nsfwPersonality || ''}
-                    onChange={(e) => updateConfig({ nsfwPersonality: e.target.value })}
+                    value={nsfwPersonality}
+                    onChange={(e) => setNsfwPersonality(e.target.value)}
+                    onBlur={() => updateConfig({ nsfwPersonality })}
                     className="w-full h-32 bg-gray-900/50 border border-gray-700 rounded-xl px-4 py-3 text-white focus:ring-2 focus:ring-pink-500 focus:border-transparent transition-all outline-none resize-none"
                     placeholder="Describe the mature AI personality..."
                   />
