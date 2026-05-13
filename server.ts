@@ -369,6 +369,33 @@ if (
   );
 }
 
+// Bootstrap credentials from env vars so Railway redeployments don't wipe them from the UI
+{
+  const envBootstrap = db
+    .prepare(
+      "SELECT telegramApiId, telegramApiHash, telegramStringSession, geminiKey FROM config WHERE id = 1",
+    )
+    .get() as any;
+  const envUpdates: Record<string, string> = {};
+  if (!envBootstrap?.telegramApiId && process.env.TELEGRAM_API_ID)
+    envUpdates.telegramApiId = process.env.TELEGRAM_API_ID;
+  if (!envBootstrap?.telegramApiHash && process.env.TELEGRAM_API_HASH)
+    envUpdates.telegramApiHash = process.env.TELEGRAM_API_HASH;
+  if (!envBootstrap?.telegramStringSession && process.env.TELEGRAM_STRING_SESSION)
+    envUpdates.telegramStringSession = process.env.TELEGRAM_STRING_SESSION;
+  if (!envBootstrap?.geminiKey && process.env.GEMINI_API_KEY)
+    envUpdates.geminiKey = process.env.GEMINI_API_KEY;
+  if (Object.keys(envUpdates).length > 0) {
+    for (const [k, v] of Object.entries(envUpdates)) {
+      db.prepare(`UPDATE config SET ${k} = ? WHERE id = 1`).run(v);
+    }
+    console.log(
+      "[startup] Bootstrapped missing credentials from environment variables:",
+      Object.keys(envUpdates).join(", "),
+    );
+  }
+}
+
 async function getGeminiResponse(
   prompt: string,
   apiKey: string,
@@ -1764,12 +1791,22 @@ async function startServer() {
       "telegramStringSession",
     ];
 
-    for (const key of Object.keys(updates)) {
-      if (allowed.includes(key)) {
-        db.prepare(`UPDATE config SET ${key} = ? WHERE id = 1`).run(
-          updates[key],
-        );
+    try {
+      for (const key of Object.keys(updates)) {
+        if (allowed.includes(key)) {
+          let value: any = updates[key];
+          // SQLite only accepts primitive values — coerce arrays/objects to strings
+          if (Array.isArray(value)) {
+            value = value.join(",");
+          } else if (value !== null && typeof value === "object") {
+            value = JSON.stringify(value);
+          }
+          db.prepare(`UPDATE config SET ${key} = ? WHERE id = 1`).run(value);
+        }
       }
+    } catch (err) {
+      console.error("[api/config] Failed to save config:", err);
+      return res.status(500).json({ error: "Failed to save configuration" });
     }
 
     // Check if we need to reload Telegram Session
