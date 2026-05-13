@@ -100,7 +100,7 @@ interface AppContextType {
   removeMessage: (id: string) => void;
   addTarget: (target: TelegramTarget) => void;
   removeTarget: (id: string) => void;
-  updateConfig: (config: Partial<AppConfig>) => void;
+  updateConfig: (config: Partial<AppConfig>) => Promise<{ telegramConnected?: boolean | null }>;
   toggleBot: () => void;
   clearLogs: () => void;
   toggleNSFWUser: (userId: string, enabled: boolean) => void;
@@ -167,7 +167,7 @@ const defaultContext: AppContextType = {
   removeMessage: () => {},
   addTarget: () => {},
   removeTarget: () => {},
-  updateConfig: () => {},
+  updateConfig: () => Promise.resolve({}),
   toggleBot: () => {},
   clearLogs: () => {},
   toggleNSFWUser: () => {},
@@ -375,18 +375,25 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     } catch {}
   };
 
-  const updateConfig = async (newConfig: Partial<AppConfig>) => {
-    setConfig(prev => {
-      const updated = { ...prev, ...newConfig };
-      
-      // Perform the network request with the merged state
-      fetch('/api/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(updated)
-      }).catch(err => console.error("Failed to update config on server", err));
-      
-      return updated;
+  const updateConfig = async (newConfig: Partial<AppConfig>): Promise<{ telegramConnected?: boolean | null }> => {
+    return new Promise((resolve) => {
+      setConfig(prev => {
+        const updated = { ...prev, ...newConfig };
+        
+        fetch('/api/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(updated)
+        })
+          .then(r => r.json())
+          .then(data => resolve({ telegramConnected: data.telegramConnected }))
+          .catch(err => {
+            console.error("Failed to update config on server", err);
+            resolve({});
+          });
+        
+        return updated;
+      });
     });
   };
 
