@@ -566,7 +566,7 @@ async function getOpenRouterResponse(
           ];
 
     const response = await fetch(
-      "https://api.v1.openrouter.ai/chat/completions",
+      "https://openrouter.ai/api/v1/chat/completions",
       {
         method: "POST",
         headers: {
@@ -1815,11 +1815,11 @@ async function startServer() {
       updates.telegramApiId ||
       updates.telegramApiHash
     ) {
-      // Trigger async reload
-      loadTelethon();
+      const connected = await loadTelethon();
+      return res.json({ success: true, telegramConnected: connected });
     }
 
-    res.json({ success: true });
+    res.json({ success: true, telegramConnected: null });
   });
 
   app.get("/api/nsfw/data", (req, res) => {
