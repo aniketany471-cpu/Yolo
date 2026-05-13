@@ -1,3 +1,4 @@
+import { execSync } from "child_process";
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import Database from "better-sqlite3";
@@ -1577,6 +1578,11 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(__dirname, "dist");
+    if (!fs.existsSync(path.join(distPath, "index.html"))) {
+      console.log("dist/ not found — building frontend now...");
+      execSync("npm run build", { cwd: __dirname, stdio: "inherit" });
+      console.log("Frontend build complete.");
+    }
     app.use(express.static(distPath));
     app.get("*", (req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
