@@ -2199,6 +2199,13 @@ async function startServer() {
           const isMe = message.out || myId && senderId === myId;
           let config2 = db.prepare("SELECT * FROM config WHERE id = 1").get();
           const admins = config2?.adminUsers ? config2.adminUsers.split(",").map((s) => s.trim()) : [];
+          const isCommand = textRaw.startsWith("/") || textRaw.startsWith(".");
+          // Non-command messages (plain text, mentions, replies) go straight to AI — no permission gate
+          if (!isMe && !isCommand) {
+            await maybeHandleAutoReply(client, message, config2, myId, myUsername);
+            return;
+          }
+          // Permission check only applies to bot commands
           const auth = await PermissionManager.check(
             text,
             senderId || "",
