@@ -1707,6 +1707,7 @@ async function startServer() {
             config?.geminiKey ||
             config?.groqKey ||
             config?.openRouterKey ||
+            config?.bluesmindsApiKey ||
             process.env.GEMINI_API_KEY
           ),
         },
