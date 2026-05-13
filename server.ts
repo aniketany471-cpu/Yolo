@@ -372,32 +372,11 @@ db.exec(`
 `);
 
 // Only update if key is missing or explicitly needed, but don't force provider if user changed it.
-const existingConfig = db
-  .prepare("SELECT openRouterKey, aiProvider, bluesmindsApiKey FROM config WHERE id = 1")
-  .get() as any;
-if (
-  !existingConfig?.openRouterKey ||
-  existingConfig.openRouterKey.length < 10
-) {
-  db.prepare(
-    "UPDATE config SET openRouterKey = ? WHERE id = 1",
-  ).run(
-    "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",
-  );
-}
-// Always ensure Blueminds key is set — survives Railway redeployments
-if (!existingConfig?.bluesmindsApiKey || existingConfig.bluesmindsApiKey.trim().length < 10) {
-  db.prepare(
-    "UPDATE config SET bluesmindsApiKey = ?, aiProvider = 'bluesminds' WHERE id = 1",
-  ).run("sk-Hzpp0hJnRRSE1JiRSeCP0XI3UxP0CLRBIUvUlPBn1yBfnX0j");
-  console.log("[startup] Blueminds API key bootstrapped.");
-}
-
 // Bootstrap credentials from env vars so Railway redeployments don't wipe them from the UI
 {
   const envBootstrap = db
     .prepare(
-      "SELECT telegramApiId, telegramApiHash, telegramStringSession, geminiKey FROM config WHERE id = 1",
+      "SELECT telegramApiId, telegramApiHash, telegramStringSession, geminiKey, openRouterKey, groqKey, bluesmindsApiKey FROM config WHERE id = 1",
     )
     .get() as any;
   const envUpdates: Record<string, string> = {};
@@ -407,8 +386,14 @@ if (!existingConfig?.bluesmindsApiKey || existingConfig.bluesmindsApiKey.trim().
     envUpdates.telegramApiHash = process.env.TELEGRAM_API_HASH;
   if (!envBootstrap?.telegramStringSession && process.env.TELEGRAM_STRING_SESSION)
     envUpdates.telegramStringSession = process.env.TELEGRAM_STRING_SESSION;
-  if (!envBootstrap?.geminiKey && process.env.GEMINI_API_KEY)
+  if (process.env.GEMINI_API_KEY)
     envUpdates.geminiKey = process.env.GEMINI_API_KEY;
+  if (process.env.OPENROUTER_API_KEY)
+    envUpdates.openRouterKey = process.env.OPENROUTER_API_KEY;
+  if (process.env.GROQ_API_KEY)
+    envUpdates.groqKey = process.env.GROQ_API_KEY;
+  if (process.env.BLUESMINDS_API_KEY)
+    envUpdates.bluesmindsApiKey = process.env.BLUESMINDS_API_KEY;
   if (Object.keys(envUpdates).length > 0) {
     for (const [k, v] of Object.entries(envUpdates)) {
       db.prepare(`UPDATE config SET ${k} = ? WHERE id = 1`).run(v);
@@ -2684,7 +2669,7 @@ async function startServer() {
           );
         } else {
           await status.finish(
-            "❌ **AI Error:** Could not generate a response. Please check your keys or try again later.",
+            "❌ **AI Error:** All AI providers failed. Please add a valid API key in **AI Settings** (Gemini key recommended — free at aistudio.google.com/apikey) or set `GEMINI_API_KEY` in your Railway environment variables.",
           );
         }
       } catch (e: any) {
