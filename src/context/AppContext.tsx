@@ -262,7 +262,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             ...restConfig 
           } = data.config;
           
-          setConfig({
+          const nextConfig = {
             ...restConfig,
             adminUsers: typeof adminUsers === 'string' ? adminUsers.split(',') : [],
             youtube_cookies: youtube_cookies || '',
@@ -304,7 +304,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             publicCommandsEnabled: publicCommandsEnabled ?? 1,
             blacklistedUsers: blacklistedUsers || '',
             whitelistedUsers: whitelistedUsers || ''
-          });
+          };
+          // Only update config reference when values actually changed so that
+          // form fields being edited are not reset by the polling loop.
+          setConfig(prev =>
+            JSON.stringify(prev) === JSON.stringify(nextConfig) ? prev : nextConfig
+          );
           
           setLogs(data.logs);
           setIsRunning(data.isRunning);
