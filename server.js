@@ -1388,7 +1388,22 @@ async function startServer() {
       "autoReplyPersonality",
       "nsfwPersonality",
       "activeModel",
-      "deepThinking"
+      "deepThinking",
+      "sudoUsers",
+      "publicCommandsEnabled",
+      "blacklistedUsers",
+      "whitelistedUsers",
+      "autoDeleteWhitelist",
+      "autoReplyWhitelist",
+      "autoReplyBlacklist",
+      "youtube_cookies",
+      "globalCooldown",
+      "perUserCooldown",
+      "maxConcurrentTasks",
+      "cleanupEnabled",
+      "telegramApiId",
+      "telegramApiHash",
+      "telegramStringSession"
     ];
     for (const key of Object.keys(updates)) {
       if (allowed.includes(key)) {
