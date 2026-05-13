@@ -593,8 +593,8 @@ export function AISettings() {
                 </div>
                 <div className="p-3 bg-slate-950/50 border border-slate-800 rounded-lg">
                    <p className="text-[10px] text-slate-500 uppercase font-black mb-1">AI Engine</p>
-                   <p className={cn("text-xs font-bold", diagnostics.aiConfigureds ? "text-emerald-400" : "text-red-400")}>
-                      {diagnostics.aiConfigureds ? "READY" : "NO KEYS"}
+                   <p className={cn("text-xs font-bold", diagnostics.aiConfigured ? "text-emerald-400" : "text-red-400")}>
+                      {diagnostics.aiConfigured ? "READY" : "NO KEYS"}
                    </p>
                 </div>
                 <div className="p-3 bg-slate-950/50 border border-slate-800 rounded-lg">
@@ -629,8 +629,17 @@ export function AISettings() {
                 </div>
                 <div className="flex justify-between items-center text-xs">
                    <span className="text-slate-500">API Health</span>
-                   <span className={cn("px-2 py-0.5 rounded text-[10px] font-bold", config.bluesmindsApiKey ? "bg-emerald-500/10 text-emerald-400" : "bg-red-500/10 text-red-400")}>
-                      {config.bluesmindsApiKey ? "SECURE" : "MISSING"}
+                   <span className={cn("px-2 py-0.5 rounded text-[10px] font-bold",
+                      (config.aiProvider === 'bluesminds' ? config.bluesmindsApiKey :
+                       config.aiProvider === 'gemini' ? config.geminiKey :
+                       config.aiProvider === 'groq' ? config.groqKey :
+                       config.openRouterKey)
+                        ? "bg-emerald-500/10 text-emerald-400" : "bg-red-500/10 text-red-400")}>
+                      {(config.aiProvider === 'bluesminds' ? config.bluesmindsApiKey :
+                        config.aiProvider === 'gemini' ? config.geminiKey :
+                        config.aiProvider === 'groq' ? config.groqKey :
+                        config.openRouterKey)
+                         ? "SECURE" : "MISSING"}
                    </span>
                 </div>
                 <div className="pt-2">
