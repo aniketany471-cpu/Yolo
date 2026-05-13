@@ -2761,7 +2761,16 @@ async function startServer() {
           const admins = config?.adminUsers
             ? config.adminUsers.split(",").map((s: string) => s.trim())
             : [];
-          // Use PermissionManager for robust checks
+
+          const isCommand = textRaw.startsWith("/") || textRaw.startsWith(".");
+
+          // Non-command messages (plain text, mentions, replies) go straight to AI — no permission gate
+          if (!isMe && !isCommand) {
+            await maybeHandleAutoReply(client, message, config, myId, myUsername);
+            return;
+          }
+
+          // Permission check only applies to bot commands
           const auth = await PermissionManager.check(
             text,
             senderId || "",
@@ -2802,7 +2811,7 @@ async function startServer() {
             }
           }
 
-          // 2. Auto-Reply Logic
+          // 2. Auto-Reply Logic (for commands that also check auto-reply)
           if (!isMe) {
             await maybeHandleAutoReply(
               client,
