@@ -336,8 +336,8 @@ db.exec(`
     status TEXT
   );
 
-  INSERT OR IGNORE INTO config (id, minDelaySeconds, maxDelaySeconds, adminUsers, isRunning, youtube_cookies, globalCooldown, perUserCooldown, maxConcurrentTasks, aiEnabled, aiProvider, openRouterKey) 
-  VALUES (1, 600, 1200, 'YOUR_TELEGRAM_ID', 0, '', 3, 10, 2, 1, 'openrouter', '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');
+  INSERT OR IGNORE INTO config (id, minDelaySeconds, maxDelaySeconds, adminUsers, isRunning, youtube_cookies, globalCooldown, perUserCooldown, maxConcurrentTasks, aiEnabled, aiProvider, activeModel) 
+  VALUES (1, 600, 1200, 'YOUR_TELEGRAM_ID', 0, '', 3, 10, 2, 1, 'openrouter', 'openrouter/free');
 
   -- Ensure existing columns have defaults if they were null from migrations
   UPDATE config SET 
@@ -394,12 +394,17 @@ db.exec(`
     envUpdates.groqKey = process.env.GROQ_API_KEY;
   if (process.env.BLUESMINDS_API_KEY)
     envUpdates.bluesmindsApiKey = process.env.BLUESMINDS_API_KEY;
+  // If env var is set, always sync it to DB (env var is the source of truth on Railway)
+  if (process.env.OPENROUTER_API_KEY && process.env.OPENROUTER_API_KEY !== envBootstrap?.openRouterKey) {
+    db.prepare("UPDATE config SET openRouterKey = ?, aiProvider = 'openrouter' WHERE id = 1").run(process.env.OPENROUTER_API_KEY);
+    console.log("[startup] OpenRouter key synced from OPENROUTER_API_KEY env var.");
+  }
   if (Object.keys(envUpdates).length > 0) {
     for (const [k, v] of Object.entries(envUpdates)) {
       db.prepare(`UPDATE config SET ${k} = ? WHERE id = 1`).run(v);
     }
     console.log(
-      "[startup] Bootstrapped missing credentials from environment variables:",
+      "[startup] Bootstrapped credentials from environment variables:",
       Object.keys(envUpdates).join(", "),
     );
   }
