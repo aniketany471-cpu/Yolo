@@ -1352,7 +1352,7 @@ async function startServer() {
           isListenerActive,
           lastEventTimestamp,
           clientReady: !!client,
-          aiConfigured: !!(config?.geminiKey || config?.groqKey || config?.openRouterKey || process.env.GEMINI_API_KEY)
+          aiConfigured: !!(config?.geminiKey || config?.groqKey || config?.openRouterKey || config?.bluesmindsApiKey || process.env.GEMINI_API_KEY)
         }
       };
       res.json(payload);
