@@ -50,6 +50,11 @@ export interface AppConfig {
   cleanupEnabled?: number;
   bluesmindsApiKey?: string;
   activeModel?: string;
+  deepThinking?: number;
+  sudoUsers?: string;
+  publicCommandsEnabled?: number;
+  blacklistedUsers?: string;
+  whitelistedUsers?: string;
 }
 
 export interface LogEntry {
@@ -63,7 +68,7 @@ export interface AppDiagnostics {
   isListenerActive: boolean;
   lastEventTimestamp: number;
   clientReady: boolean;
-  aiConfigureds: boolean;
+  aiConfigured: boolean;
 }
 
 export interface NSFWLog {
@@ -100,6 +105,8 @@ interface AppContextType {
   clearLogs: () => void;
   toggleNSFWUser: (userId: string, enabled: boolean) => void;
   clearNSFWLogs: () => void;
+  addSudoUser: (id: string, name?: string) => void;
+  removeSudoUser: (id: string) => void;
 }
 
 const defaultContext: AppContextType = {
@@ -139,7 +146,12 @@ const defaultContext: AppContextType = {
     formattingEnabled: 1,
     cleanupEnabled: 1,
     bluesmindsApiKey: '',
-    activeModel: 'gemini-1.5-flash'
+    activeModel: 'gemini-1.5-flash',
+    deepThinking: 0,
+    sudoUsers: '',
+    publicCommandsEnabled: 1,
+    blacklistedUsers: '',
+    whitelistedUsers: ''
   },
   logs: [],
   nsfwLogs: [],
@@ -149,7 +161,7 @@ const defaultContext: AppContextType = {
     isListenerActive: false,
     lastEventTimestamp: 0,
     clientReady: false,
-    aiConfigureds: false
+    aiConfigured: false
   },
   addMessage: () => {},
   removeMessage: () => {},
@@ -160,6 +172,8 @@ const defaultContext: AppContextType = {
   clearLogs: () => {},
   toggleNSFWUser: () => {},
   clearNSFWLogs: () => {},
+  addSudoUser: () => {},
+  removeSudoUser: () => {},
 };
 
 const AppContext = createContext<AppContextType>(defaultContext);
@@ -201,7 +215,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     formattingEnabled: 1,
     cleanupEnabled: 1,
     bluesmindsApiKey: '',
-    activeModel: 'gemini-1.5-flash'
+    activeModel: 'gemini-1.5-flash',
+    deepThinking: 0,
+    sudoUsers: '',
+    publicCommandsEnabled: 1,
+    blacklistedUsers: '',
+    whitelistedUsers: ''
   });
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [nsfwLogs, setNSFWLogs] = useState<NSFWLog[]>([]);
@@ -211,7 +230,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     isListenerActive: false,
     lastEventTimestamp: 0,
     clientReady: false,
-    aiConfigureds: false
+    aiConfigured: false
   });
 
   const fetchState = async () => {
@@ -239,6 +258,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             searchEnabled, searchProvider, searchApiKey,
             aiMode, formattingEnabled, cleanupEnabled,
             bluesmindsApiKey, activeModel,
+            deepThinking, sudoUsers, publicCommandsEnabled, blacklistedUsers, whitelistedUsers,
             ...restConfig 
           } = data.config;
           
@@ -278,7 +298,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             formattingEnabled: formattingEnabled ?? 1,
             cleanupEnabled: cleanupEnabled ?? 1,
             bluesmindsApiKey: bluesmindsApiKey || '',
-            activeModel: activeModel || 'gemini-1.5-flash'
+            activeModel: activeModel || 'gemini-1.5-flash',
+            deepThinking: deepThinking ?? 0,
+            sudoUsers: sudoUsers || '',
+            publicCommandsEnabled: publicCommandsEnabled ?? 1,
+            blacklistedUsers: blacklistedUsers || '',
+            whitelistedUsers: whitelistedUsers || ''
           });
           
           setLogs(data.logs);
@@ -422,7 +447,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     <AppContext.Provider value={{
       messages, targets, config, logs, nsfwLogs, nsfwUsers, isRunning, diagnostics,
       addMessage, removeMessage, addTarget: addTarget as any, removeTarget, updateConfig, toggleBot, clearLogs,
-      toggleNSFWUser, clearNSFWLogs
+      toggleNSFWUser, clearNSFWLogs, addSudoUser, removeSudoUser
     }}>
       {children}
     </AppContext.Provider>
