@@ -28,6 +28,23 @@ const youtubeCookiesPath = path.join(cookiesDir, "youtube.txt");
 
 const upload = multer({ dest: tempDir });
 
+// Writes youtube_cookies from DB to disk so yt-dlp can use them
+function syncCookiesToDisk() {
+  try {
+    const row = db.prepare("SELECT youtube_cookies FROM config WHERE id = 1").get() as { youtube_cookies?: string };
+    const cookieText = row?.youtube_cookies || "";
+    if (cookieText.trim()) {
+      fs.outputFileSync(youtubeCookiesPath, cookieText);
+      console.log(`[cookies] Wrote youtube.txt to disk (${cookieText.length} bytes)`);
+    } else {
+      if (fs.existsSync(youtubeCookiesPath)) fs.removeSync(youtubeCookiesPath);
+      console.log("[cookies] No cookies in DB — youtube.txt removed.");
+    }
+  } catch (e) {
+    console.error("[cookies] Failed to sync cookies to disk:", e);
+  }
+}
+
 process.on("uncaughtException", (err) => {
   console.error("UNCAUGHT: " + err.stack);
 });
@@ -1814,6 +1831,11 @@ async function startServer() {
       return res.status(500).json({ error: "Failed to save configuration" });
     }
 
+    // If cookies were updated, write them to disk immediately
+    if (updates.youtube_cookies !== undefined) {
+      syncCookiesToDisk();
+    }
+
     // Only reconnect Telegram if the credentials actually changed
     const credsChanged =
       (updates.telegramApiId !== undefined && updates.telegramApiId !== prevCreds?.telegramApiId) ||
@@ -3112,6 +3134,27 @@ _Visit the dashboard for advanced configuration._`;
             return;
           }
 
+          if (text === "/reloadcookies" || text === ".reloadcookies") {
+            await CommandProcessor.process(
+              client,
+              message,
+              config,
+              myId,
+              "reloadcookies",
+              textRaw,
+              async (status) => {
+                syncCookiesToDisk();
+                const exists = fs.existsSync(youtubeCookiesPath);
+                await status.finish(
+                  exists
+                    ? "✅ YouTube cookies reloaded from database and written to disk."
+                    : "⚠️ No cookies found in database. Paste your cookies in Settings first.",
+                );
+              },
+            );
+            return;
+          }
+
           if (text === "/startbot" || text === ".startbot") {
             await CommandProcessor.process(
               client,
@@ -3490,6 +3533,9 @@ _Visit the dashboard for advanced configuration._`;
 
     loop(); // Kick off the background loop
   };
+
+  // Restore cookies from DB to disk on every boot
+  syncCookiesToDisk();
 
   // Recover state on boot
   loadTelethon().then(() => {
