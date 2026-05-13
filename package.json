@@ -5,12 +5,10 @@
     "type": "module",
     "scripts": {
       "dev": "tsx server.ts",
-      "build:client": "vite build",
-      "build:server": "esbuild server.ts --platform=node --format=esm --packages=external --outfile=server.js",
-      "build": "npm run build:client && npm run build:server",
+      "build": "vite build",
       "start": "NODE_ENV=production node server.js",
       "preview": "vite preview",
-      "clean": "rm -rf dist server.js",
+      "clean": "rm -rf dist",
       "lint": "tsc --noEmit"
     },
     "dependencies": {
@@ -24,7 +22,6 @@
       "clsx": "^2.1.1",
       "date-fns": "^4.1.0",
       "dotenv": "^17.2.3",
-      "esbuild": "^0.25.0",
       "express": "^4.21.2",
       "fs-extra": "^11.3.4",
       "input": "^1.0.1",
