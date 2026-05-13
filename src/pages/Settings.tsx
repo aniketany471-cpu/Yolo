@@ -24,6 +24,7 @@ export function Settings() {
   const [telegramApiHash, setTelegramApiHash] = useState(config.telegramApiHash || '');
   const [telegramStringSession, setTelegramStringSession] = useState(config.telegramStringSession || '');
   const [saved, setSaved] = useState(false);
+  const [telegramStatus, setTelegramStatus] = useState<'idle' | 'connecting' | 'connected' | 'failed'>('idle');
   const [ytdlVersion, setYtdlVersion] = useState<string | null>(null);
 
   useEffect(() => {
@@ -62,7 +63,7 @@ export function Settings() {
     await updateConfig({ ...config, autoDeleteCommands: checked ? 1 : 0 });
   };
 
-  const handleSave = (e: React.FormEvent) => {
+  const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
     
     let parsedMin = parseInt(minDelay);
@@ -78,7 +79,10 @@ export function Settings() {
 
     const adminList = admins.split(',').map(s => s.trim()).filter(s => s !== '');
 
-    updateConfig({
+    const hasTelegramCreds = !!(telegramApiId && telegramApiHash && telegramStringSession);
+    if (hasTelegramCreds) setTelegramStatus('connecting');
+
+    const result = await updateConfig({
       minDelaySeconds: parsedMin,
       maxDelaySeconds: parsedMax,
       adminUsers: adminList.length > 0 ? adminList : ['YOUR_TELEGRAM_ID'],
@@ -100,6 +104,17 @@ export function Settings() {
 
     setSaved(true);
     setTimeout(() => setSaved(false), 3000);
+
+    if (hasTelegramCreds) {
+      if (result.telegramConnected === true) {
+        setTelegramStatus('connected');
+      } else if (result.telegramConnected === false) {
+        setTelegramStatus('failed');
+      } else {
+        setTelegramStatus('idle');
+      }
+      setTimeout(() => setTelegramStatus('idle'), 6000);
+    }
   };
 
   return (
@@ -438,19 +453,35 @@ export function Settings() {
           </section>
 
           <div className="pt-4 flex items-center justify-between border-t border-slate-800">
-            <div>
+            <div className="space-y-1">
               {saved && (
-                <span className="text-emerald-400 text-sm font-medium animate-pulse">
+                <span className="text-emerald-400 text-sm font-medium block">
                   Settings saved successfully!
+                </span>
+              )}
+              {telegramStatus === 'connecting' && (
+                <span className="text-sky-400 text-sm font-medium block animate-pulse">
+                  ⏳ Connecting to Telegram...
+                </span>
+              )}
+              {telegramStatus === 'connected' && (
+                <span className="text-emerald-400 text-sm font-medium block">
+                  ✅ Telegram connected successfully!
+                </span>
+              )}
+              {telegramStatus === 'failed' && (
+                <span className="text-red-400 text-sm font-medium block">
+                  ❌ Telegram connection failed — check your API ID, Hash, and Session. See Dashboard logs for details.
                 </span>
               )}
             </div>
             <button
               type="submit"
-              className="flex items-center gap-2 bg-blue-600 hover:bg-blue-500 text-white font-medium py-2 px-6 rounded-lg transition-colors"
+              disabled={telegramStatus === 'connecting'}
+              className="flex items-center gap-2 bg-blue-600 hover:bg-blue-500 disabled:opacity-60 disabled:cursor-not-allowed text-white font-medium py-2 px-6 rounded-lg transition-colors"
             >
               <Save className="w-4 h-4" />
-              Save Configuration
+              {telegramStatus === 'connecting' ? 'Saving...' : 'Save Configuration'}
             </button>
           </div>
         </form>
