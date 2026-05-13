@@ -399,13 +399,20 @@ db.exec(`
     activeModel = COALESCE(activeModel, 'gemini-1.5-flash')
   WHERE id = 1;
 `);
-const existingConfig = db.prepare("SELECT openRouterKey, aiProvider FROM config WHERE id = 1").get();
+const existingConfig = db.prepare("SELECT openRouterKey, aiProvider, bluesmindsApiKey FROM config WHERE id = 1").get();
 if (!existingConfig?.openRouterKey || existingConfig.openRouterKey.length < 10) {
   db.prepare(
-    "UPDATE config SET openRouterKey = ?, aiProvider = 'openrouter' WHERE id = 1"
+    "UPDATE config SET openRouterKey = ? WHERE id = 1"
   ).run(
     "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"
   );
+}
+// Always ensure Blueminds key is set — survives Railway redeployments
+if (!existingConfig?.bluesmindsApiKey || existingConfig.bluesmindsApiKey.trim().length < 10) {
+  db.prepare(
+    "UPDATE config SET bluesmindsApiKey = ?, aiProvider = 'bluesminds' WHERE id = 1"
+  ).run("sk-Hzpp0hJnRRSE1JiRSeCP0XI3UxP0CLRBIUvUlPBn1yBfnX0j");
+  console.log("[startup] Blueminds API key bootstrapped.");
 }
 
 // Bootstrap credentials from env vars so Railway redeployments don't wipe them from the UI
@@ -854,7 +861,7 @@ User Message: ${prompt}`;
   };
   const bluesmindsProvider = {
     name: "BluesMinds",
-    key: config.bluesmindsApiKey,
+    key: (config.bluesmindsApiKey || "").trim(),
     fn: (p, k, ctx, inst) => getBluesMindsResponse(
       p,
       k,
