@@ -1795,10 +1795,11 @@ async function startServer() {
 
   app.post("/api/nsfw/users/:userId/toggle", (req, res) => {
     const { userId } = req.params;
-    const { enabled } = req.body;
+    const { enabled, nsfwEnabled } = req.body;
+    const isEnabled = enabled ?? nsfwEnabled;
     db.prepare(
       "INSERT OR REPLACE INTO user_nsfw_prefs (userId, nsfwEnabled, ageConfirmed, updatedAt) VALUES (?, ?, 1, ?)",
-    ).run(userId, enabled ? 1 : 0, Date.now());
+    ).run(userId, isEnabled ? 1 : 0, Date.now());
     res.json({ success: true });
   });
 
@@ -1816,17 +1817,17 @@ async function startServer() {
     const list = db
       .prepare("SELECT * FROM exports ORDER BY createdAt DESC")
       .all();
-    res.json(list);
+    res.json({ exports: list });
   });
 
   app.delete("/api/exports/:id", (req, res) => {
     const exp = db
       .prepare("SELECT filename FROM exports WHERE id = ?")
-      .get() as any;
+      .get(req.params.id) as any;
     if (exp) {
       const type = db
         .prepare("SELECT type FROM exports WHERE id = ?")
-        .get() as any;
+        .get(req.params.id) as any;
       const dir = type?.type === "music" ? musicDir : exportsDir;
       fs.remove(path.join(dir, exp.filename)).catch(() => {});
     }
@@ -1835,7 +1836,7 @@ async function startServer() {
   });
 
   app.get("/api/exports/download/:id", (req, res) => {
-    const exp = db.prepare("SELECT * FROM exports WHERE id = ?").get() as any;
+    const exp = db.prepare("SELECT * FROM exports WHERE id = ?").get(req.params.id) as any;
     if (!exp) return res.status(404).send("File not found");
     const dir = exp.type === "music" ? musicDir : exportsDir;
     res.download(path.join(dir, exp.filename));
@@ -1963,12 +1964,13 @@ async function startServer() {
   });
 
   app.post("/api/sudo-users", (req, res) => {
-    const { userId } = req.body;
-    if (!userId) return res.status(400).json({ error: "Missing userId" });
+    const { userId, id: bodyId, name } = req.body;
+    const resolvedUserId = userId || bodyId;
+    if (!resolvedUserId) return res.status(400).json({ error: "Missing userId" });
     const id = Math.random().toString(36).substring(2);
     db.prepare(
       "INSERT INTO sudo_users (id, userId, createdAt) VALUES (?, ?, ?)",
-    ).run(id, userId, Date.now());
+    ).run(id, resolvedUserId, Date.now());
     res.json({ success: true, id });
   });
 
