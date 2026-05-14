@@ -2723,13 +2723,28 @@ async function startServer() {
         parseInt(apiId.toString()),
         apiHash,
         {
-          connectionRetries: 10,
-          useWSS: false,
+          connectionRetries: 5,
+          useWSS: true,
           autoReconnect: true,
+          timeout: 30,
         },
       );
 
-      await client.connect();
+      // Wrap connect in a 40-second timeout so isConnecting never gets stuck
+      await Promise.race([
+        client.connect(),
+        new Promise<void>((_, reject) =>
+          setTimeout(
+            () =>
+              reject(
+                new Error(
+                  "Connection timed out after 40s — check your credentials and Railway network settings",
+                ),
+              ),
+            40000,
+          ),
+        ),
+      ]);
       const me: any = await client.getMe();
       const myId = me.id.toString();
       const myUsername = me.username || "";
