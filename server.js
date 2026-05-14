@@ -1432,6 +1432,10 @@ async function startServer() {
       "telegramApiHash",
       "telegramStringSession"
     ];
+    // Read current creds BEFORE saving so we can detect actual changes
+    const prevCreds = db.prepare(
+      "SELECT telegramApiId, telegramApiHash, telegramStringSession FROM config WHERE id = 1"
+    ).get();
     try {
       for (const key of Object.keys(updates)) {
         if (allowed.includes(key)) {
@@ -1449,7 +1453,12 @@ async function startServer() {
       console.error("[api/config] Failed to save config:", err);
       return res.status(500).json({ error: "Failed to save configuration" });
     }
-    if (updates.telegramStringSession || updates.telegramApiId || updates.telegramApiHash) {
+    // Only reconnect if credentials actually changed — not just because they were included in the payload
+    const credentialsChanged =
+      (updates.telegramStringSession !== undefined && updates.telegramStringSession !== prevCreds?.telegramStringSession) ||
+      (updates.telegramApiId !== undefined && String(updates.telegramApiId) !== String(prevCreds?.telegramApiId || "")) ||
+      (updates.telegramApiHash !== undefined && updates.telegramApiHash !== prevCreds?.telegramApiHash);
+    if (credentialsChanged) {
       loadTelethon();
     }
     res.json({ success: true });
