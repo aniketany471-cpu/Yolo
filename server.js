@@ -456,7 +456,7 @@ async function getGeminiResponse(prompt, apiKey, model = "gemini-1.5-flash", con
     return null;
   }
 }
-const AI_FETCH_TIMEOUT_MS = 30000;
+const AI_FETCH_TIMEOUT_MS = 10000;
 function makeAbortSignal() {
   const ctrl = new AbortController();
   setTimeout(() => ctrl.abort(), AI_FETCH_TIMEOUT_MS);
@@ -821,10 +821,11 @@ User Message: ${prompt}`;
     key: groqK,
     fn: (p, k, ctx, inst) => getGroqResponse(p, k, config.activeModel, ctx, inst)
   };
+  const systemOrKey = (process.env.OPENROUTER_API_KEY || "").trim();
   const orProvider = {
     name: "OpenRouter",
-    key: openRouterK,
-    fn: (p, k, ctx, inst) => getOpenRouterResponse(p, k, config.activeModel, ctx, inst)
+    key: openRouterK || systemOrKey,
+    fn: (p, k, ctx, inst) => getOpenRouterResponse(p, k, config.activeModel || "openrouter/free", ctx, inst)
   };
   const bluesmindsProvider = {
     name: "BluesMinds",
@@ -2090,13 +2091,18 @@ async function startServer() {
           }
         }
         await status.update("\u{1F50D} **Searching...**");
-        const aiRes = await getAIResponse(
-          text,
-          config,
-          chatIdStr,
-          senderId,
-          isNSFWActive
-        );
+        let aiRes = null;
+        try {
+          aiRes = await getAIResponse(
+            text,
+            config,
+            chatIdStr,
+            senderId,
+            isNSFWActive
+          );
+        } catch (aiErr) {
+          console.error(`[AI-Auto] getAIResponse threw:`, aiErr?.message || aiErr);
+        }
         if (aiRes && client2) {
           const responseMod = await moderateContent(aiRes);
           const formatted = formatAiMessage(
@@ -2111,11 +2117,12 @@ async function startServer() {
           );
         } else {
           await status.finish(
-            "\u274C **AI Error:** Could not generate a response. Please check your keys or try again later."
+            "\u274C **AI Error:** Could not generate a response. Check your AI provider key in settings or switch to OpenRouter (free)."
           );
         }
       } catch (e) {
-        console.error(`[AI-Auto] Error:`, e.message || e);
+        console.error(`[AI-Auto] Outer Error:`, e.message || e);
+        try { await status.finish("\u274C **AI Error:** Something went wrong. Please try again."); } catch (_) {}
       } finally {
         setTimeout(() => aiProcessingLock.delete(lockKey), 6e4);
       }
