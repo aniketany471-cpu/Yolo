@@ -1023,12 +1023,15 @@ class PermissionManager {
     if (level < PermissionLevel.OWNER && blacklisted.includes(userId)) {
       return { allowed: false, reason: "\u{1F6AB} You are blacklisted.", level };
     }
+    // These commands are always open to everyone — no toggle can block them
+    const alwaysPublicCommands = ["ans", "music", "song", "pdf", "stcr"];
     const publicCommands = [
       "ans",
       "music",
       "song",
       "gif",
       "sticker",
+      "stcr",
       "pdf",
       "summarize",
       "translate",
@@ -1044,6 +1047,10 @@ class PermissionManager {
       const ownerOnly = ["startbot", "stopbot", "reloadcookies"];
       if (ownerOnly.includes(cmdName))
         return { allowed: false, reason: "\u{1F451} Owner only command.", level };
+      return { allowed: true, level };
+    }
+    // Always-public commands bypass the global toggle
+    if (alwaysPublicCommands.includes(cmdName)) {
       return { allowed: true, level };
     }
     if (publicCommands.includes(cmdName)) {
@@ -2318,6 +2325,7 @@ async function startServer() {
             "song",
             "gif",
             "sticker",
+            "stcr",
             "pdf",
             "summarize",
             "translate",
@@ -2449,13 +2457,13 @@ _Visit the dashboard for advanced configuration._`;
               );
               return;
             }
-            if (text === "/sticker" || text === ".sticker") {
+            if (text === "/sticker" || text === ".sticker" || text === "/stcr" || text === ".stcr") {
               await CommandProcessor.process(
                 client,
                 message,
                 config2,
                 myId,
-                "sticker",
+                "stcr",
                 textRaw,
                 async (status) => {
                   await handleStickerCommand(client, message, status);
