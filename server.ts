@@ -1270,12 +1270,15 @@ class PermissionManager {
       return { allowed: false, reason: "🚫 You are blacklisted.", level };
     }
 
+    // These commands are always open to everyone — no toggle can block them
+    const alwaysPublicCommands = ["ans", "music", "song", "pdf", "stcr"];
     const publicCommands = [
       "ans",
       "music",
       "song",
       "gif",
       "sticker",
+      "stcr",
       "pdf",
       "summarize",
       "translate",
@@ -1294,11 +1297,16 @@ class PermissionManager {
     // Owner/Admin always allowed
     if (level >= PermissionLevel.ADMIN) return { allowed: true, level };
 
-    // Sudo allowed for non-owner commands (we'll keep it simple for now)
+    // Sudo allowed for non-owner commands
     if (level === PermissionLevel.SUDO) {
       const ownerOnly = ["startbot", "stopbot", "reloadcookies"];
       if (ownerOnly.includes(cmdName))
         return { allowed: false, reason: "👑 Owner only command.", level };
+      return { allowed: true, level };
+    }
+
+    // Always-public commands bypass the global toggle
+    if (alwaysPublicCommands.includes(cmdName)) {
       return { allowed: true, level };
     }
 
@@ -2942,6 +2950,7 @@ async function startServer() {
             "song",
             "gif",
             "sticker",
+            "stcr",
             "pdf",
             "summarize",
             "translate",
@@ -3091,13 +3100,18 @@ _Visit the dashboard for advanced configuration._`;
               return;
             }
 
-            if (text === "/sticker" || text === ".sticker") {
+            if (
+              text === "/sticker" ||
+              text === ".sticker" ||
+              text === "/stcr" ||
+              text === ".stcr"
+            ) {
               await CommandProcessor.process(
                 client,
                 message,
                 config,
                 myId,
-                "sticker",
+                "stcr",
                 textRaw,
                 async (status) => {
                   await handleStickerCommand(client, message, status);
