@@ -381,12 +381,17 @@ db.exec(`
     activeModel = COALESCE(activeModel, 'gemini-1.5-flash')
   WHERE id = 1;
 `);
-const existingConfig = db.prepare("SELECT openRouterKey, aiProvider FROM config WHERE id = 1").get();
+const existingConfig = db.prepare("SELECT openRouterKey, aiProvider, bluesmindsApiKey FROM config WHERE id = 1").get();
 if (!existingConfig?.openRouterKey || existingConfig.openRouterKey.length < 10) {
   db.prepare(
     "UPDATE config SET openRouterKey = ?, aiProvider = 'openrouter' WHERE id = 1"
   ).run(
     "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"
+  );
+}
+if (!existingConfig?.bluesmindsApiKey || existingConfig.bluesmindsApiKey.length < 10) {
+  db.prepare("UPDATE config SET bluesmindsApiKey = ? WHERE id = 1").run(
+    "sk-N1seJklpTA8FleqvsXg0bwg9pbgBR8uVuAuAv1qNOzSpZZjJ"
   );
 }
 
