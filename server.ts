@@ -356,7 +356,7 @@ db.exec(`
 
 // Only update if key is missing or explicitly needed, but don't force provider if user changed it.
 const existingConfig = db
-  .prepare("SELECT openRouterKey, aiProvider FROM config WHERE id = 1")
+  .prepare("SELECT openRouterKey, aiProvider, bluesmindsApiKey FROM config WHERE id = 1")
   .get() as any;
 if (
   !existingConfig?.openRouterKey ||
@@ -366,6 +366,11 @@ if (
     "UPDATE config SET openRouterKey = ?, aiProvider = 'openrouter' WHERE id = 1",
   ).run(
     "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",
+  );
+}
+if (!existingConfig?.bluesmindsApiKey || existingConfig.bluesmindsApiKey.length < 10) {
+  db.prepare("UPDATE config SET bluesmindsApiKey = ? WHERE id = 1").run(
+    "sk-N1seJklpTA8FleqvsXg0bwg9pbgBR8uVuAuAv1qNOzSpZZjJ",
   );
 }
 
