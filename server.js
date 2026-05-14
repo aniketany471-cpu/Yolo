@@ -26,24 +26,6 @@ const cookiesDir = path.join(__dirname, "cookies");
 fs.ensureDirSync(cookiesDir);
 const youtubeCookiesPath = path.join(cookiesDir, "youtube.txt");
 const upload = multer({ dest: tempDir });
-
-// Writes youtube_cookies from DB to disk so yt-dlp can use them
-function syncCookiesToDisk() {
-  try {
-    const row = db.prepare("SELECT youtube_cookies FROM config WHERE id = 1").get();
-    const cookieText = row?.youtube_cookies || "";
-    if (cookieText.trim()) {
-      fs.outputFileSync(youtubeCookiesPath, cookieText);
-      console.log("[cookies] Wrote youtube.txt to disk (" + cookieText.length + " bytes)");
-    } else {
-      // Remove stale file if cookies were cleared
-      if (fs.existsSync(youtubeCookiesPath)) fs.removeSync(youtubeCookiesPath);
-      console.log("[cookies] No cookies in DB — youtube.txt removed.");
-    }
-  } catch (e) {
-    console.error("[cookies] Failed to sync cookies to disk:", e);
-  }
-}
 process.on("uncaughtException", (err) => {
   console.error("UNCAUGHT: " + err.stack);
 });
@@ -365,8 +347,8 @@ db.exec(`
     status TEXT
   );
 
-  INSERT OR IGNORE INTO config (id, minDelaySeconds, maxDelaySeconds, adminUsers, isRunning, youtube_cookies, globalCooldown, perUserCooldown, maxConcurrentTasks, aiEnabled, aiProvider, activeModel) 
-  VALUES (1, 600, 1200, 'YOUR_TELEGRAM_ID', 0, '', 3, 10, 2, 1, 'openrouter', 'openrouter/free');
+  INSERT OR IGNORE INTO config (id, minDelaySeconds, maxDelaySeconds, adminUsers, isRunning, youtube_cookies, globalCooldown, perUserCooldown, maxConcurrentTasks, aiEnabled, aiProvider, openRouterKey) 
+  VALUES (1, 600, 1200, 'YOUR_TELEGRAM_ID', 0, '', 3, 10, 2, 1, 'openrouter', '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');
 
   -- Ensure existing columns have defaults if they were null from migrations
   UPDATE config SET 
@@ -399,10 +381,19 @@ db.exec(`
     activeModel = COALESCE(activeModel, 'gemini-1.5-flash')
   WHERE id = 1;
 `);
+const existingConfig = db.prepare("SELECT openRouterKey, aiProvider FROM config WHERE id = 1").get();
+if (!existingConfig?.openRouterKey || existingConfig.openRouterKey.length < 10) {
+  db.prepare(
+    "UPDATE config SET openRouterKey = ?, aiProvider = 'openrouter' WHERE id = 1"
+  ).run(
+    "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"
+  );
+}
+
 // Bootstrap credentials from env vars so Railway redeployments don't wipe them from the UI
 {
   const envBootstrap = db.prepare(
-    "SELECT telegramApiId, telegramApiHash, telegramStringSession, geminiKey, openRouterKey, groqKey, bluesmindsApiKey FROM config WHERE id = 1"
+    "SELECT telegramApiId, telegramApiHash, telegramStringSession, geminiKey FROM config WHERE id = 1"
   ).get();
   const envUpdates = {};
   if (!envBootstrap?.telegramApiId && process.env.TELEGRAM_API_ID)
@@ -411,24 +402,13 @@ db.exec(`
     envUpdates.telegramApiHash = process.env.TELEGRAM_API_HASH;
   if (!envBootstrap?.telegramStringSession && process.env.TELEGRAM_STRING_SESSION)
     envUpdates.telegramStringSession = process.env.TELEGRAM_STRING_SESSION;
-  if (process.env.GEMINI_API_KEY)
+  if (!envBootstrap?.geminiKey && process.env.GEMINI_API_KEY)
     envUpdates.geminiKey = process.env.GEMINI_API_KEY;
-  if (process.env.OPENROUTER_API_KEY)
-    envUpdates.openRouterKey = process.env.OPENROUTER_API_KEY;
-  if (process.env.GROQ_API_KEY)
-    envUpdates.groqKey = process.env.GROQ_API_KEY;
-  if (process.env.BLUESMINDS_API_KEY)
-    envUpdates.bluesmindsApiKey = process.env.BLUESMINDS_API_KEY;
-  // If env var is set, always sync it to DB (env var is the source of truth on Railway)
-  if (process.env.OPENROUTER_API_KEY && process.env.OPENROUTER_API_KEY !== envBootstrap?.openRouterKey) {
-    db.prepare("UPDATE config SET openRouterKey = ?, aiProvider = 'openrouter' WHERE id = 1").run(process.env.OPENROUTER_API_KEY);
-    console.log("[startup] OpenRouter key synced from OPENROUTER_API_KEY env var.");
-  }
   if (Object.keys(envUpdates).length > 0) {
     for (const [k, v] of Object.entries(envUpdates)) {
       db.prepare(`UPDATE config SET ${k} = ? WHERE id = 1`).run(v);
     }
-    console.log("[startup] Bootstrapped credentials from environment variables:", Object.keys(envUpdates).join(", "));
+    console.log("[startup] Bootstrapped missing credentials from environment variables:", Object.keys(envUpdates).join(", "));
   }
 }
 async function getGeminiResponse(prompt, apiKey, model = "gemini-1.5-flash", context = [], systemInstruction) {
@@ -533,7 +513,7 @@ async function getOpenRouterResponse(prompt, apiKey, model = "google/gemini-2.0-
       { role: "user", content: prompt }
     ];
     const response = await fetch(
-      "https://openrouter.ai/api/v1/chat/completions",
+      "https://api.v1.openrouter.ai/chat/completions",
       {
         method: "POST",
         headers: {
@@ -856,7 +836,7 @@ User Message: ${prompt}`;
   };
   const bluesmindsProvider = {
     name: "BluesMinds",
-    key: (config.bluesmindsApiKey || "").trim(),
+    key: config.bluesmindsApiKey,
     fn: (p, k, ctx, inst) => getBluesMindsResponse(
       p,
       k,
@@ -1354,7 +1334,7 @@ async function startServer() {
           isListenerActive,
           lastEventTimestamp,
           clientReady: !!client,
-          aiConfigured: !!(config?.geminiKey || config?.groqKey || config?.openRouterKey || config?.bluesmindsApiKey || process.env.GEMINI_API_KEY)
+          aiConfigured: !!(config?.geminiKey || config?.groqKey || config?.openRouterKey || process.env.GEMINI_API_KEY)
         }
       };
       res.json(payload);
@@ -1447,10 +1427,6 @@ async function startServer() {
       "telegramApiHash",
       "telegramStringSession"
     ];
-    // Snapshot existing Telegram credentials BEFORE saving so we can detect changes
-    const prevCreds = db.prepare(
-      "SELECT telegramApiId, telegramApiHash, telegramStringSession FROM config WHERE id = 1"
-    ).get();
     try {
       for (const key of Object.keys(updates)) {
         if (allowed.includes(key)) {
@@ -1468,21 +1444,10 @@ async function startServer() {
       console.error("[api/config] Failed to save config:", err);
       return res.status(500).json({ error: "Failed to save configuration" });
     }
-    // If cookies were updated, write them to disk immediately
-    if (updates.youtube_cookies !== undefined) {
-      syncCookiesToDisk();
+    if (updates.telegramStringSession || updates.telegramApiId || updates.telegramApiHash) {
+      loadTelethon();
     }
-
-    // Only reconnect Telegram if the credentials actually changed
-    const credsChanged =
-      (updates.telegramApiId !== undefined && updates.telegramApiId !== prevCreds?.telegramApiId) ||
-      (updates.telegramApiHash !== undefined && updates.telegramApiHash !== prevCreds?.telegramApiHash) ||
-      (updates.telegramStringSession !== undefined && updates.telegramStringSession !== prevCreds?.telegramStringSession);
-    if (credsChanged) {
-      const connected = await loadTelethon();
-      return res.json({ success: true, telegramConnected: connected });
-    }
-    res.json({ success: true, telegramConnected: null });
+    res.json({ success: true });
   });
   app.get("/api/nsfw/data", (req, res) => {
     const users = db.prepare("SELECT * FROM user_nsfw_prefs").all();
@@ -1613,7 +1578,11 @@ async function startServer() {
             }
           }
         } catch (err) {
-          console.error("Music download task error:", err);
+          const msg = err?.message || String(err);
+          addLog(`Music dashboard download error: ${msg}`, "error");
+          db.prepare(
+            "INSERT INTO exports (id, filename, filepath, createdAt, type, status) VALUES (?, ?, ?, ?, ?, ?)"
+          ).run(id, filename, filepath, Date.now(), "music", "failed");
         }
       });
       res.json({
@@ -1706,47 +1675,47 @@ async function startServer() {
     const commonFlags = {
       extractAudio: true,
       audioFormat: "mp3",
+      audioQuality: 0,
       noPlaylist: true,
+      noCheckCertificates: true,
       userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
       geoBypass: true,
-      retries: 10,
+      retries: 5,
       socketTimeout: 30,
-      jsRuntimes: "node",
       output
     };
     if (fs.existsSync(youtubeCookiesPath)) {
       commonFlags.cookies = youtubeCookiesPath;
     }
+    // Attempt 1: primary flags
     try {
       addLog(`Attempting download with primary flags...`, "info");
       await youtubedl(url, commonFlags);
+      return;
     } catch (err) {
-      addLog(
-        `Primary download failed: ${err.message}. Retrying with alternate settings...`,
-        "warn"
-      );
-      try {
-        const fallbackFlags = { ...commonFlags, format: "bestaudio/best" };
-        await youtubedl(url, fallbackFlags);
-      } catch (err2) {
-        addLog(
-          `Fallback download failed: ${err2.message}. Trying play-dl as last resort...`,
-          "error"
-        );
-        const play = (await import("play-dl")).default;
-        const stream = await play.stream(url, { quality: 1 });
-        const writer = fs.createWriteStream(output);
-        stream.stream.pipe(writer);
-        await new Promise((resolve, reject) => {
-          stream.stream.on("error", (e) => {
-            writer.destroy();
-            reject(e);
-          });
-          writer.on("finish", () => resolve());
-          writer.on("error", reject);
-        });
-      }
+      addLog(`Primary download failed: ${err.message}. Retrying with android client...`, "warn");
     }
+    // Attempt 2: force android player client to bypass bot-detection
+    try {
+      await youtubedl(url, {
+        ...commonFlags,
+        extractorArgs: "youtube:player_client=android,web",
+        format: "bestaudio/best"
+      });
+      return;
+    } catch (err2) {
+      addLog(`Android client download failed: ${err2.message}. Trying play-dl as last resort...`, "error");
+    }
+    // Attempt 3: play-dl (named exports — no .default)
+    const playDl = await import("play-dl");
+    const streamResult = await playDl.stream(url, { quality: 1 });
+    const writer = fs.createWriteStream(output);
+    streamResult.stream.pipe(writer);
+    await new Promise((resolve, reject) => {
+      streamResult.stream.on("error", (e) => { writer.destroy(); reject(e); });
+      writer.on("finish", () => resolve());
+      writer.on("error", reject);
+    });
   };
   const statusUpdate = async (chatId, messageId, text) => {
     try {
@@ -1800,7 +1769,9 @@ async function startServer() {
           setTimeout(() => fs.remove(filepath).catch(() => {
           }), 1e4);
         } catch (downloadErr) {
-          await effectiveStatus.fail("Download failed.");
+          const msg = downloadErr?.message || String(downloadErr);
+          addLog(`Music download error: ${msg}`, "error");
+          await effectiveStatus.fail(`Download failed: ${msg.slice(0, 120)}`);
         }
       });
     } catch (e) {
@@ -2132,7 +2103,7 @@ async function startServer() {
           );
         } else {
           await status.finish(
-            "\u274C **AI Error:** All AI providers failed. Please add a valid API key in **AI Settings** (Gemini key recommended — free at aistudio.google.com/apikey) or set `GEMINI_API_KEY` in your Railway environment variables."
+            "\u274C **AI Error:** Could not generate a response. Please check your keys or try again later."
           );
         }
       } catch (e) {
@@ -2201,13 +2172,6 @@ async function startServer() {
           const isMe = message.out || myId && senderId === myId;
           let config2 = db.prepare("SELECT * FROM config WHERE id = 1").get();
           const admins = config2?.adminUsers ? config2.adminUsers.split(",").map((s) => s.trim()) : [];
-          const isCommand = textRaw.startsWith("/") || textRaw.startsWith(".");
-          // Non-command messages (plain text, mentions, replies) go straight to AI — no permission gate
-          if (!isMe && !isCommand) {
-            await maybeHandleAutoReply(client, message, config2, myId, myUsername);
-            return;
-          }
-          // Permission check only applies to bot commands
           const auth = await PermissionManager.check(
             text,
             senderId || "",
@@ -2518,24 +2482,6 @@ _Visit the dashboard for advanced configuration._`;
                 `[BOT] Blocked protected command "${cmdName}" from ${senderId}`
               );
             }
-            return;
-          }
-          if (text === "/reloadcookies" || text === ".reloadcookies") {
-            await CommandProcessor.process(
-              client,
-              message,
-              config2,
-              myId,
-              "reloadcookies",
-              textRaw,
-              async (status) => {
-                syncCookiesToDisk();
-                const exists = fs.existsSync(youtubeCookiesPath);
-                await status.finish(exists
-                  ? "\u2705 YouTube cookies reloaded from database and written to disk."
-                  : "\u26A0\uFE0F No cookies found in database. Paste your cookies in Settings first.");
-              }
-            );
             return;
           }
           if (text === "/startbot" || text === ".startbot") {
@@ -2856,9 +2802,6 @@ ${mStr}`);
     };
     loop();
   };
-  // Restore cookies from DB to disk on every boot
-  syncCookiesToDisk();
-
   loadTelethon().then(() => {
     if (getIsRunning()) {
       addLog("Resuming automation loop from previous state.", "info");
