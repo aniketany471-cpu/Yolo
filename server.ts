@@ -2781,19 +2781,34 @@ async function startServer() {
           const admins = config?.adminUsers
             ? config.adminUsers.split(",").map((s: string) => s.trim())
             : [];
-          // Use PermissionManager for robust checks
-          const auth = await PermissionManager.check(
-            text,
-            senderId || "",
-            chatIdStr || "",
-            myId,
-          );
+          // Only gate commands (/ or .) — plain mentions and DMs bypass permission check
+          // so maybeHandleAutoReply can process them normally
+          const isCommand = textRaw.startsWith("/") || textRaw.startsWith(".");
+          let auth: any = { allowed: true, level: PermissionLevel.PUBLIC };
+          if (isCommand) {
+            auth = await PermissionManager.check(
+              text,
+              senderId || "",
+              chatIdStr || "",
+              myId,
+            );
+          } else {
+            // For non-commands, still compute the user's level for use in later checks
+            const config2tmp = db
+              .prepare("SELECT * FROM config WHERE id = 1")
+              .get() as any;
+            auth.level = PermissionManager.getLevel(
+              senderId || "",
+              myId,
+              config2tmp,
+            );
+          }
 
           console.log(
             `[BOT] Incoming: "${textRaw.substring(0, 30)}" from ${senderId}, Level: ${auth.level}, Allowed: ${auth.allowed}`,
           );
 
-          if (!auth.allowed) {
+          if (isCommand && !auth.allowed) {
             if (auth.reason && !isMe) {
               await client
                 ?.sendMessage(message.chatId, {
