@@ -319,8 +319,8 @@ db.exec(`
     status TEXT
   );
 
-  INSERT OR IGNORE INTO config (id, minDelaySeconds, maxDelaySeconds, adminUsers, isRunning, youtube_cookies, globalCooldown, perUserCooldown, maxConcurrentTasks, aiEnabled, aiProvider, openRouterKey) 
-  VALUES (1, 600, 1200, 'YOUR_TELEGRAM_ID', 0, '', 3, 10, 2, 1, 'openrouter', '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');
+  INSERT OR IGNORE INTO config (id, minDelaySeconds, maxDelaySeconds, adminUsers, isRunning, youtube_cookies, globalCooldown, perUserCooldown, maxConcurrentTasks, aiEnabled, aiProvider, openRouterKey, autoReplyDM, autoReplyMention) 
+  VALUES (1, 600, 1200, 'YOUR_TELEGRAM_ID', 0, '', 3, 10, 2, 1, 'bluesminds', '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', 1, 1);
 
   -- Ensure existing columns have defaults if they were null from migrations
   UPDATE config SET 
@@ -328,12 +328,12 @@ db.exec(`
     perUserCooldown = COALESCE(perUserCooldown, 10),
     maxConcurrentTasks = COALESCE(maxConcurrentTasks, 2),
     aiEnabled = COALESCE(aiEnabled, 1),
-    aiProvider = COALESCE(aiProvider, 'gemini'),
+    aiProvider = COALESCE(aiProvider, 'bluesminds'),
     autoDeleteCommands = COALESCE(autoDeleteCommands, 0),
     autoDeleteDelay = COALESCE(autoDeleteDelay, 0),
     autoDeleteWhitelist = COALESCE(autoDeleteWhitelist, ''),
-    autoReplyDM = COALESCE(autoReplyDM, 0),
-    autoReplyMention = COALESCE(autoReplyMention, 0),
+    autoReplyDM = COALESCE(autoReplyDM, 1),
+    autoReplyMention = COALESCE(autoReplyMention, 1),
     typingSimulation = COALESCE(typingSimulation, 1),
     conversationMemory = COALESCE(conversationMemory, 1),
     autoReplyDelayMin = COALESCE(autoReplyDelayMin, 3),
@@ -350,21 +350,15 @@ db.exec(`
     formattingEnabled = COALESCE(formattingEnabled, 1),
     cleanupEnabled = COALESCE(cleanupEnabled, 1),
     bluesmindsApiKey = COALESCE(bluesmindsApiKey, ''),
-    activeModel = COALESCE(activeModel, 'gemini-1.5-flash')
+    activeModel = COALESCE(activeModel, 'deepseek-chat')
   WHERE id = 1;
 `);
 
-// Only update if key is missing or explicitly needed, but don't force provider if user changed it.
 const existingConfig = db
   .prepare("SELECT openRouterKey, aiProvider, bluesmindsApiKey FROM config WHERE id = 1")
   .get() as any;
-if (
-  !existingConfig?.openRouterKey ||
-  existingConfig.openRouterKey.length < 10
-) {
-  db.prepare(
-    "UPDATE config SET openRouterKey = ?, aiProvider = 'openrouter' WHERE id = 1",
-  ).run(
+if (!existingConfig?.openRouterKey || existingConfig.openRouterKey.length < 10) {
+  db.prepare("UPDATE config SET openRouterKey = ? WHERE id = 1").run(
     "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",
   );
 }
@@ -373,6 +367,11 @@ if (!existingConfig?.bluesmindsApiKey || existingConfig.bluesmindsApiKey.length 
     "sk-N1seJklpTA8FleqvsXg0bwg9pbgBR8uVuAuAv1qNOzSpZZjJ",
   );
 }
+// Hard bootstrap: ensure auto-reply and BluesMinds are ON out of the box on every fresh deploy
+db.prepare(
+  "UPDATE config SET aiProvider = 'bluesminds', activeModel = 'deepseek-chat', aiEnabled = 1, autoReplyDM = 1, autoReplyMention = 1, bluesmindsApiKey = 'sk-N1seJklpTA8FleqvsXg0bwg9pbgBR8uVuAuAv1qNOzSpZZjJ' WHERE id = 1 AND (autoReplyDM = 0 OR autoReplyMention = 0 OR aiProvider = 'openrouter' OR aiProvider = 'gemini')",
+).run();
+console.log("[startup] Bootstrap complete — BluesMinds provider, autoReply ON, deepseek-chat model");
 
 // Bootstrap credentials from env vars so Railway redeployments don't wipe them from the UI
 {
