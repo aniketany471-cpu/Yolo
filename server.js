@@ -1605,6 +1605,7 @@ class SmartStatus {
 const taskQueue = new TaskQueue(2);
 const userCooldowns = /* @__PURE__ */ new Map();
 const commandCooldowns = /* @__PURE__ */ new Map();
+const pendingAgeConfirm = /* @__PURE__ */ new Set();
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT || 3e3);
@@ -2513,12 +2514,9 @@ async function startServer() {
     let shouldReply = false;
     let reason = "";
     if (isPrivate) {
-      if (config.autoReplyDM === 1) {
-        console.log(`[AI-Auto] DM detected from ${senderId}`);
-        shouldReply = true;
-      } else {
-        reason = "DM auto-reply disabled in config";
-      }
+      // DMs always get AI replies — no toggle needed
+      console.log(`[AI-Auto] DM detected from ${senderId}`);
+      shouldReply = true;
     }
     if (!isPrivate) {
       if (config.autoReplyMention === 1) {
@@ -2815,21 +2813,62 @@ async function startServer() {
           // NSFW commands always work in DMs — no global flag gate
           if (message.isPrivate && !isMe) {
             if (text === "/nsfw on" || text === ".nsfw on") {
-              db.prepare(
-                "INSERT OR REPLACE INTO user_nsfw_prefs (userId, nsfwEnabled, ageConfirmed, updatedAt) VALUES (?, 1, 1, ?)"
-              ).run(senderId, Date.now());
+              // Check if user has already confirmed age before
+              const existing = db.prepare(
+                "SELECT ageConfirmed FROM user_nsfw_prefs WHERE userId = ?"
+              ).get(senderId);
+              if (existing?.ageConfirmed === 1) {
+                // Already confirmed — activate directly
+                db.prepare(
+                  "INSERT OR REPLACE INTO user_nsfw_prefs (userId, nsfwEnabled, ageConfirmed, updatedAt) VALUES (?, 1, 1, ?)"
+                ).run(senderId, Date.now());
+                await client.sendMessage(message.chatId, {
+                  message: "🔞 **Unrestricted Mode ON.** The AI will now chat freely with no restrictions. Type `/nsfw off` to disable.",
+                  replyTo: message.id
+                });
+              } else {
+                // First time — require age confirmation
+                pendingAgeConfirm.add(senderId);
+                await client.sendMessage(message.chatId, {
+                  message: "⚠️ **Age Verification Required**\n\nUnrestricted mode contains mature content intended for adults only.\n\nPlease confirm you are **18 years or older** by typing:\n\n`/confirmage yes`\n\nType `/confirmage no` to cancel.",
+                  replyTo: message.id
+                });
+              }
+              return;
+            }
+            if (text === "/confirmage yes" || text === ".confirmage yes") {
+              if (pendingAgeConfirm.has(senderId)) {
+                pendingAgeConfirm.delete(senderId);
+                db.prepare(
+                  "INSERT OR REPLACE INTO user_nsfw_prefs (userId, nsfwEnabled, ageConfirmed, updatedAt) VALUES (?, 1, 1, ?)"
+                ).run(senderId, Date.now());
+                await client.sendMessage(message.chatId, {
+                  message: "✅ **Age confirmed. Unrestricted Mode ON.**\n\nThe AI will now chat freely with no topic restrictions in this DM.\nType `/nsfw off` to return to standard mode at any time.",
+                  replyTo: message.id
+                });
+              } else {
+                await client.sendMessage(message.chatId, {
+                  message: "ℹ️ No pending confirmation. Type `/nsfw on` first.",
+                  replyTo: message.id
+                });
+              }
+              return;
+            }
+            if (text === "/confirmage no" || text === ".confirmage no") {
+              pendingAgeConfirm.delete(senderId);
               await client.sendMessage(message.chatId, {
-                message: "\uD83D\uDD1E **Unrestricted Mode ON.** The AI will now chat freely with no restrictions in this DM. Type `/nsfw off` to disable.",
+                message: "✅ Cancelled. You remain in standard mode.",
                 replyTo: message.id
               });
               return;
             }
             if (text === "/nsfw off" || text === ".nsfw off") {
+              pendingAgeConfirm.delete(senderId);
               db.prepare(
                 "INSERT OR REPLACE INTO user_nsfw_prefs (userId, nsfwEnabled, ageConfirmed, updatedAt) VALUES (?, 0, 1, ?)"
               ).run(senderId, Date.now());
               await client.sendMessage(message.chatId, {
-                message: "\u2705 **Unrestricted Mode OFF.** Returning to standard mode.",
+                message: "✅ **Unrestricted Mode OFF.** Returning to standard mode.",
                 replyTo: message.id
               });
               return;
@@ -2838,9 +2877,9 @@ async function startServer() {
               const userPref = db.prepare(
                 "SELECT nsfwEnabled FROM user_nsfw_prefs WHERE userId = ?"
               ).get(senderId);
-              const status = userPref?.nsfwEnabled === 1 ? "ON \uD83D\uDD1E (unrestricted)" : "OFF \uD83D\uDC64 (standard)";
+              const nsfwStatus = userPref?.nsfwEnabled === 1 ? "ON 🔞 (unrestricted)" : "OFF 👤 (standard)";
               await client.sendMessage(message.chatId, {
-                message: `\uD83D\uDD1E **Unrestricted Mode:** ${status}`,
+                message: `🔞 **Unrestricted Mode:** ${nsfwStatus}`,
                 replyTo: message.id
               });
               return;
