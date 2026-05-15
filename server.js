@@ -1,4 +1,4 @@
-import { execSync } from "child_process";
+import { execSync, spawn } from "child_process";
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import Database from "better-sqlite3";
@@ -16,6 +16,46 @@ import yts from "yt-search";
 import youtubedl from "youtube-dl-exec";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+// ── Standalone yt-dlp binary (downloaded at startup, no Python needed) ───────
+const YTDLP_BIN = path.join(__dirname, "yt-dlp");
+function buildYtdlpArgs(url, opts) {
+  const args = [];
+  if (opts.extractAudio) args.push("--extract-audio");
+  if (opts.audioFormat) args.push("--audio-format", opts.audioFormat);
+  if (opts.audioQuality !== undefined) args.push("--audio-quality", String(opts.audioQuality));
+  if (opts.noPlaylist) args.push("--no-playlist");
+  if (opts.noCheckCertificates) args.push("--no-check-certificates");
+  if (opts.geoBypass) args.push("--geo-bypass");
+  if (opts.retries !== undefined) args.push("--retries", String(opts.retries));
+  if (opts.socketTimeout !== undefined) args.push("--socket-timeout", String(opts.socketTimeout));
+  if (opts.cookies) args.push("--cookies", opts.cookies);
+  if (opts.extractorArgs) args.push("--extractor-args", opts.extractorArgs);
+  if (opts.userAgent) args.push("--user-agent", opts.userAgent);
+  if (opts.format) args.push("-f", opts.format);
+  if (opts.output) args.push("-o", opts.output);
+  args.push(url);
+  return args;
+}
+function runYtdlpDirect(url, opts) {
+  return new Promise((resolve, reject) => {
+    const args = buildYtdlpArgs(url, opts);
+    const proc = spawn(YTDLP_BIN, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stderr = "";
+    proc.stderr.on("data", (d) => { stderr += d.toString(); });
+    proc.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(stderr.trim() || `yt-dlp exited with code ${code}`));
+    });
+    proc.on("error", (err) => reject(new Error(`yt-dlp spawn error: ${err.message}`)));
+  });
+}
+function downloadYtdlpBinary() {
+  console.log("[ytdlp] Downloading standalone yt-dlp binary...");
+  execSync(
+    `curl -fsSL "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp" -o "${YTDLP_BIN}" && chmod +x "${YTDLP_BIN}"`,
+    { stdio: "pipe", timeout: 60000 }
+  );
+}
 const exportsDir = path.join(__dirname, "exports");
 fs.ensureDirSync(exportsDir);
 const musicDir = path.join(exportsDir, "music");
@@ -2044,8 +2084,10 @@ async function startServer() {
   app.get("/api/youtubedl/check", async (req, res) => {
     const info = { ytdlp: null, ffmpeg: null, cookiesFile: false };
     try {
-      info.ytdlp = (await youtubedl("--version").catch(() => null)) || "not found";
-    } catch {}
+      info.ytdlp = fs.existsSync(YTDLP_BIN)
+        ? execSync(`"${YTDLP_BIN}" --version`, { stdio: "pipe", timeout: 8000 }).toString().trim()
+        : "not found";
+    } catch { info.ytdlp = "not found"; }
     try {
       const ffver = execSync("ffmpeg -version 2>&1", { timeout: 5000 }).toString();
       const match = ffver.match(/ffmpeg version ([^\s]+)/);
@@ -2060,9 +2102,11 @@ async function startServer() {
 
   app.post("/api/youtubedl/update", async (req, res) => {
     try {
-      const before = await youtubedl("--version").catch(() => "unknown");
-      try { execSync("yt-dlp -U", { stdio: "pipe", timeout: 60000 }); } catch {}
-      const after = await youtubedl("--version").catch(() => "unknown");
+      const before = fs.existsSync(YTDLP_BIN)
+        ? execSync(`"${YTDLP_BIN}" --version`, { stdio: "pipe", timeout: 8000 }).toString().trim()
+        : "not found";
+      downloadYtdlpBinary();
+      const after = execSync(`"${YTDLP_BIN}" --version`, { stdio: "pipe", timeout: 8000 }).toString().trim();
       const updated = after !== before;
       addLog(`yt-dlp ${updated ? `updated ${before} → ${after}` : `already up-to-date (${after})`}`, "success");
       res.json({ ok: true, before, after, updated });
@@ -2125,39 +2169,31 @@ async function startServer() {
       console.error("[Log Error]:", e);
     }
   };
-  // ─── yt-dlp auto-install + auto-update ────────────────────────────────────
-  // Downloads the yt-dlp binary if it is not found (e.g. fresh Railway deploy),
-  // then updates it. Stale/missing yt-dlp is the #1 cause of music failures.
+  // ─── yt-dlp standalone binary — download/verify at startup ───────────────
+  // We bypass youtube-dl-exec's bundled binary entirely (it requires Python 3).
+  // Instead we download the official standalone Linux binary once and keep it
+  // inside the project directory so it persists across Railway restarts.
   (async () => {
     try {
-      // Check if yt-dlp binary is reachable
-      let verBefore = await youtubedl("--version").catch(() => null);
-      if (!verBefore) {
-        console.log("[ytdlp] Binary not found — downloading standalone yt-dlp...");
+      let needsDownload = !fs.existsSync(YTDLP_BIN);
+      if (!needsDownload) {
+        // Verify it actually runs (not a broken/wrong-arch file)
         try {
-          // Download the pre-built Linux x86_64 binary from the official release
-          execSync(
-            "curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && chmod +x /usr/local/bin/yt-dlp",
-            { stdio: "pipe", timeout: 60000 }
-          );
-          verBefore = await youtubedl("--version").catch(() => null);
-          console.log(`[ytdlp] Downloaded yt-dlp ${verBefore || "unknown"}`);
-        } catch (dlErr) {
-          console.warn(`[ytdlp] Auto-download failed: ${dlErr?.message}`);
+          execSync(`"${YTDLP_BIN}" --version`, { stdio: "pipe", timeout: 10000 });
+          const ver = execSync(`"${YTDLP_BIN}" --version`, { stdio: "pipe", timeout: 10000 }).toString().trim();
+          console.log(`[ytdlp] Standalone binary OK: ${ver}`);
+          // Self-update
+          try { execSync(`"${YTDLP_BIN}" -U`, { stdio: "pipe", timeout: 30000 }); } catch {}
+          return;
+        } catch {
+          needsDownload = true;
         }
-      } else {
-        console.log(`[ytdlp] Installed version: ${verBefore}`);
       }
-      // Self-update to latest stable
-      try { execSync("yt-dlp -U", { stdio: "pipe", timeout: 30000 }); } catch {}
-      const verAfter = await youtubedl("--version").catch(() => null);
-      if (verAfter && verAfter !== verBefore) {
-        console.log(`[ytdlp] Auto-updated: ${verBefore} → ${verAfter}`);
-      } else {
-        console.log(`[ytdlp] Up-to-date (${verAfter || "unknown"})`);
-      }
+      downloadYtdlpBinary();
+      const ver = execSync(`"${YTDLP_BIN}" --version`, { stdio: "pipe", timeout: 10000 }).toString().trim();
+      console.log(`[ytdlp] Binary ready: ${ver}`);
     } catch (e) {
-      console.warn(`[ytdlp] Startup setup skipped: ${e?.message}`);
+      console.warn(`[ytdlp] Startup binary setup failed: ${e?.message}`);
     }
   })();
 
@@ -2241,7 +2277,7 @@ async function startServer() {
     for (const { name, opts } of strategies) {
       try {
         addLog(`[ytdlp] Trying client: ${name}`, "info");
-        await youtubedl(cleanUrl, { ...base, ...opts });
+        await runYtdlpDirect(cleanUrl, { ...base, ...opts });
         addLog(`[ytdlp] Success with client: ${name}`, "success");
         return; // done
       } catch (e) {
