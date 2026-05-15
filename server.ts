@@ -2106,6 +2106,8 @@ async function startServer() {
   let client: TelegramClient | null = null;
   let runningLoop = false;
   let isConnecting = false;
+  let lastConnectError = "";
+  let lastConnectFailTime = 0;
 
   const getIsRunning = () => {
     const row = db
@@ -2753,6 +2755,14 @@ async function startServer() {
     }
 
     if (isConnecting) return false;
+    // Enforce backoff: 90s for AUTH_KEY_DUPLICATED, 15s for other errors
+    const now = Date.now();
+    const backoffMs = lastConnectError.includes("AUTH_KEY_DUPLICATED") ? 90000 : 15000;
+    if (lastConnectFailTime > 0 && now - lastConnectFailTime < backoffMs) {
+      const remaining = Math.ceil((backoffMs - (now - lastConnectFailTime)) / 1000);
+      console.log(`[BOT] Reconnect backoff: ${remaining}s remaining (${lastConnectError.slice(0, 40)})`);
+      return false;
+    }
     isConnecting = true;
 
     try {
@@ -2763,9 +2773,9 @@ async function startServer() {
         parseInt(apiId.toString()),
         apiHash,
         {
-          connectionRetries: 5,
+          connectionRetries: 1,
           useWSS: true,
-          autoReconnect: true,
+          autoReconnect: false,
           timeout: 30,
         },
       );
@@ -3507,10 +3517,17 @@ _Visit the dashboard for advanced configuration._`;
       return true;
     } catch (e: any) {
       isListenerActive = false;
-      addLog(
-        `Failed to connect to Telegram: ${e?.message || "Unknown error"}`,
-        "error",
-      );
+      lastConnectError = e?.message || "Unknown error";
+      lastConnectFailTime = Date.now();
+      const isAuthDup = lastConnectError.includes("AUTH_KEY_DUPLICATED");
+      addLog(`Failed to connect to Telegram: ${lastConnectError}`, "error");
+      if (isAuthDup) {
+        addLog(
+          "AUTH_KEY_DUPLICATED: another instance is using this session. Waiting 90s before retry — old Railway instance may still be shutting down.",
+          "warn",
+        );
+      }
+      if (client) { try { await client.disconnect(); } catch (_) {} }
       client = null;
       return false;
     } finally {
