@@ -2136,63 +2136,66 @@ async function startServer() {
   };
 
   const downloadYoutube = async (url: string, output: string) => {
-    const commonFlags: any = {
+    // Always use a clean canonical URL to avoid query-param confusion
+    const vidId =
+      url.match(/[?&]v=([^&]+)/)?.[1] ||
+      url.match(/youtu\.be\/([^?&]+)/)?.[1];
+    const cleanUrl = vidId ? `https://www.youtube.com/watch?v=${vidId}` : url;
+    const base: any = {
       extractAudio: true,
       audioFormat: "mp3",
       audioQuality: 0,
       noPlaylist: true,
       noCheckCertificates: true,
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
       geoBypass: true,
-      retries: 5,
+      retries: 3,
       socketTimeout: 30,
-      output: output,
+      output,
     };
-
-    if (fs.existsSync(youtubeCookiesPath)) {
-      commonFlags.cookies = youtubeCookiesPath;
-    }
-
-    // Attempt 1: primary flags
+    if (fs.existsSync(youtubeCookiesPath)) base.cookies = youtubeCookiesPath;
+    // Attempt 1: iOS client — most reliable on server IPs (bypasses sign-in checks)
     try {
-      addLog(`Attempting download with primary flags...`, "info");
-      await youtubedl(url, commonFlags);
+      addLog(`Download attempt 1: iOS client...`, "info");
+      await youtubedl(cleanUrl, {
+        ...base,
+        extractorArgs: "youtube:player_client=ios",
+        userAgent:
+          "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iPhone OS 17_5_1 like Mac OS X;)",
+        format: "bestaudio[ext=m4a]/bestaudio/best",
+      });
       return;
-    } catch (err: any) {
-      addLog(
-        `Primary download failed: ${err.message}. Retrying with android client...`,
-        "warn",
-      );
+    } catch (e1: any) {
+      addLog(`iOS client failed: ${e1.message}. Trying TV embedded...`, "warn");
     }
-
-    // Attempt 2: force android player client to bypass bot-detection
+    // Attempt 2: TV embedded client
     try {
-      await youtubedl(url, {
-        ...commonFlags,
-        extractorArgs: "youtube:player_client=android,web",
+      await youtubedl(cleanUrl, {
+        ...base,
+        extractorArgs: "youtube:player_client=tv_embedded",
         format: "bestaudio/best",
       });
       return;
-    } catch (err2: any) {
-      addLog(
-        `Android client download failed: ${err2.message}. Trying play-dl as last resort...`,
-        "error",
-      );
+    } catch (e2: any) {
+      addLog(`TV client failed: ${e2.message}. Trying mweb...`, "warn");
     }
-
-    // Attempt 3: play-dl (named exports — no .default)
-    const playDl = await import("play-dl");
-    const streamResult = await playDl.stream(url, { quality: 1 });
-    const writer = fs.createWriteStream(output);
-    streamResult.stream.pipe(writer);
-    await new Promise<void>((resolve, reject) => {
-      streamResult.stream.on("error", (e) => {
-        writer.destroy();
-        reject(e);
+    // Attempt 3: mweb client
+    try {
+      await youtubedl(cleanUrl, {
+        ...base,
+        extractorArgs: "youtube:player_client=mweb",
+        userAgent:
+          "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36",
+        format: "bestaudio/best",
       });
-      writer.on("finish", () => resolve());
-      writer.on("error", reject);
+      return;
+    } catch (e3: any) {
+      addLog(`mweb client failed: ${e3.message}. Trying web_creator...`, "warn");
+    }
+    // Attempt 4: web_creator client (last resort)
+    await youtubedl(cleanUrl, {
+      ...base,
+      extractorArgs: "youtube:player_client=web_creator",
+      format: "bestaudio/best",
     });
   };
 
