@@ -350,7 +350,7 @@ db.exec(`
     formattingEnabled = COALESCE(formattingEnabled, 1),
     cleanupEnabled = COALESCE(cleanupEnabled, 1),
     bluesmindsApiKey = COALESCE(bluesmindsApiKey, ''),
-    activeModel = COALESCE(activeModel, 'deepseek-chat')
+    activeModel = COALESCE(activeModel, 'gpt-4o-mini')
   WHERE id = 1;
 `);
 
@@ -369,9 +369,9 @@ if (!existingConfig?.bluesmindsApiKey || existingConfig.bluesmindsApiKey.length 
 }
 // Hard bootstrap: ensure auto-reply and BluesMinds are ON out of the box on every fresh deploy
 db.prepare(
-  "UPDATE config SET aiProvider = 'bluesminds', activeModel = 'deepseek-chat', aiEnabled = 1, autoReplyDM = 1, autoReplyMention = 1, bluesmindsApiKey = 'sk-N1seJklpTA8FleqvsXg0bwg9pbgBR8uVuAuAv1qNOzSpZZjJ' WHERE id = 1 AND (autoReplyDM = 0 OR autoReplyMention = 0 OR aiProvider = 'openrouter' OR aiProvider = 'gemini')",
+  "UPDATE config SET aiProvider = 'bluesminds', activeModel = 'gpt-4o-mini', aiEnabled = 1, autoReplyDM = 1, autoReplyMention = 1, bluesmindsApiKey = 'sk-N1seJklpTA8FleqvsXg0bwg9pbgBR8uVuAuAv1qNOzSpZZjJ' WHERE id = 1 AND (autoReplyDM = 0 OR autoReplyMention = 0 OR aiProvider = 'openrouter' OR aiProvider = 'gemini')",
 ).run();
-console.log("[startup] Bootstrap complete — BluesMinds provider, autoReply ON, deepseek-chat model");
+console.log("[startup] Bootstrap complete — BluesMinds provider, autoReply ON, gpt-4o-mini model");
 
 // Bootstrap credentials from env vars so Railway redeployments don't wipe them from the UI
 {
@@ -1039,7 +1039,7 @@ async function getAIResponse(
       getBluesMindsResponse(
         p,
         k,
-        config.activeModel || "gemini-1.5-flash",
+        config.activeModel || "gpt-4o-mini",
         ctx,
         inst,
       ),
