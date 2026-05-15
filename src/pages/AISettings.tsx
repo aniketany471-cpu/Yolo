@@ -167,6 +167,8 @@ export function AISettings() {
   // Live model list from Bluesminds API
   const [bluesModels, setBluesModels] = useState<string[]>([]);
   const [modelsLoading, setModelsLoading] = useState(false);
+  const [auditLoading, setAuditLoading] = useState(false);
+  const [auditReport, setAuditReport] = useState<any | null>(null);
 
   const fetchModels = async () => {
     setModelsLoading(true);
@@ -179,6 +181,23 @@ export function AISettings() {
   };
 
   useEffect(() => { fetchModels(); }, []);
+
+  const runBluemindsAudit = async () => {
+    setAuditLoading(true);
+    try {
+      const r = await fetch('/api/bluesminds/test-all', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: 'Say: BLUEMINDS_OK' })
+      });
+      const data = await r.json();
+      setAuditReport(data);
+    } catch (e) {
+      setAuditReport({ ok: false, error: String(e) });
+    } finally {
+      setAuditLoading(false);
+    }
+  };
 
   useEffect(() => {
     setAiEnabled(config.aiEnabled === 1);
@@ -413,6 +432,16 @@ export function AISettings() {
                       }}
                     />
                     <p className="text-[10px] text-slate-600">This model is used for all BluesMinds AI calls</p>
+                    <div className="pt-2">
+                      <button onClick={runBluemindsAudit} className="text-[11px] bg-slate-800 hover:bg-slate-700 px-2 py-1 rounded border border-slate-700">
+                        {auditLoading ? 'Running full model audit…' : 'Run Blueminds Full Model Audit'}
+                      </button>
+                    </div>
+                    {auditReport && (
+                      <pre className="mt-2 text-[10px] bg-slate-950 border border-slate-800 rounded p-2 overflow-auto max-h-48 text-slate-300">
+                        {JSON.stringify(auditReport, null, 2)}
+                      </pre>
+                    )}
                   </div>
                 </div>
               </div>
