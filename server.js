@@ -66,6 +66,7 @@ db.exec(`
     geminiKey TEXT,
     groqKey TEXT,
     openRouterKey TEXT,
+    xaiKey TEXT DEFAULT '',
     autoDeleteCommands INTEGER DEFAULT 1,
     autoDeleteDelay INTEGER DEFAULT 0,
     autoDeleteWhitelist TEXT DEFAULT '',
@@ -206,6 +207,10 @@ try {
 }
 try {
   db.exec("ALTER TABLE config ADD COLUMN openRouterKey TEXT;");
+} catch (e) {
+}
+try {
+  db.exec("ALTER TABLE config ADD COLUMN xaiKey TEXT DEFAULT '';");
 } catch (e) {
 }
 try {
@@ -623,6 +628,34 @@ async function getGroqResponse(prompt, apiKey, model = "llama3-8b-8192", context
     return result.data?.choices?.[0]?.message?.content?.trim() || null;
   } catch (e) {
     console.error("[Groq] Fetch Error:", e?.message || e);
+    return null;
+  }
+}
+async function getGrokResponse(prompt, apiKey, model = "grok-4", context = [], systemInstruction) {
+  try {
+    const cleanKey = apiKey?.trim();
+    if (!cleanKey || cleanKey === "undefined" || cleanKey === "null")
+      return null;
+    const GROK_MODEL_IDS = [
+      "grok-4", "grok-4-0709",
+      "grok-3", "grok-3-fast", "grok-3-mini", "grok-3-mini-fast",
+      "grok-2-1212", "grok-2-vision-1212", "grok-vision-beta", "grok-beta"
+    ];
+    const finalModel = GROK_MODEL_IDS.includes(model) ? model : "grok-3";
+    const messages = normalizeContextMessages(prompt, context, systemInstruction);
+    const result = await fetchJsonWithRetry(
+      "https://api.x.ai/v1/chat/completions",
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${cleanKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ model: finalModel, messages })
+      },
+      { provider: "xAI/Grok", model: finalModel, endpoint: "/v1/chat/completions" }
+    );
+    if (!result.ok) return null;
+    return result.data?.choices?.[0]?.message?.content?.trim() || null;
+  } catch (e) {
+    console.error("[xAI/Grok] Fetch Error:", e?.message || e);
     return null;
   }
 }
@@ -1067,6 +1100,11 @@ User Message: ${prompt}`;
     key: groqK,
     fn: (p, k, ctx, inst) => getGroqResponse(p, k, config.activeModel, ctx, inst)
   };
+  const grokProvider = {
+    name: "xAI/Grok",
+    key: config.xaiKey,
+    fn: (p, k, ctx, inst) => getGrokResponse(p, k, config.activeModel, ctx, inst)
+  };
   const orProvider = {
     name: "OpenRouter",
     key: openRouterK,
@@ -1084,33 +1122,15 @@ User Message: ${prompt}`;
     )
   };
   if (config.aiProvider === "gemini") {
-    providers.push(
-      geminiProvider,
-      bluesmindsProvider,
-      groqProvider,
-      orProvider
-    );
+    providers.push(geminiProvider, bluesmindsProvider, groqProvider, grokProvider, orProvider);
   } else if (config.aiProvider === "groq") {
-    providers.push(
-      groqProvider,
-      bluesmindsProvider,
-      geminiProvider,
-      orProvider
-    );
+    providers.push(groqProvider, bluesmindsProvider, geminiProvider, grokProvider, orProvider);
   } else if (config.aiProvider === "bluesminds") {
-    providers.push(
-      bluesmindsProvider,
-      geminiProvider,
-      groqProvider,
-      orProvider
-    );
+    providers.push(bluesmindsProvider, geminiProvider, groqProvider, grokProvider, orProvider);
+  } else if (config.aiProvider === "xai") {
+    providers.push(grokProvider, bluesmindsProvider, geminiProvider, groqProvider, orProvider);
   } else {
-    providers.push(
-      orProvider,
-      bluesmindsProvider,
-      geminiProvider,
-      groqProvider
-    );
+    providers.push(orProvider, bluesmindsProvider, geminiProvider, groqProvider, grokProvider);
   }
   for (const p of providers) {
     if (p.key && p.key !== "undefined" && p.key !== "null" && p.key.length > 5) {
@@ -1639,6 +1659,7 @@ async function startServer() {
       "geminiKey",
       "groqKey",
       "openRouterKey",
+      "xaiKey",
       "bluesmindsApiKey",
       "autoDeleteCommands",
       "autoDeleteDelay",
@@ -1766,6 +1787,8 @@ async function startServer() {
         text = await getGroqResponse(safePrompt, cfg?.groqKey || "", selectedModel);
       } else if (selectedProvider === "openrouter") {
         text = await getOpenRouterResponse(safePrompt, cfg?.openRouterKey || "", selectedModel);
+      } else if (selectedProvider === "xai") {
+        text = await getGrokResponse(safePrompt, cfg?.xaiKey || process.env.XAI_API_KEY || "", selectedModel);
       } else {
         // BluesMinds — skip fallback chain for test (test the specific model directly)
         const bmKey = (cfg?.bluesmindsApiKey || process.env.BLUEMINDS_API_KEY || "").trim();
