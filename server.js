@@ -1693,6 +1693,8 @@ async function startServer() {
   let isConnecting = false;
   let lastConnectError = "";
   let lastConnectFailTime = 0;
+  let authDupRetries = 0;
+  let retryTimer = null;
   const getIsRunning = () => {
     const row = db.prepare("SELECT isRunning FROM config WHERE id = 1").get();
     return row?.isRunning === 1;
@@ -2827,14 +2829,24 @@ ${mStr}`);
       lastConnectFailTime = Date.now();
       const isAuthDup = lastConnectError.includes("AUTH_KEY_DUPLICATED");
       addLog(`Failed to connect to Telegram: ${lastConnectError}`, "error");
-      if (isAuthDup) {
-        addLog(
-          "AUTH_KEY_DUPLICATED: another instance is using this session. Waiting 90s before retry — old Railway instance may still be shutting down.",
-          "warn"
-        );
-      }
       if (client) { try { await client.disconnect(); } catch (_) {} }
       client = null;
+      if (isAuthDup) {
+        authDupRetries++;
+        if (authDupRetries <= 5) {
+          addLog(
+            `AUTH_KEY_DUPLICATED: old instance still running. Auto-retrying in 90s (attempt ${authDupRetries}/5)...`,
+            "warn"
+          );
+          if (retryTimer) clearTimeout(retryTimer);
+          retryTimer = setTimeout(() => { retryTimer = null; loadTelethon(); }, 90000);
+        } else {
+          addLog(
+            "AUTH_KEY_DUPLICATED: 5 retries exhausted. Go to Telegram → Settings → Devices → terminate the duplicate session, then restart Railway.",
+            "error"
+          );
+        }
+      }
       return false;
     } finally {
       isConnecting = false;
