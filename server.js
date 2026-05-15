@@ -87,7 +87,7 @@ db.exec(`
     formattingEnabled INTEGER DEFAULT 1,
     cleanupEnabled INTEGER DEFAULT 1,
     bluesmindsApiKey TEXT DEFAULT '',
-    activeModel TEXT DEFAULT 'gemini-1.5-flash',
+    activeModel TEXT DEFAULT 'deepseek.v3.2',
     deepThinking INTEGER DEFAULT 0,
     publicCommandsEnabled INTEGER DEFAULT 1,
     blacklistedUsers TEXT DEFAULT '',
@@ -306,7 +306,7 @@ try {
 }
 try {
   db.exec(
-    "ALTER TABLE config ADD COLUMN activeModel TEXT DEFAULT 'gemini-1.5-flash';"
+    "ALTER TABLE config ADD COLUMN activeModel TEXT DEFAULT 'deepseek.v3.2';"
   );
 } catch (e) {
 }
@@ -378,7 +378,7 @@ db.exec(`
     formattingEnabled = COALESCE(formattingEnabled, 1),
     cleanupEnabled = COALESCE(cleanupEnabled, 1),
     bluesmindsApiKey = COALESCE(bluesmindsApiKey, ''),
-    activeModel = COALESCE(activeModel, 'gpt-4o-mini')
+    activeModel = COALESCE(activeModel, 'deepseek.v3.2')
   WHERE id = 1;
 `);
 const existingConfig = db.prepare("SELECT openRouterKey, aiProvider, bluesmindsApiKey FROM config WHERE id = 1").get();
@@ -396,7 +396,10 @@ if (!existingConfig?.bluesmindsApiKey || existingConfig.bluesmindsApiKey.length 
 db.prepare(
   "UPDATE config SET aiProvider = 'bluesminds', activeModel = 'gpt-4o-mini', aiEnabled = 1, autoReplyDM = 1, autoReplyMention = 1, bluesmindsApiKey = 'sk-N1seJklpTA8FleqvsXg0bwg9pbgBR8uVuAuAv1qNOzSpZZjJ' WHERE id = 1 AND (autoReplyDM = 0 OR autoReplyMention = 0 OR aiProvider = 'openrouter' OR aiProvider = 'gemini')"
 ).run();
-console.log("[startup] Bootstrap complete — BluesMinds provider, autoReply ON, gpt-4o-mini model");
+// Always enforce deepseek.v3.2 as the active model on every startup/redeploy.
+// This runs unconditionally so even an existing DB row is corrected.
+db.prepare("UPDATE config SET activeModel = 'deepseek.v3.2' WHERE id = 1").run();
+console.log("[startup] Bootstrap complete — BluesMinds provider, autoReply ON, model locked to deepseek.v3.2");
 
 // Bootstrap credentials from env vars so Railway redeployments don't wipe them from the UI
 {
