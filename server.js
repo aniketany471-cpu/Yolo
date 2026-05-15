@@ -1979,11 +1979,32 @@ async function startServer() {
     res.json({ success: true });
   });
   app.get("/api/youtubedl/check", async (req, res) => {
+    const info = { ytdlp: null, ffmpeg: null, cookiesFile: false };
     try {
-      const result = await youtubedl("--version");
-      res.json({ version: result });
+      info.ytdlp = (await youtubedl("--version").catch(() => null)) || "not found";
+    } catch {}
+    try {
+      const ffver = execSync("ffmpeg -version 2>&1", { timeout: 5000 }).toString();
+      const match = ffver.match(/ffmpeg version ([^\s]+)/);
+      info.ffmpeg = match ? match[1] : "found";
+    } catch {
+      info.ffmpeg = "not found";
+    }
+    info.cookiesFile = fs.existsSync(youtubeCookiesPath);
+    const ok = info.ytdlp !== "not found" && info.ytdlp !== null;
+    res.status(ok ? 200 : 500).json({ ok, ...info });
+  });
+
+  app.post("/api/youtubedl/update", async (req, res) => {
+    try {
+      const before = await youtubedl("--version").catch(() => "unknown");
+      try { execSync("yt-dlp -U", { stdio: "pipe", timeout: 60000 }); } catch {}
+      const after = await youtubedl("--version").catch(() => "unknown");
+      const updated = after !== before;
+      addLog(`yt-dlp ${updated ? `updated ${before} → ${after}` : `already up-to-date (${after})`}`, "success");
+      res.json({ ok: true, before, after, updated });
     } catch (e) {
-      res.status(500).json({ error: "yt-dlp binary not found or not working." });
+      res.status(500).json({ ok: false, error: e?.message });
     }
   });
   app.use("/api/*", (req, res) => {
@@ -2041,64 +2062,143 @@ async function startServer() {
       console.error("[Log Error]:", e);
     }
   };
+  // ─── yt-dlp auto-update ────────────────────────────────────────────────────
+  // Run once at startup (non-blocking). Stale yt-dlp is the #1 cause of
+  // music download failures — YouTube changes its bot-detection weekly.
+  (async () => {
+    try {
+      const verBefore = await youtubedl("--version").catch(() => null);
+      console.log(`[ytdlp] Installed version: ${verBefore || "unknown"}`);
+      // -U / --update: ask yt-dlp to update itself to the latest stable release
+      try { execSync("yt-dlp -U", { stdio: "pipe", timeout: 30000 }); } catch {}
+      const verAfter = await youtubedl("--version").catch(() => null);
+      if (verAfter && verAfter !== verBefore) {
+        console.log(`[ytdlp] Auto-updated: ${verBefore} → ${verAfter}`);
+      } else {
+        console.log(`[ytdlp] Already up-to-date (${verAfter || "unknown"})`);
+      }
+    } catch (e) {
+      console.warn(`[ytdlp] Startup update skipped: ${e?.message}`);
+    }
+  })();
+
+  /**
+   * Download a YouTube video as MP3 audio using yt-dlp.
+   *
+   * Strategy order (2026 — tested against current YouTube bot detection):
+   *   1. mediaconnect  — embedded TV player, bypasses most bot checks
+   *   2. mweb_earlybird — mobile early-access client, lower detection rate
+   *   3. ios            — iOS client with bundled user-agent
+   *   4. tv_embedded    — TV embedded player
+   *   5. default        — standard web player (works with fresh yt-dlp)
+   *   6. @distube/ytdl-core — pure-JS fallback, no yt-dlp binary needed
+   *
+   * Each attempt logs its own failure reason so the dashboard shows
+   * exactly which strategy and error occurred.
+   */
   const downloadYoutube = async (url, output) => {
-    // Always use a clean canonical URL to avoid query-param confusion
     const vidId = url.match(/[?&]v=([^&]+)/)?.[1] || url.match(/youtu\.be\/([^?&]+)/)?.[1];
     const cleanUrl = vidId ? `https://www.youtube.com/watch?v=${vidId}` : url;
+
     const base = {
       extractAudio: true,
       audioFormat: "mp3",
       audioQuality: 0,
       noPlaylist: true,
       noCheckCertificates: true,
+      noCheckFormats: true,        // skip format probe — reduces bot-detection footprint
       geoBypass: true,
-      retries: 3,
+      retries: 2,
       socketTimeout: 30,
       output
     };
     if (fs.existsSync(youtubeCookiesPath)) base.cookies = youtubeCookiesPath;
-    // Attempt 1: iOS client — most reliable on server IPs (bypasses sign-in checks)
-    try {
-      addLog(`Download attempt 1: iOS client...`, "info");
-      await youtubedl(cleanUrl, {
-        ...base,
-        extractorArgs: "youtube:player_client=ios",
-        userAgent: "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iPhone OS 17_5_1 like Mac OS X;)",
-        format: "bestaudio[ext=m4a]/bestaudio/best"
-      });
-      return;
-    } catch (e1) {
-      addLog(`iOS client failed: ${e1.message}. Trying TV embedded...`, "warn");
+
+    // ── Client strategy table ────────────────────────────────────────────────
+    const strategies = [
+      {
+        name: "mediaconnect",
+        opts: {
+          extractorArgs: "youtube:player_client=mediaconnect",
+          format: "bestaudio/best"
+        }
+      },
+      {
+        name: "mweb_earlybird",
+        opts: {
+          extractorArgs: "youtube:player_client=mweb_earlybird",
+          userAgent: "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+          format: "bestaudio/best"
+        }
+      },
+      {
+        name: "ios",
+        opts: {
+          extractorArgs: "youtube:player_client=ios",
+          userAgent: "com.google.ios.youtube/19.45.4 (iPhone17,2; U; CPU iPhone OS 18_1 like Mac OS X;)",
+          format: "bestaudio[ext=m4a]/bestaudio/best"
+        }
+      },
+      {
+        name: "tv_embedded",
+        opts: {
+          extractorArgs: "youtube:player_client=tv_embedded",
+          format: "bestaudio/best"
+        }
+      },
+      {
+        name: "default",
+        opts: {
+          extractorArgs: "youtube:player_client=default",
+          format: "bestaudio[ext=webm]/bestaudio/best"
+        }
+      }
+    ];
+
+    const errors = [];
+    for (const { name, opts } of strategies) {
+      try {
+        addLog(`[ytdlp] Trying client: ${name}`, "info");
+        await youtubedl(cleanUrl, { ...base, ...opts });
+        addLog(`[ytdlp] Success with client: ${name}`, "success");
+        return; // done
+      } catch (e) {
+        const msg = e?.stderr || e?.message || String(e);
+        const short = msg.replace(/\s+/g, " ").slice(0, 120);
+        addLog(`[ytdlp] ${name} failed: ${short}`, "warn");
+        errors.push(`${name}: ${short}`);
+      }
     }
-    // Attempt 2: TV embedded client
+
+    // ── Fallback: @distube/ytdl-core (pure JS, no binary) ──────────────────
+    // Only works for non-age-restricted, publicly available videos.
+    addLog(`[ytdlp] All yt-dlp strategies failed. Trying ytdl-core fallback...`, "warn");
     try {
-      await youtubedl(cleanUrl, {
-        ...base,
-        extractorArgs: "youtube:player_client=tv_embedded",
-        format: "bestaudio/best"
+      const ytdlCore = await import("@distube/ytdl-core");
+      const ytdl = ytdlCore.default || ytdlCore;
+      await new Promise((resolve, reject) => {
+        const stream = ytdl(cleanUrl, {
+          quality: "highestaudio",
+          filter: "audioonly"
+        });
+        const outStream = fs.createWriteStream(output);
+        stream.pipe(outStream);
+        stream.on("error", reject);
+        outStream.on("finish", resolve);
+        outStream.on("error", reject);
       });
+      addLog(`[ytdlp] ytdl-core fallback succeeded`, "success");
       return;
-    } catch (e2) {
-      addLog(`TV client failed: ${e2.message}. Trying mweb...`, "warn");
+    } catch (fallbackErr) {
+      const fbMsg = fallbackErr?.message || String(fallbackErr);
+      errors.push(`ytdl-core: ${fbMsg.slice(0, 120)}`);
+      addLog(`[ytdlp] ytdl-core fallback failed: ${fbMsg.slice(0, 120)}`, "error");
     }
-    // Attempt 3: mweb client
-    try {
-      await youtubedl(cleanUrl, {
-        ...base,
-        extractorArgs: "youtube:player_client=mweb",
-        userAgent: "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36",
-        format: "bestaudio/best"
-      });
-      return;
-    } catch (e3) {
-      addLog(`mweb client failed: ${e3.message}. Trying web_creator...`, "warn");
-    }
-    // Attempt 4: web_creator client (last resort)
-    await youtubedl(cleanUrl, {
-      ...base,
-      extractorArgs: "youtube:player_client=web_creator",
-      format: "bestaudio/best"
-    });
+
+    // All strategies exhausted — throw combined error summary
+    throw new Error(
+      `All download strategies failed:\n${errors.map((e, i) => `  ${i + 1}. ${e}`).join("\n")}`
+    );
   };
   const statusUpdate = async (chatId, messageId, text) => {
     try {
