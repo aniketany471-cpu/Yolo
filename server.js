@@ -398,7 +398,7 @@ if (!existingConfig?.bluesmindsApiKey || existingConfig.bluesmindsApiKey.length 
 // Bootstrap credentials from env vars so Railway redeployments don't wipe them from the UI
 {
   const envBootstrap = db.prepare(
-    "SELECT telegramApiId, telegramApiHash, telegramStringSession, geminiKey, openRouterKey, groqKey, bluesmindsApiKey FROM config WHERE id = 1"
+    "SELECT telegramApiId, telegramApiHash, telegramStringSession, geminiKey FROM config WHERE id = 1"
   ).get();
   const envUpdates = {};
   if (!envBootstrap?.telegramApiId && process.env.TELEGRAM_API_ID)
@@ -407,14 +407,8 @@ if (!existingConfig?.bluesmindsApiKey || existingConfig.bluesmindsApiKey.length 
     envUpdates.telegramApiHash = process.env.TELEGRAM_API_HASH;
   if (!envBootstrap?.telegramStringSession && process.env.TELEGRAM_STRING_SESSION)
     envUpdates.telegramStringSession = process.env.TELEGRAM_STRING_SESSION;
-  if (process.env.GEMINI_API_KEY)
+  if (!envBootstrap?.geminiKey && process.env.GEMINI_API_KEY)
     envUpdates.geminiKey = process.env.GEMINI_API_KEY;
-  if (process.env.OPENROUTER_API_KEY)
-    envUpdates.openRouterKey = process.env.OPENROUTER_API_KEY;
-  if (process.env.GROQ_API_KEY)
-    envUpdates.groqKey = process.env.GROQ_API_KEY;
-  if (process.env.BLUESMINDS_API_KEY)
-    envUpdates.bluesmindsApiKey = process.env.BLUESMINDS_API_KEY;
   if (Object.keys(envUpdates).length > 0) {
     for (const [k, v] of Object.entries(envUpdates)) {
       db.prepare(`UPDATE config SET ${k} = ? WHERE id = 1`).run(v);
@@ -456,12 +450,6 @@ async function getGeminiResponse(prompt, apiKey, model = "gemini-1.5-flash", con
     return null;
   }
 }
-const AI_FETCH_TIMEOUT_MS = 10000;
-function makeAbortSignal() {
-  const ctrl = new AbortController();
-  setTimeout(() => ctrl.abort(), AI_FETCH_TIMEOUT_MS);
-  return ctrl.signal;
-}
 async function getGroqResponse(prompt, apiKey, model = "llama3-8b-8192", context = [], systemInstruction) {
   try {
     const cleanKey = apiKey?.trim();
@@ -490,29 +478,34 @@ async function getGroqResponse(prompt, apiKey, model = "llama3-8b-8192", context
           Authorization: `Bearer ${cleanKey}`,
           "Content-Type": "application/json"
         },
-        body: JSON.stringify({ model: finalModel, messages }),
-        signal: makeAbortSignal()
+        body: JSON.stringify({
+          model: finalModel,
+          messages
+        })
       }
     );
     const contentType = response.headers.get("content-type");
     if (!response.ok || !contentType?.includes("application/json")) {
       const err = await response.text();
-      console.error(`[Groq] API Error (${response.status}):`, err.substring(0, 300));
+      console.error(
+        `[Groq] API Error (${response.status}, ${contentType}):`,
+        err.substring(0, 500)
+      );
       return null;
     }
     const data = await response.json();
     return data.choices?.[0]?.message?.content?.trim() || null;
   } catch (e) {
-    console.error("[Groq] Fetch Error:", e?.name === "AbortError" ? "Timed out after 30s" : e?.message || e);
+    console.error("[Groq] Fetch Error:", e?.message || e);
     return null;
   }
 }
-async function getOpenRouterResponse(prompt, apiKey, model = "openrouter/free", context = [], systemInstruction) {
+async function getOpenRouterResponse(prompt, apiKey, model = "google/gemini-2.0-flash-001", context = [], systemInstruction) {
   try {
     const cleanKey = apiKey?.trim();
     if (!cleanKey || cleanKey === "undefined" || cleanKey === "null")
       return null;
-    const finalModel = model && (model.includes("/") || model.includes("-")) ? model : "openrouter/free";
+    const finalModel = model && (model.includes("/") || model.includes("-")) ? model : "google/gemini-2.0-flash-001";
     const messages = context.length > 0 ? [
       ...systemInstruction ? [{ role: "system", content: systemInstruction }] : [],
       ...context.map((c) => ({
@@ -525,7 +518,7 @@ async function getOpenRouterResponse(prompt, apiKey, model = "openrouter/free", 
       { role: "user", content: prompt }
     ];
     const response = await fetch(
-      "https://openrouter.ai/api/v1/chat/completions",
+      "https://api.v1.openrouter.ai/chat/completions",
       {
         method: "POST",
         headers: {
@@ -534,20 +527,25 @@ async function getOpenRouterResponse(prompt, apiKey, model = "openrouter/free", 
           "HTTP-Referer": "https://ais-dev.run.app",
           "X-Title": "TG Userbot"
         },
-        body: JSON.stringify({ model: finalModel, messages }),
-        signal: makeAbortSignal()
+        body: JSON.stringify({
+          model: finalModel,
+          messages
+        })
       }
     );
     const contentType = response.headers.get("content-type");
     if (!response.ok || !contentType?.includes("application/json")) {
       const err = await response.text();
-      console.error(`[OpenRouter] API Error (${response.status}):`, err.substring(0, 300));
+      console.error(
+        `[OpenRouter] API Error (${response.status}, ${contentType}):`,
+        err.substring(0, 500)
+      );
       return null;
     }
     const data = await response.json();
     return data.choices?.[0]?.message?.content?.trim() || null;
   } catch (e) {
-    console.error("[OpenRouter] Fetch Error:", e?.name === "AbortError" ? "Timed out after 30s" : e?.message || e);
+    console.error("[OpenRouter] Fetch Error:", e?.message || e);
     return null;
   }
 }
@@ -575,28 +573,44 @@ async function getBluesMindsResponse(prompt, apiKey, model = "gemini-1.5-flash",
           "Content-Type": "application/json",
           Authorization: `Bearer ${cleanKey}`
         },
-        body: JSON.stringify({ model, messages, temperature: 0.7 }),
-        signal: makeAbortSignal()
+        body: JSON.stringify({
+          model,
+          messages,
+          temperature: 0.7
+        })
       }
     );
     if (!response.ok) {
       const errText = await response.text();
       if (errText.includes("reached its end of life") || response.status === 410 || response.status === 503 || errText.includes("model_not_found") || errText.includes("no available channel")) {
-        console.warn(`[BluesMinds] Model ${model} unavailable, trying fallback...`);
-        const fallbackChain = ["gemini-1.5-pro", "gemini-2.0-flash-exp", "deepseek-chat", "gpt-4o-mini", "gemini-1.5-flash"];
+        console.warn(
+          `[AI] BluesMinds Warning (${response.status}): Model ${model} is discontinued or unavailable. Attempting fallback...`
+        );
+        const fallbackChain = [
+          "gpt-4o",
+          "gpt-4o-mini",
+          "deepseek-chat",
+          "deepseek-v4-flash",
+          "meta/llama-3.3-70b-instruct"
+        ];
         const currentIdx = fallbackChain.indexOf(model);
-        const nextModel = fallbackChain[currentIdx + 1] || (model !== "gemini-1.5-flash" ? "gemini-1.5-flash" : null);
+        const nextModel = fallbackChain[currentIdx + 1] || (model !== "gpt-4o-mini" ? "gpt-4o-mini" : null);
         if (nextModel && nextModel !== model) {
-          return getBluesMindsResponse(prompt, apiKey, nextModel, context, systemInstruction);
+          return getBluesMindsResponse(
+            prompt,
+            apiKey,
+            nextModel,
+            context,
+            systemInstruction
+          );
         }
       }
-      console.error(`[BluesMinds] API Error (${response.status}):`, errText.substring(0, 300));
-      return null;
+      throw new Error(`BluesMinds API Error (${response.status}): ${errText}`);
     }
     const data = await response.json();
     return data.choices?.[0]?.message?.content?.trim() || null;
   } catch (e) {
-    console.error("[BluesMinds] Fetch Error:", e?.name === "AbortError" ? "Timed out after 30s" : e?.message || e);
+    console.error(`[AI] BluesMinds Error:`, e.message || e);
     return null;
   }
 }
@@ -634,8 +648,7 @@ async function performWebSearch(query, config, deep = false) {
         query,
         search_depth: depth,
         max_results: maxResults
-      }),
-      signal: makeAbortSignal()
+      })
     });
     if (!response.ok) {
       console.error(`[Search] API Error: ${response.status}`);
@@ -821,15 +834,14 @@ User Message: ${prompt}`;
     key: groqK,
     fn: (p, k, ctx, inst) => getGroqResponse(p, k, config.activeModel, ctx, inst)
   };
-  const systemOrKey = (process.env.OPENROUTER_API_KEY || "").trim();
   const orProvider = {
     name: "OpenRouter",
-    key: openRouterK || systemOrKey,
-    fn: (p, k, ctx, inst) => getOpenRouterResponse(p, k, config.activeModel || "openrouter/free", ctx, inst)
+    key: openRouterK,
+    fn: (p, k, ctx, inst) => getOpenRouterResponse(p, k, config.activeModel, ctx, inst)
   };
   const bluesmindsProvider = {
     name: "BluesMinds",
-    key: (config.bluesmindsApiKey || "").trim(),
+    key: config.bluesmindsApiKey,
     fn: (p, k, ctx, inst) => getBluesMindsResponse(
       p,
       k,
@@ -1334,7 +1346,7 @@ async function startServer() {
           isListenerActive,
           lastEventTimestamp,
           clientReady: !!client,
-          aiConfigured: !!(config?.geminiKey || config?.groqKey || config?.openRouterKey || config?.bluesmindsApiKey || process.env.GEMINI_API_KEY)
+          aiConfigured: !!(config?.geminiKey || config?.groqKey || config?.openRouterKey || process.env.GEMINI_API_KEY)
         }
       };
       res.json(payload);
@@ -1479,6 +1491,22 @@ async function startServer() {
   app.delete("/api/logs", (req, res) => {
     db.prepare("DELETE FROM logs").run();
     res.json({ success: true });
+  });
+  app.get("/api/bluesminds/models", async (req, res) => {
+    try {
+      const cfg = db.prepare("SELECT bluesmindsApiKey FROM config WHERE id = 1").get();
+      const key = (cfg?.bluesmindsApiKey || "").trim();
+      if (!key) return res.json({ models: [] });
+      const r = await fetch("https://api.bluesminds.com/v1/models", {
+        headers: { Authorization: `Bearer ${key}` }
+      });
+      if (!r.ok) return res.json({ models: [] });
+      const data = await r.json();
+      const ids = (data.data || []).map((m) => m.id).sort();
+      res.json({ models: ids });
+    } catch (e) {
+      res.json({ models: [] });
+    }
   });
   app.get("/api/exports", (req, res) => {
     const list = db.prepare("SELECT * FROM exports ORDER BY createdAt DESC").all();
@@ -2091,18 +2119,13 @@ async function startServer() {
           }
         }
         await status.update("\u{1F50D} **Searching...**");
-        let aiRes = null;
-        try {
-          aiRes = await getAIResponse(
-            text,
-            config,
-            chatIdStr,
-            senderId,
-            isNSFWActive
-          );
-        } catch (aiErr) {
-          console.error(`[AI-Auto] getAIResponse threw:`, aiErr?.message || aiErr);
-        }
+        const aiRes = await getAIResponse(
+          text,
+          config,
+          chatIdStr,
+          senderId,
+          isNSFWActive
+        );
         if (aiRes && client2) {
           const responseMod = await moderateContent(aiRes);
           const formatted = formatAiMessage(
@@ -2117,12 +2140,11 @@ async function startServer() {
           );
         } else {
           await status.finish(
-            "\u274C **AI Error:** Could not generate a response. Check your AI provider key in settings or switch to OpenRouter (free)."
+            "\u274C **AI Error:** Could not generate a response. Please check your keys or try again later."
           );
         }
       } catch (e) {
-        console.error(`[AI-Auto] Outer Error:`, e.message || e);
-        try { await status.finish("\u274C **AI Error:** Something went wrong. Please try again."); } catch (_) {}
+        console.error(`[AI-Auto] Error:`, e.message || e);
       } finally {
         setTimeout(() => aiProcessingLock.delete(lockKey), 6e4);
       }
