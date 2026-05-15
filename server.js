@@ -1254,7 +1254,9 @@ class PermissionManager {
       return { allowed: false, reason: "\u{1F6AB} You are blacklisted.", level };
     }
     // These commands are always open to everyone — no toggle can block them
-    const alwaysPublicCommands = ["ans", "music", "song", "pdf", "stcr"];
+    // nsfw/confirmage MUST be here so DM users can always enable/disable mature mode
+    // regardless of the global publicCommandsEnabled setting.
+    const alwaysPublicCommands = ["ans", "music", "song", "pdf", "stcr", "nsfw", "confirmage"];
     const publicCommands = [
       "ans",
       "music",
@@ -2497,22 +2499,32 @@ async function startServer() {
         isNSFWActive = true;
       }
     }
-    const modResult = await moderateContent(text);
-    if (!modResult.safe) {
-      console.log(
-        `[AI-Auto] NSFW Content Violation by ${senderId}: ${modResult.reason}`
-      );
-      const nsfwLogId = Math.random().toString(36).substring(2);
-      db.prepare(
-        "INSERT INTO nsfw_logs (id, timestamp, userId, chatId, message, violation) VALUES (?, ?, ?, ?, ?, ?)"
-      ).run(nsfwLogId, Date.now(), senderId, chatIdStr, text, modResult.reason);
-      if (isPrivate) {
-        await client2.sendMessage(message.chatId, {
-          message: "\u26A0\uFE0F **Moderation:** Your message violates our safety guidelines. NSFW mode has been temporarily restricted for this conversation.",
-          replyTo: message.id
-        });
+    // Content moderation only applies in groups — DMs are unrestricted.
+    // Illegal content patterns (minors, bestiality, etc.) are still blocked everywhere.
+    const hardBlocked = [
+      /\b(minor|child|toddler|kid|infant)\s+(porn|sex|erotica|nude|naked)\b/i,
+      /\b(zoo|bestiality|animal)\s+(sex|porn)\b/i,
+      /\b(underage)\b/i
+    ];
+    if (!isPrivate) {
+      const modResult = await moderateContent(text);
+      if (!modResult.safe) {
+        console.log(
+          `[AI-Auto] NSFW Content Violation by ${senderId}: ${modResult.reason}`
+        );
+        const nsfwLogId = Math.random().toString(36).substring(2);
+        db.prepare(
+          "INSERT INTO nsfw_logs (id, timestamp, userId, chatId, message, violation) VALUES (?, ?, ?, ?, ?, ?)"
+        ).run(nsfwLogId, Date.now(), senderId, chatIdStr, text, modResult.reason);
+        return;
       }
-      return;
+    } else {
+      // In DMs: only block truly illegal content (hard rules that cannot be bypassed)
+      const hardViolation = hardBlocked.some((p) => p.test(text));
+      if (hardViolation) {
+        console.log(`[AI-Auto] Hard block in DM from ${senderId}`);
+        return;
+      }
     }
     console.log(
       `[AI-Auto] Processing reply for ${chatIdStr} (NSFW: ${isNSFWActive})...`
@@ -2573,10 +2585,14 @@ async function startServer() {
           isNSFWActive
         );
         if (aiRes && client2) {
-          const responseMod = await moderateContent(aiRes);
-          const formatted = formatAiMessage(
-            responseMod.safe ? aiRes : "I cannot fulfill that request due to safety restrictions."
-          );
+          // In DMs there is no outgoing content filter — the AI response is sent as-is.
+          // In groups, moderate the output and replace unsafe replies with a refusal.
+          let safeAiRes = aiRes;
+          if (!isPrivate) {
+            const responseMod = await moderateContent(aiRes);
+            if (!responseMod.safe) safeAiRes = "I cannot fulfill that request in a group chat.";
+          }
+          const formatted = formatAiMessage(safeAiRes);
           await status.update(formatted.text, {
             parseMode: formatted.parseMode
           });
