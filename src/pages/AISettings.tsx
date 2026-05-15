@@ -662,6 +662,9 @@ export function AISettings() {
             </div>
           </div>
 
+          {/* Model test panel */}
+          <ModelTestPanel activeModel={activeModel} />
+
           {/* Recent AI logs */}
           <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-xl">
             <h4 className="text-sm font-semibold text-slate-300 mb-3">Recent AI Activity</h4>
@@ -679,6 +682,105 @@ export function AISettings() {
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+interface TestResult {
+  ok: boolean;
+  latency?: number;
+  text?: string;
+  error?: string;
+  knownBad?: boolean;
+  broken?: boolean;
+  status?: number;
+}
+
+function ModelTestPanel({ activeModel }: { activeModel: string }) {
+  const [prompt, setPrompt] = useState('Reply with exactly: MODEL_OK');
+  const [result, setResult] = useState<TestResult | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  const runTest = async () => {
+    setLoading(true);
+    setResult(null);
+    try {
+      const r = await fetch('/api/ai/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ provider: 'bluesminds', model: activeModel, prompt }),
+      });
+      const data = await r.json();
+      setResult(data);
+    } catch (e: any) {
+      setResult({ ok: false, error: e?.message || 'Network error' });
+    }
+    setLoading(false);
+  };
+
+  return (
+    <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4 shadow-xl">
+      <h4 className="text-sm font-semibold text-slate-300 flex items-center gap-2">
+        <Zap className="w-4 h-4 text-amber-400" /> Test Active Model
+      </h4>
+
+      <div className="text-[10px] font-mono text-blue-400 bg-slate-950 rounded px-2 py-1.5 truncate">
+        {activeModel || 'none selected'}
+      </div>
+
+      <input
+        type="text"
+        value={prompt}
+        onChange={(e) => setPrompt(e.target.value)}
+        placeholder="Test prompt…"
+        className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-xs text-slate-200 focus:outline-none focus:border-blue-500 transition-colors"
+      />
+
+      <button
+        onClick={runTest}
+        disabled={loading || !activeModel}
+        className={cn(
+          'w-full py-2 rounded-lg text-xs font-bold transition-all',
+          loading
+            ? 'bg-slate-700 text-slate-500 cursor-not-allowed'
+            : 'bg-blue-600 hover:bg-blue-500 text-white shadow-lg shadow-blue-500/20'
+        )}
+      >
+        {loading ? 'Testing…' : 'Run Test'}
+      </button>
+
+      {result && (
+        <div className={cn(
+          'rounded-lg p-3 space-y-2 text-xs border',
+          result.ok
+            ? 'bg-emerald-500/5 border-emerald-500/20'
+            : 'bg-red-500/5 border-red-500/20'
+        )}>
+          <div className="flex items-center gap-2">
+            <span className={cn('font-bold', result.ok ? 'text-emerald-400' : 'text-red-400')}>
+              {result.ok ? '✅ PASS' : '❌ FAIL'}
+            </span>
+            {result.latency != null && (
+              <span className="text-slate-500 text-[10px]">{result.latency}ms</span>
+            )}
+            {result.knownBad && (
+              <span className="text-[10px] bg-orange-500/10 text-orange-400 px-1.5 py-0.5 rounded border border-orange-500/20">
+                KNOWN BAD
+              </span>
+            )}
+          </div>
+          {result.ok && result.text && (
+            <div className="font-mono text-emerald-300 text-[10px] bg-slate-950 rounded p-2 break-words max-h-20 overflow-y-auto">
+              {result.text}
+            </div>
+          )}
+          {!result.ok && result.error && (
+            <div className="text-red-300 text-[10px] bg-slate-950 rounded p-2 break-words">
+              {result.status ? `HTTP ${result.status}: ` : ''}{result.error}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

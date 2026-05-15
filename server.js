@@ -420,8 +420,40 @@ console.log("[startup] Bootstrap complete — BluesMinds provider, autoReply ON,
   }
 }
 // ─── Robust request infrastructure ────────────────────────────────────────────
-const REQUEST_TIMEOUT_MS = 30000;
-const MAX_RETRIES = 2;
+const REQUEST_TIMEOUT_MS = 15000;  // 15s per attempt — fails fast before fallback
+const MAX_RETRIES = 1;             // 1 retry = max 30s total before giving up
+
+const BLUEMINDS_BASE_URL = "https://api.bluesminds.com/v1";
+
+// Models confirmed broken: tier restriction, suspended, 404 not found, or permanent timeout.
+// Updated from live audit May 2026.
+const KNOWN_BAD_MODELS = new Set([
+  "gpt-5-nano",             // permanent timeout
+  "deepseek-chat",          // permanent timeout
+  "deepseek-reasoner",      // permanent timeout
+  "blackbox",               // permanent timeout
+  "kimi-k2.5",              // permanent timeout
+  "deepseek-v4-flash",      // 403 Tier Restriction
+  "deepseek-v4-pro",        // 412 Account Suspended
+  "deepseek-ai/deepseek-v4-flash",  // 403 Tier Restriction
+  "deepseek-ai/deepseek-v4-pro",    // 412 Account Suspended
+  "claude-sonnet-4-6",      // 403 Tier Restriction
+  "gemini-3.1-flash-lite-preview",  // 404 Not Found
+  "mistralai/mistral-large",        // 404 Function not found
+  "gpt-4o",                 // 500 upstream "Extra data" — malformed response
+]);
+
+// Fallback chain of verified-working models (confirmed in live audit May 2026).
+// Ordered: fastest/most reliable first.
+const BM_FALLBACK_CHAIN = [
+  "deepseek.v3.1",             //  942ms ✅
+  "gpt-5-chat",                // 1796ms ✅
+  "gpt-4o-mini",               // 2779ms ✅
+  "gpt-3.5-turbo-0613",        // 2770ms ✅
+  "gemini-3-flash-preview",    // 1339ms ✅
+  "meta/llama-3.3-70b-instruct", // 583ms ✅
+  "meta/llama-3.1-8b-instruct",  // 3006ms ✅
+];
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -429,6 +461,27 @@ function sleep(ms) {
 
 function isRetryableStatus(status) {
   return status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
+}
+
+/**
+ * Returns true if a BluesMinds error response body/status indicates the model
+ * itself is broken (and we should try the next fallback immediately, NOT retry).
+ */
+function isBmModelBroken(status, errText) {
+  if (status === 403 || status === 404 || status === 410 || status === 412) return true;
+  const t = (errText || "").toLowerCase();
+  return (
+    t.includes("tier restriction") ||
+    t.includes("suspended") ||
+    t.includes("not found") ||
+    t.includes("notfounderror") ||
+    t.includes("reached its end of life") ||
+    t.includes("model_not_found") ||
+    t.includes("no available channel") ||
+    t.includes("agent not found") ||
+    t.includes("model not found") ||
+    (status === 500 && t.includes("extra data"))  // gpt-4o upstream parse crash
+  );
 }
 
 function normalizeContextMessages(prompt, context = [], systemInstruction) {
@@ -453,42 +506,52 @@ async function fetchJsonWithRetry(url, options, meta) {
     const started = Date.now();
     try {
       console.log(
-        `[AI][Request][Provider=${meta.provider}][Model=${meta.model}][Endpoint=${meta.endpoint}][Attempt=${attempt + 1}]`
+        `[${meta.provider}][Model=${meta.model}][Attempt=${attempt + 1}] → ${meta.endpoint}`
       );
       const response = await fetch(url, { ...options, signal: controller.signal });
       const latency = Date.now() - started;
       const contentType = response.headers.get("content-type") || "";
+
       if (!response.ok) {
-        const errText = await response.text();
+        const rawBody = await response.text();
+        const errText = rawBody.trim() || `(empty body, status ${response.status})`;
         console.error(
-          `[AI][Response][Provider=${meta.provider}][Model=${meta.model}][Status=${response.status}][Latency=${latency}ms][Error=${errText.substring(0, 200)}]`
+          `[${meta.provider}][Model=${meta.model}][Status=${response.status}][Latency=${latency}ms] ERROR: ${errText.substring(0, 200)}`
         );
+        // Don't retry broken models — waste of time
+        if (isBmModelBroken(response.status, rawBody)) {
+          return { ok: false, status: response.status, text: rawBody, broken: true };
+        }
         if (attempt < MAX_RETRIES && isRetryableStatus(response.status)) {
-          await sleep(250 * Math.pow(2, attempt));
+          await sleep(300 * Math.pow(2, attempt));
           continue;
         }
-        return { ok: false, status: response.status, text: errText };
+        return { ok: false, status: response.status, text: rawBody };
       }
-      if (!contentType.includes("application/json")) {
+
+      // Accept both JSON and SSE content types as success for non-stream calls
+      if (!contentType.includes("application/json") && !contentType.includes("text/event-stream")) {
         const text = await response.text();
         console.error(
-          `[AI][Response][Provider=${meta.provider}][Model=${meta.model}][Status=${response.status}][Latency=${latency}ms][Error=Non-JSON response]`
+          `[${meta.provider}][Model=${meta.model}][Status=${response.status}][Latency=${latency}ms] Non-JSON content-type: ${contentType}`
         );
         return { ok: false, status: response.status, text };
       }
+
       const data = await response.json();
       console.log(
-        `[AI][Response][Provider=${meta.provider}][Model=${meta.model}][Status=${response.status}][Latency=${latency}ms]`
+        `[${meta.provider}][Model=${meta.model}][Status=${response.status}][Latency=${latency}ms] OK`
       );
       return { ok: true, status: response.status, data };
     } catch (e) {
       const latency = Date.now() - started;
-      const msg = e?.name === "AbortError" ? "Request timed out" : e?.message || String(e);
+      const isTimeout = e?.name === "AbortError";
+      const msg = isTimeout ? `Timed out after ${REQUEST_TIMEOUT_MS}ms` : (e?.message || String(e));
       console.error(
-        `[AI][Error][Provider=${meta.provider}][Model=${meta.model}][Latency=${latency}ms][Attempt=${attempt + 1}][Error=${msg}]`
+        `[${meta.provider}][Model=${meta.model}][Latency=${latency}ms][Attempt=${attempt + 1}] ${isTimeout ? "TIMEOUT" : "NETWORK_ERROR"}: ${msg}`
       );
-      if (attempt < MAX_RETRIES) {
-        await sleep(250 * Math.pow(2, attempt));
+      if (attempt < MAX_RETRIES && !isTimeout) {
+        await sleep(300 * Math.pow(2, attempt));
         continue;
       }
       return { ok: false, status: 0, text: msg };
@@ -496,7 +559,7 @@ async function fetchJsonWithRetry(url, options, meta) {
       clearTimeout(timeout);
     }
   }
-  return { ok: false, status: 0, text: "Unknown request failure" };
+  return { ok: false, status: 0, text: "Request failed after all retries" };
 }
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -588,52 +651,191 @@ async function getOpenRouterResponse(prompt, apiKey, model = "google/gemini-2.0-
     return null;
   }
 }
-async function getBluesMindsResponse(prompt, apiKey, model = "gpt-4o-mini", context = [], systemInstruction) {
+/**
+ * Extract text content from a BluesMinds chat completions response object.
+ * Handles the main OpenAI-compatible path and any known alternate field layouts.
+ */
+function extractBmContent(data) {
+  if (!data || typeof data !== "object") return null;
+  // Standard OpenAI path
+  const standard = data?.choices?.[0]?.message?.content;
+  if (typeof standard === "string" && standard.trim()) return standard.trim();
+  // Alternate paths observed in some BluesMinds models
+  const alt =
+    data?.output?.text ||
+    data?.data?.text ||
+    data?.text ||
+    data?.content ||
+    data?.choices?.[0]?.text;
+  if (typeof alt === "string" && alt.trim()) return alt.trim();
+  return null;
+}
+
+/**
+ * Extract text from a single SSE streaming delta chunk.
+ * BluesMinds uses standard OpenAI delta format for most models,
+ * but some older proxied models use delta.text instead of delta.content.
+ */
+function extractBmDelta(chunk) {
+  if (!chunk || typeof chunk !== "object") return "";
+  const delta = chunk?.choices?.[0]?.delta;
+  if (!delta) return "";
+  // Standard: delta.content
+  if (typeof delta.content === "string") return delta.content;
+  // Alternate: delta.text (some NVIDIA/proxied models)
+  if (typeof delta.text === "string") return delta.text;
+  return "";
+}
+
+/**
+ * Main non-streaming BluesMinds response function.
+ * Tries the requested model first, then walks the fallback chain automatically
+ * when the model is broken (tier restriction, suspended, not found, timeout, etc.).
+ */
+async function getBluesMindsResponse(prompt, apiKey, model = "gpt-4o-mini", context = [], systemInstruction, _visited = new Set()) {
+  const cleanKey = (apiKey || process.env.BLUEMINDS_API_KEY || "").trim();
+  if (!cleanKey || cleanKey === "undefined" || cleanKey === "null" || cleanKey.length < 10) {
+    console.warn("[BluesMinds] No valid API key configured.");
+    return null;
+  }
+
+  const targetModel = model || "gpt-4o-mini";
+  _visited.add(targetModel);
+
+  // Skip known-bad models immediately
+  if (KNOWN_BAD_MODELS.has(targetModel)) {
+    console.warn(`[BluesMinds][Model=${targetModel}] Skipped — in KNOWN_BAD_MODELS list. Trying fallback...`);
+    return _bmFallback(prompt, cleanKey, targetModel, context, systemInstruction, _visited);
+  }
+
+  const messages = normalizeContextMessages(prompt, context, systemInstruction);
+  const result = await fetchJsonWithRetry(
+    `${BLUEMINDS_BASE_URL}/chat/completions`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${cleanKey}` },
+      body: JSON.stringify({ model: targetModel, messages, temperature: 0.7 })
+    },
+    { provider: "BluesMinds", model: targetModel, endpoint: "/v1/chat/completions" }
+  );
+
+  if (!result.ok) {
+    // If model itself is broken, fall back instead of throwing
+    if (result.broken || isBmModelBroken(result.status, result.text)) {
+      console.warn(`[BluesMinds][Model=${targetModel}][Status=${result.status}] Model broken. Trying fallback...`);
+      return _bmFallback(prompt, cleanKey, targetModel, context, systemInstruction, _visited);
+    }
+    console.error(`[BluesMinds][Model=${targetModel}][Status=${result.status}] Request failed: ${(result.text || "").slice(0, 200)}`);
+    return null;
+  }
+
+  const content = extractBmContent(result.data);
+  if (!content) {
+    console.warn(`[BluesMinds][Model=${targetModel}] Response OK but content was empty. Raw keys: ${Object.keys(result.data || {}).join(", ")}`);
+    // Try fallback on empty response
+    return _bmFallback(prompt, cleanKey, targetModel, context, systemInstruction, _visited);
+  }
+
+  console.log(`[BluesMinds][Model=${targetModel}] ✅ Got ${content.length} chars`);
+  return content;
+}
+
+/**
+ * Walk the fallback chain and return the first successful response.
+ * Never visits the same model twice.
+ */
+async function _bmFallback(prompt, cleanKey, failedModel, context, systemInstruction, _visited) {
+  // Build ordered fallback list: put the configured fallbacks first,
+  // skipping already-visited and known-bad models
+  const chain = BM_FALLBACK_CHAIN.filter(m => !_visited.has(m) && !KNOWN_BAD_MODELS.has(m));
+  if (chain.length === 0) {
+    console.error(`[BluesMinds] All fallback models exhausted. Returning null.`);
+    return null;
+  }
+  const nextModel = chain[0];
+  console.log(`[BluesMinds] Falling back from ${failedModel} → ${nextModel}`);
+  return getBluesMindsResponse(prompt, cleanKey, nextModel, context, systemInstruction, _visited);
+}
+
+/**
+ * Async generator that streams BluesMinds SSE output chunk by chunk.
+ * Yields plain text strings as they arrive.
+ * Handles both delta.content and delta.text field paths.
+ *
+ * Usage:
+ *   for await (const chunk of getBluesMindsStream(prompt, key, model)) {
+ *     process.stdout.write(chunk);
+ *   }
+ */
+async function* getBluesMindsStream(prompt, apiKey, model = "gpt-4o-mini", context = [], systemInstruction) {
+  const cleanKey = (apiKey || process.env.BLUEMINDS_API_KEY || "").trim();
+  if (!cleanKey || cleanKey.length < 10) return;
+
+  const messages = normalizeContextMessages(prompt, context, systemInstruction);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+  let response;
   try {
-    const cleanKey = apiKey?.trim();
-    if (!cleanKey || cleanKey === "undefined" || cleanKey === "null")
-      return null;
-    const messages = normalizeContextMessages(prompt, context, systemInstruction);
-    const result = await fetchJsonWithRetry(
-      "https://api.bluesminds.com/v1/chat/completions",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${cleanKey}` },
-        body: JSON.stringify({ model, messages, temperature: 0.7 })
-      },
-      { provider: "BluesMinds", model, endpoint: "/v1/chat/completions" }
-    );
-    if (!result.ok) {
-      const errText = result.text || "";
-      if (
-        errText.includes("reached its end of life") ||
-        result.status === 410 ||
-        result.status === 503 ||
-        errText.includes("model_not_found") ||
-        errText.includes("no available channel")
-      ) {
-        console.warn(
-          `[AI] BluesMinds Warning (${result.status}): Model ${model} is discontinued or unavailable. Attempting fallback...`
-        );
-        const fallbackChain = [
-          "gpt-4o",
-          "gpt-4o-mini",
-          "deepseek-chat",
-          "deepseek-v4-flash",
-          "meta/llama-3.3-70b-instruct"
-        ];
-        const currentIdx = fallbackChain.indexOf(model);
-        const nextModel = fallbackChain[currentIdx + 1] || (model !== "gpt-4o-mini" ? "gpt-4o-mini" : null);
-        if (nextModel && nextModel !== model) {
-          return getBluesMindsResponse(prompt, apiKey, nextModel, context, systemInstruction);
+    response = await fetch(`${BLUEMINDS_BASE_URL}/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${cleanKey}` },
+      body: JSON.stringify({ model, messages, temperature: 0.7, stream: true }),
+      signal: controller.signal
+    });
+  } catch (e) {
+    clearTimeout(timeoutId);
+    console.error(`[BluesMinds][Stream][Model=${model}] Fetch error: ${e.message}`);
+    return;
+  }
+
+  if (!response.ok) {
+    clearTimeout(timeoutId);
+    const errBody = await response.text().catch(() => "");
+    console.error(`[BluesMinds][Stream][Model=${model}][Status=${response.status}] Error: ${errBody.slice(0, 150)}`);
+    return;
+  }
+
+  console.log(`[BluesMinds][Stream][Model=${model}] Connected — content-type: ${response.headers.get("content-type")}`);
+
+  const decoder = new TextDecoder();
+  const reader = response.body.getReader();
+  let buffer = "";
+  let chunkCount = 0;
+  let totalChars = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      // Process all complete SSE lines in the buffer
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? ""; // keep incomplete last line
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("data: ")) continue;
+        const data = trimmed.slice(6);
+        if (data === "[DONE]") continue;
+        try {
+          const parsed = JSON.parse(data);
+          const text = extractBmDelta(parsed);
+          if (text) {
+            chunkCount++;
+            totalChars += text.length;
+            yield text;
+          }
+        } catch {
+          // ignore malformed SSE lines (pings, heartbeats, etc.)
         }
       }
-      throw new Error(`BluesMinds API Error (${result.status}): ${errText}`);
     }
-    return result.data?.choices?.[0]?.message?.content?.trim() || null;
-  } catch (e) {
-    console.error(`[AI] BluesMinds Error:`, e.message || e);
-    return null;
+  } finally {
+    clearTimeout(timeoutId);
+    reader.releaseLock();
+    console.log(`[BluesMinds][Stream][Model=${model}] Done — chunks=${chunkCount} chars=${totalChars}`);
   }
 }
 const aiProcessingLock = /* @__PURE__ */ new Set();
@@ -1523,47 +1725,115 @@ async function startServer() {
   app.get("/api/bluesminds/models", async (req, res) => {
     try {
       const cfg = db.prepare("SELECT bluesmindsApiKey FROM config WHERE id = 1").get();
-      const key = (cfg?.bluesmindsApiKey || "").trim();
-      if (!key) return res.json({ models: [] });
-      const r = await fetch("https://api.bluesminds.com/v1/models", {
-        headers: { Authorization: `Bearer ${key}` }
-      });
-      if (!r.ok) return res.json({ models: [] });
+      const key = (cfg?.bluesmindsApiKey || process.env.BLUEMINDS_API_KEY || "").trim();
+      if (!key) return res.json({ models: [], working: [], bad: [] });
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 10000);
+      const r = await fetch(`${BLUEMINDS_BASE_URL}/models`, {
+        headers: { Authorization: `Bearer ${key}` },
+        signal: ctrl.signal
+      }).finally(() => clearTimeout(t));
+      if (!r.ok) return res.json({ models: [], working: [], bad: [] });
       const data = await r.json();
-      const ids = (data.data || []).map((m) => m.id).sort();
-      res.json({ models: ids });
+      const allIds = (data.data || []).map((m) => m.id).sort();
+      // Filter out confirmed-broken models so they don't pollute the picker
+      const workingIds = allIds.filter(id => !KNOWN_BAD_MODELS.has(id));
+      const badIds = allIds.filter(id => KNOWN_BAD_MODELS.has(id));
+      res.json({ models: workingIds, working: workingIds, bad: badIds, total: allIds.length });
     } catch (e) {
-      res.json({ models: [] });
+      res.json({ models: [], working: [], bad: [], error: e?.message });
     }
   });
+
+  // Non-streaming model test — runs a real inference call and reports result
   app.post("/api/ai/test", async (req, res) => {
-    const { provider, model, prompt, stream } = req.body || {};
+    const { provider, model, prompt } = req.body || {};
     const cfg = db.prepare("SELECT * FROM config WHERE id = 1").get();
-    const safePrompt = (prompt || "Return exactly: OK").toString();
-    const selectedProvider = (provider || cfg.aiProvider || "bluesminds").toString();
-    const selectedModel = (model || cfg.activeModel || "gpt-4o-mini").toString();
+    const safePrompt = (prompt || "Reply with exactly: OK").toString();
+    const selectedProvider = (provider || cfg?.aiProvider || "bluesminds").toString();
+    const selectedModel = (model || cfg?.activeModel || "gpt-4o-mini").toString();
     const started = Date.now();
     let text = null;
     try {
-      if (stream === true) {
-        console.log(
-          `[AI][Test][Provider=${selectedProvider}][Model=${selectedModel}] Stream flag received, running non-streaming compatibility probe.`
-        );
-      }
       if (selectedProvider === "gemini") {
-        text = await getGeminiResponse(safePrompt, cfg.geminiKey || process.env.GEMINI_API_KEY || "", selectedModel);
+        text = await getGeminiResponse(safePrompt, cfg?.geminiKey || process.env.GEMINI_API_KEY || "", selectedModel);
       } else if (selectedProvider === "groq") {
-        text = await getGroqResponse(safePrompt, cfg.groqKey || "", selectedModel);
+        text = await getGroqResponse(safePrompt, cfg?.groqKey || "", selectedModel);
       } else if (selectedProvider === "openrouter") {
-        text = await getOpenRouterResponse(safePrompt, cfg.openRouterKey || "", selectedModel);
+        text = await getOpenRouterResponse(safePrompt, cfg?.openRouterKey || "", selectedModel);
       } else {
-        text = await getBluesMindsResponse(safePrompt, cfg.bluesmindsApiKey || "", selectedModel);
+        // BluesMinds — skip fallback chain for test (test the specific model directly)
+        const bmKey = (cfg?.bluesmindsApiKey || process.env.BLUEMINDS_API_KEY || "").trim();
+        if (!bmKey) {
+          return res.status(400).json({ ok: false, error: "No BluesMinds API key configured", provider: selectedProvider, model: selectedModel });
+        }
+        if (KNOWN_BAD_MODELS.has(selectedModel)) {
+          const latency = Date.now() - started;
+          return res.json({ ok: false, provider: selectedProvider, model: selectedModel, latency, error: "Model is in KNOWN_BAD_MODELS (confirmed broken)", knownBad: true });
+        }
+        const messages = normalizeContextMessages(safePrompt, [], undefined);
+        const result = await fetchJsonWithRetry(
+          `${BLUEMINDS_BASE_URL}/chat/completions`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${bmKey}` },
+            body: JSON.stringify({ model: selectedModel, messages, temperature: 0.3 })
+          },
+          { provider: "BluesMinds[Test]", model: selectedModel, endpoint: "/v1/chat/completions" }
+        );
+        if (result.ok) {
+          text = extractBmContent(result.data);
+          if (!text) {
+            const latency = Date.now() - started;
+            return res.json({ ok: false, provider: selectedProvider, model: selectedModel, latency, error: "Response OK but content was empty", rawKeys: Object.keys(result.data || {}) });
+          }
+        } else {
+          const latency = Date.now() - started;
+          let rawErr = result.text || "";
+          try { rawErr = JSON.parse(rawErr)?.error?.message || rawErr; } catch {}
+          return res.json({ ok: false, provider: selectedProvider, model: selectedModel, latency, error: rawErr.slice(0, 300), status: result.status, broken: result.broken || isBmModelBroken(result.status, result.text) });
+        }
       }
       const latency = Date.now() - started;
-      return res.json({ ok: !!text, provider: selectedProvider, model: selectedModel, stream: !!stream, latency, text: text || "" });
+      return res.json({ ok: !!text, provider: selectedProvider, model: selectedModel, latency, text: text || "" });
     } catch (e) {
       const latency = Date.now() - started;
       return res.status(500).json({ ok: false, provider: selectedProvider, model: selectedModel, latency, error: e?.message || String(e) });
+    }
+  });
+
+  // SSE streaming endpoint — proxies BluesMinds SSE stream to the browser
+  app.post("/api/ai/stream", async (req, res) => {
+    const { model, prompt, context, systemInstruction } = req.body || {};
+    const cfg = db.prepare("SELECT * FROM config WHERE id = 1").get();
+    const selectedModel = (model || cfg?.activeModel || "gpt-4o-mini").toString();
+    const bmKey = (cfg?.bluesmindsApiKey || process.env.BLUEMINDS_API_KEY || "").trim();
+
+    if (!bmKey) {
+      return res.status(400).json({ error: "No BluesMinds API key configured" });
+    }
+
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders();
+
+    const safePrompt = (prompt || "Hello").toString();
+    let totalChars = 0;
+    let chunkCount = 0;
+
+    try {
+      for await (const chunk of getBluesMindsStream(safePrompt, bmKey, selectedModel, context || [], systemInstruction)) {
+        chunkCount++;
+        totalChars += chunk.length;
+        res.write(`data: ${JSON.stringify({ text: chunk })}\n\n`);
+      }
+      res.write(`data: ${JSON.stringify({ done: true, chunks: chunkCount, chars: totalChars, model: selectedModel })}\n\n`);
+    } catch (e) {
+      res.write(`data: ${JSON.stringify({ error: e?.message || "Stream error" })}\n\n`);
+    } finally {
+      res.end();
     }
   });
 
