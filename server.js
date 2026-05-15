@@ -419,6 +419,87 @@ console.log("[startup] Bootstrap complete — BluesMinds provider, autoReply ON,
     console.log("[startup] Bootstrapped missing credentials from environment variables:", Object.keys(envUpdates).join(", "));
   }
 }
+// ─── Robust request infrastructure ────────────────────────────────────────────
+const REQUEST_TIMEOUT_MS = 30000;
+const MAX_RETRIES = 2;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryableStatus(status) {
+  return status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
+}
+
+function normalizeContextMessages(prompt, context = [], systemInstruction) {
+  const messages = [];
+  if (systemInstruction?.trim()) {
+    messages.push({ role: "system", content: systemInstruction.trim() });
+  }
+  for (const c of context || []) {
+    const role = c?.role === "model" ? "assistant" : c?.role;
+    const text = typeof c?.content === "string" ? c.content : c?.parts?.[0]?.text;
+    if (!role || typeof text !== "string" || !text.trim()) continue;
+    messages.push({ role, content: text });
+  }
+  messages.push({ role: "user", content: prompt });
+  return messages;
+}
+
+async function fetchJsonWithRetry(url, options, meta) {
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    const started = Date.now();
+    try {
+      console.log(
+        `[AI][Request][Provider=${meta.provider}][Model=${meta.model}][Endpoint=${meta.endpoint}][Attempt=${attempt + 1}]`
+      );
+      const response = await fetch(url, { ...options, signal: controller.signal });
+      const latency = Date.now() - started;
+      const contentType = response.headers.get("content-type") || "";
+      if (!response.ok) {
+        const errText = await response.text();
+        console.error(
+          `[AI][Response][Provider=${meta.provider}][Model=${meta.model}][Status=${response.status}][Latency=${latency}ms][Error=${errText.substring(0, 200)}]`
+        );
+        if (attempt < MAX_RETRIES && isRetryableStatus(response.status)) {
+          await sleep(250 * Math.pow(2, attempt));
+          continue;
+        }
+        return { ok: false, status: response.status, text: errText };
+      }
+      if (!contentType.includes("application/json")) {
+        const text = await response.text();
+        console.error(
+          `[AI][Response][Provider=${meta.provider}][Model=${meta.model}][Status=${response.status}][Latency=${latency}ms][Error=Non-JSON response]`
+        );
+        return { ok: false, status: response.status, text };
+      }
+      const data = await response.json();
+      console.log(
+        `[AI][Response][Provider=${meta.provider}][Model=${meta.model}][Status=${response.status}][Latency=${latency}ms]`
+      );
+      return { ok: true, status: response.status, data };
+    } catch (e) {
+      const latency = Date.now() - started;
+      const msg = e?.name === "AbortError" ? "Request timed out" : e?.message || String(e);
+      console.error(
+        `[AI][Error][Provider=${meta.provider}][Model=${meta.model}][Latency=${latency}ms][Attempt=${attempt + 1}][Error=${msg}]`
+      );
+      if (attempt < MAX_RETRIES) {
+        await sleep(250 * Math.pow(2, attempt));
+        continue;
+      }
+      return { ok: false, status: 0, text: msg };
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  return { ok: false, status: 0, text: "Unknown request failure" };
+}
+// ──────────────────────────────────────────────────────────────────────────────
+
 async function getGeminiResponse(prompt, apiKey, model = "gemini-1.5-flash", context = [], systemInstruction) {
   try {
     const cleanKey = apiKey?.trim();
@@ -462,42 +543,18 @@ async function getGroqResponse(prompt, apiKey, model = "llama3-8b-8192", context
     if (!finalModel.includes("-") && !finalModel.includes("/")) {
       finalModel = "llama3-8b-8192";
     }
-    const messages = context.length > 0 ? [
-      ...systemInstruction ? [{ role: "system", content: systemInstruction }] : [],
-      ...context.map((c) => ({
-        role: c.role === "model" ? "assistant" : c.role,
-        content: c.parts[0].text
-      })),
-      { role: "user", content: prompt }
-    ] : [
-      ...systemInstruction ? [{ role: "system", content: systemInstruction }] : [],
-      { role: "user", content: prompt }
-    ];
-    const response = await fetch(
+    const messages = normalizeContextMessages(prompt, context, systemInstruction);
+    const result = await fetchJsonWithRetry(
       "https://api.groq.com/openai/v1/chat/completions",
       {
         method: "POST",
-        headers: {
-          Authorization: `Bearer ${cleanKey}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          model: finalModel,
-          messages
-        })
-      }
+        headers: { Authorization: `Bearer ${cleanKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ model: finalModel, messages })
+      },
+      { provider: "Groq", model: finalModel, endpoint: "/openai/v1/chat/completions" }
     );
-    const contentType = response.headers.get("content-type");
-    if (!response.ok || !contentType?.includes("application/json")) {
-      const err = await response.text();
-      console.error(
-        `[Groq] API Error (${response.status}, ${contentType}):`,
-        err.substring(0, 500)
-      );
-      return null;
-    }
-    const data = await response.json();
-    return data.choices?.[0]?.message?.content?.trim() || null;
+    if (!result.ok) return null;
+    return result.data?.choices?.[0]?.message?.content?.trim() || null;
   } catch (e) {
     console.error("[Groq] Fetch Error:", e?.message || e);
     return null;
@@ -509,19 +566,9 @@ async function getOpenRouterResponse(prompt, apiKey, model = "google/gemini-2.0-
     if (!cleanKey || cleanKey === "undefined" || cleanKey === "null")
       return null;
     const finalModel = model && (model.includes("/") || model.includes("-")) ? model : "google/gemini-2.0-flash-001";
-    const messages = context.length > 0 ? [
-      ...systemInstruction ? [{ role: "system", content: systemInstruction }] : [],
-      ...context.map((c) => ({
-        role: c.role === "model" ? "assistant" : c.role,
-        content: c.parts[0].text
-      })),
-      { role: "user", content: prompt }
-    ] : [
-      ...systemInstruction ? [{ role: "system", content: systemInstruction }] : [],
-      { role: "user", content: prompt }
-    ];
-    const response = await fetch(
-      "https://api.v1.openrouter.ai/chat/completions",
+    const messages = normalizeContextMessages(prompt, context, systemInstruction);
+    const result = await fetchJsonWithRetry(
+      "https://openrouter.ai/api/v1/chat/completions",
       {
         method: "POST",
         headers: {
@@ -530,64 +577,43 @@ async function getOpenRouterResponse(prompt, apiKey, model = "google/gemini-2.0-
           "HTTP-Referer": "https://ais-dev.run.app",
           "X-Title": "TG Userbot"
         },
-        body: JSON.stringify({
-          model: finalModel,
-          messages
-        })
-      }
+        body: JSON.stringify({ model: finalModel, messages })
+      },
+      { provider: "OpenRouter", model: finalModel, endpoint: "/api/v1/chat/completions" }
     );
-    const contentType = response.headers.get("content-type");
-    if (!response.ok || !contentType?.includes("application/json")) {
-      const err = await response.text();
-      console.error(
-        `[OpenRouter] API Error (${response.status}, ${contentType}):`,
-        err.substring(0, 500)
-      );
-      return null;
-    }
-    const data = await response.json();
-    return data.choices?.[0]?.message?.content?.trim() || null;
+    if (!result.ok) return null;
+    return result.data?.choices?.[0]?.message?.content?.trim() || null;
   } catch (e) {
     console.error("[OpenRouter] Fetch Error:", e?.message || e);
     return null;
   }
 }
-async function getBluesMindsResponse(prompt, apiKey, model = "gemini-1.5-flash", context = [], systemInstruction) {
+async function getBluesMindsResponse(prompt, apiKey, model = "gpt-4o-mini", context = [], systemInstruction) {
   try {
     const cleanKey = apiKey?.trim();
     if (!cleanKey || cleanKey === "undefined" || cleanKey === "null")
       return null;
-    const messages = context.length > 0 ? [
-      ...systemInstruction ? [{ role: "system", content: systemInstruction }] : [],
-      ...context.map((c) => ({
-        role: c.role === "model" ? "assistant" : c.role,
-        content: c.parts[0].text
-      })),
-      { role: "user", content: prompt }
-    ] : [
-      ...systemInstruction ? [{ role: "system", content: systemInstruction }] : [],
-      { role: "user", content: prompt }
-    ];
-    const response = await fetch(
+    const messages = normalizeContextMessages(prompt, context, systemInstruction);
+    const result = await fetchJsonWithRetry(
       "https://api.bluesminds.com/v1/chat/completions",
       {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${cleanKey}`
-        },
-        body: JSON.stringify({
-          model,
-          messages,
-          temperature: 0.7
-        })
-      }
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${cleanKey}` },
+        body: JSON.stringify({ model, messages, temperature: 0.7 })
+      },
+      { provider: "BluesMinds", model, endpoint: "/v1/chat/completions" }
     );
-    if (!response.ok) {
-      const errText = await response.text();
-      if (errText.includes("reached its end of life") || response.status === 410 || response.status === 503 || errText.includes("model_not_found") || errText.includes("no available channel")) {
+    if (!result.ok) {
+      const errText = result.text || "";
+      if (
+        errText.includes("reached its end of life") ||
+        result.status === 410 ||
+        result.status === 503 ||
+        errText.includes("model_not_found") ||
+        errText.includes("no available channel")
+      ) {
         console.warn(
-          `[AI] BluesMinds Warning (${response.status}): Model ${model} is discontinued or unavailable. Attempting fallback...`
+          `[AI] BluesMinds Warning (${result.status}): Model ${model} is discontinued or unavailable. Attempting fallback...`
         );
         const fallbackChain = [
           "gpt-4o",
@@ -599,19 +625,12 @@ async function getBluesMindsResponse(prompt, apiKey, model = "gemini-1.5-flash",
         const currentIdx = fallbackChain.indexOf(model);
         const nextModel = fallbackChain[currentIdx + 1] || (model !== "gpt-4o-mini" ? "gpt-4o-mini" : null);
         if (nextModel && nextModel !== model) {
-          return getBluesMindsResponse(
-            prompt,
-            apiKey,
-            nextModel,
-            context,
-            systemInstruction
-          );
+          return getBluesMindsResponse(prompt, apiKey, nextModel, context, systemInstruction);
         }
       }
-      throw new Error(`BluesMinds API Error (${response.status}): ${errText}`);
+      throw new Error(`BluesMinds API Error (${result.status}): ${errText}`);
     }
-    const data = await response.json();
-    return data.choices?.[0]?.message?.content?.trim() || null;
+    return result.data?.choices?.[0]?.message?.content?.trim() || null;
   } catch (e) {
     console.error(`[AI] BluesMinds Error:`, e.message || e);
     return null;
@@ -778,11 +797,17 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
       prompt = `[REASONING REQUIRED] ${prompt}`;
     }
   }
-  if (config.aiMode === "concise") {
+  const normalizedMode =
+    config.aiMode === "fast"
+      ? "concise"
+      : config.aiMode === "creative"
+        ? "casual"
+        : config.aiMode;
+  if (normalizedMode === "concise") {
     systemPrompt += " Be extremely brief and direct. One or two sentences maximum.";
-  } else if (config.aiMode === "detailed") {
+  } else if (normalizedMode === "detailed" || normalizedMode === "intelligent") {
     systemPrompt += " Provide in-depth information with clear sections.";
-  } else if (config.aiMode === "casual") {
+  } else if (normalizedMode === "casual") {
     systemPrompt += " Use a friendly, slang-inclusive, and relaxed tone.";
   }
   let personality = config.autoReplyPersonality;
@@ -1511,6 +1536,37 @@ async function startServer() {
       res.json({ models: [] });
     }
   });
+  app.post("/api/ai/test", async (req, res) => {
+    const { provider, model, prompt, stream } = req.body || {};
+    const cfg = db.prepare("SELECT * FROM config WHERE id = 1").get();
+    const safePrompt = (prompt || "Return exactly: OK").toString();
+    const selectedProvider = (provider || cfg.aiProvider || "bluesminds").toString();
+    const selectedModel = (model || cfg.activeModel || "gpt-4o-mini").toString();
+    const started = Date.now();
+    let text = null;
+    try {
+      if (stream === true) {
+        console.log(
+          `[AI][Test][Provider=${selectedProvider}][Model=${selectedModel}] Stream flag received, running non-streaming compatibility probe.`
+        );
+      }
+      if (selectedProvider === "gemini") {
+        text = await getGeminiResponse(safePrompt, cfg.geminiKey || process.env.GEMINI_API_KEY || "", selectedModel);
+      } else if (selectedProvider === "groq") {
+        text = await getGroqResponse(safePrompt, cfg.groqKey || "", selectedModel);
+      } else if (selectedProvider === "openrouter") {
+        text = await getOpenRouterResponse(safePrompt, cfg.openRouterKey || "", selectedModel);
+      } else {
+        text = await getBluesMindsResponse(safePrompt, cfg.bluesmindsApiKey || "", selectedModel);
+      }
+      const latency = Date.now() - started;
+      return res.json({ ok: !!text, provider: selectedProvider, model: selectedModel, stream: !!stream, latency, text: text || "" });
+    } catch (e) {
+      const latency = Date.now() - started;
+      return res.status(500).json({ ok: false, provider: selectedProvider, model: selectedModel, latency, error: e?.message || String(e) });
+    }
+  });
+
   app.get("/api/exports", (req, res) => {
     const list = db.prepare("SELECT * FROM exports ORDER BY createdAt DESC").all();
     res.json({ exports: list });
