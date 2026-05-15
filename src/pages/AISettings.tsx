@@ -140,6 +140,7 @@ export function AISettings() {
   const [geminiKey, setGeminiKey] = useState(config.geminiKey || '');
   const [groqKey, setGroqKey] = useState(config.groqKey || '');
   const [openRouterKey, setOpenRouterKey] = useState(config.openRouterKey || '');
+  const [xaiKey, setXaiKey] = useState(config.xaiKey || '');
 
   const [autoReplyDM, setAutoReplyDM] = useState(config.autoReplyDM === 1);
   const [autoReplyMention, setAutoReplyMention] = useState(config.autoReplyMention === 1);
@@ -186,6 +187,7 @@ export function AISettings() {
     setGeminiKey(config.geminiKey || '');
     setGroqKey(config.groqKey || '');
     setOpenRouterKey(config.openRouterKey || '');
+    setXaiKey(config.xaiKey || '');
     setAutoReplyDM(config.autoReplyDM === 1);
     setAutoReplyMention(config.autoReplyMention === 1);
     setTypingSimulation(config.typingSimulation === 1);
@@ -255,6 +257,7 @@ export function AISettings() {
       geminiKey,
       groqKey,
       openRouterKey,
+      xaiKey,
       autoReplyDM: autoReplyDM ? 1 : 0,
       autoReplyMention: autoReplyMention ? 1 : 0,
       typingSimulation: typingSimulation ? 1 : 0,
@@ -358,6 +361,7 @@ export function AISettings() {
                       { id: 'gemini', label: 'Gemini', icon: Bot },
                       { id: 'groq', label: 'Groq', icon: Zap },
                       { id: 'openrouter', label: 'OpenRouter', icon: Globe },
+                      { id: 'xai', label: 'Grok / xAI', icon: Brain },
                     ].map((p) => (
                       <button
                         key={p.id}
@@ -466,6 +470,22 @@ export function AISettings() {
                     onBlur={handleBlur}
                     className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-xs text-slate-200 focus:outline-none focus:border-blue-500 transition-colors"
                   />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">xAI / Grok Key</label>
+                  <input
+                    type="password"
+                    placeholder="Enter xAI API Key"
+                    value={xaiKey}
+                    onChange={(e) => setXaiKey(e.target.value)}
+                    onBlur={handleBlur}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-xs text-slate-200 focus:outline-none focus:border-blue-500 transition-colors"
+                  />
+                  <div className="flex items-center gap-1.5">
+                    <div className={cn('w-1.5 h-1.5 rounded-full', xaiKey ? 'bg-emerald-400' : 'bg-red-500')} />
+                    <span className="text-[10px] text-slate-600">{xaiKey ? 'Key configured' : 'No key set'}</span>
+                  </div>
+                  <p className="text-[10px] text-slate-600">Models: grok-4, grok-4-0709, grok-3, grok-3-fast, grok-3-mini, grok-3-mini-fast, grok-2-1212, grok-2-vision-1212, grok-vision-beta, grok-beta</p>
                 </div>
               </div>
             </div>
