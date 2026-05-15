@@ -2143,28 +2143,30 @@ async function startServer() {
     if (fs.existsSync(youtubeCookiesPath)) base.cookies = youtubeCookiesPath;
 
     // ── Client strategy table ────────────────────────────────────────────────
+    // NOTE: mediaconnect and mweb_earlybird require Python 3 (yt-dlp jsinterp).
+    // Prioritise iOS/Android clients — they use native API responses, no JS eval needed.
     const strategies = [
-      {
-        name: "mediaconnect",
-        opts: {
-          extractorArgs: "youtube:player_client=mediaconnect",
-          format: "bestaudio/best"
-        }
-      },
-      {
-        name: "mweb_earlybird",
-        opts: {
-          extractorArgs: "youtube:player_client=mweb_earlybird",
-          userAgent: "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
-          format: "bestaudio/best"
-        }
-      },
       {
         name: "ios",
         opts: {
           extractorArgs: "youtube:player_client=ios",
           userAgent: "com.google.ios.youtube/19.45.4 (iPhone17,2; U; CPU iPhone OS 18_1 like Mac OS X;)",
           format: "bestaudio[ext=m4a]/bestaudio/best"
+        }
+      },
+      {
+        name: "android",
+        opts: {
+          extractorArgs: "youtube:player_client=android",
+          userAgent: "com.google.android.youtube/19.44.34 (Linux; U; Android 14) gzip",
+          format: "bestaudio/best"
+        }
+      },
+      {
+        name: "android_testsuite",
+        opts: {
+          extractorArgs: "youtube:player_client=android_testsuite",
+          format: "bestaudio/best"
         }
       },
       {
@@ -2175,9 +2177,9 @@ async function startServer() {
         }
       },
       {
-        name: "default",
+        name: "web_embedded",
         opts: {
-          extractorArgs: "youtube:player_client=default",
+          extractorArgs: "youtube:player_client=web_embedded",
           format: "bestaudio[ext=webm]/bestaudio/best"
         }
       }
