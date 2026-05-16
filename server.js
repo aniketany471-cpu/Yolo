@@ -3114,7 +3114,13 @@ async function startServer() {
 
           // ── Maintenance mode ─────────────────────────────────────────────
           const isMaintenanceCmd = text === "/maintenance" || text.startsWith("/maintenance ") || text === ".maintenance" || text.startsWith(".maintenance ");
-          if (config2?.maintenanceMode === 1 && !isMe && !isMaintenanceCmd) {
+          // Only reply with maintenance notice when the bot would normally respond:
+          // – always in private/DM chats
+          // – in groups: only when directly addressed (command, @mention, or reply to bot)
+          const isMentionedHere = myUsername && text.includes(`@${myUsername.toLowerCase()}`);
+          const isReplyToBot = !!message.replyTo?.replyToMsgId;
+          const botWouldRespond = message.isPrivate || isCommand || isMentionedHere || isReplyToBot;
+          if (config2?.maintenanceMode === 1 && !isMe && !isMaintenanceCmd && botWouldRespond) {
             await client?.sendMessage(message.chatId, {
               message: "🔧 **Bot is under maintenance.**\nPlease check back shortly.",
               replyTo: message.id
