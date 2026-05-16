@@ -2994,15 +2994,25 @@ async function startServer() {
           ? needsSearch(text).needs
           : false;
         await status.update(searchStatus ? HS.search() : HS.think());
-        const aiRes = await getAIResponse(
-          text,
-          config,
-          chatIdStr,
-          senderId,
-          isNSFWActive,
-          false,
-          message.sender?.username || null
-        );
+        // Retry up to 3 times silently — never show an error to the user mid-retry
+        let aiRes = null;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            aiRes = await getAIResponse(
+              text,
+              config,
+              chatIdStr,
+              senderId,
+              isNSFWActive,
+              false,
+              message.sender?.username || null
+            );
+            if (aiRes) break;
+          } catch (retryErr) {
+            console.error(`[AI-Auto] Attempt ${attempt} failed:`, retryErr.message || retryErr);
+          }
+          if (attempt < 3) await new Promise(r => setTimeout(r, 2000 * attempt));
+        }
 
         // ── DM image fallback: bypass AI refusal ──────────────────────────
         // If we're in a private DM and the user's message looks like an image
@@ -3127,9 +3137,9 @@ async function startServer() {
             "success"
           );
         } else {
-          await status.finish(
-            "\u274C **AI Error:** Could not generate a response. Please check your keys or try again later."
-          );
+          // All retries failed — delete the thinking indicator silently, no error shown
+          console.error(`[AI-Auto] All retries failed for ${chatIdStr}, dropping silently.`);
+          try { await client2.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch {}
         }
       } catch (e) {
         console.error(`[AI-Auto] Error:`, e.message || e);
