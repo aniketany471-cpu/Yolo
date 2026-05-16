@@ -12,11 +12,7 @@ import multer from "multer";
 import sharp from "sharp";
 import fs from "fs-extra";
 import yts from "yt-search";
-import {
-  downloadAudio,
-  runStartupDiagnostics,
-  getDiagnosticsStatus,
-} from "./services/musicDownloader.js";
+import youtubedl from "youtube-dl-exec";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -2000,11 +1996,10 @@ async function startServer() {
 
       taskQueue.add(async () => {
         try {
-          const actualPath = await downloadYoutube(video.url, filepath);
-          const actualFilename = path.basename(actualPath);
+          await downloadYoutube(video.url, filepath);
           db.prepare(
             "INSERT INTO exports (id, filename, filepath, createdAt, type, status) VALUES (?, ?, ?, ?, ?, ?)",
-          ).run(id, actualFilename, actualPath, Date.now(), "music", "success");
+          ).run(id, filename, filepath, Date.now(), "music", "success");
           addLog(`Downloaded music via dashboard: ${video.title}`, "success");
 
           if (client) {
@@ -2067,21 +2062,14 @@ async function startServer() {
     res.json({ success: true });
   });
 
-  app.get("/api/youtubedl/check", (_req, res) => {
+  app.get("/api/youtubedl/check", async (req, res) => {
     try {
-      const diag = getDiagnosticsStatus();
-      res.json(diag);
-    } catch (e: any) {
-      res.status(500).json({ error: e?.message || "Diagnostics failed" });
-    }
-  });
-
-  app.get("/api/music/diagnostics", (_req, res) => {
-    try {
-      const diag = getDiagnosticsStatus();
-      res.json(diag);
-    } catch (e: any) {
-      res.status(500).json({ error: e?.message || "Diagnostics failed" });
+      const result = await youtubedl("--version");
+      res.json({ version: result });
+    } catch (e) {
+      res
+        .status(500)
+        .json({ error: "yt-dlp binary not found or not working." });
     }
   });
 
@@ -2151,13 +2139,68 @@ async function startServer() {
     }
   };
 
-  // Thin wrapper — delegates all strategy/fallback logic to services/musicDownloader.js
-  const downloadYoutube = async (url: string, output: string): Promise<string> => {
-    const result = await downloadAudio(url, output, {
-      cookies: fs.existsSync(youtubeCookiesPath) ? youtubeCookiesPath : undefined,
-      onLog: (msg: string) => { addLog(msg, "info"); console.log(msg); },
+  const downloadYoutube = async (url: string, output: string) => {
+    // Always use a clean canonical URL to avoid query-param confusion
+    const vidId =
+      url.match(/[?&]v=([^&]+)/)?.[1] ||
+      url.match(/youtu\.be\/([^?&]+)/)?.[1];
+    const cleanUrl = vidId ? `https://www.youtube.com/watch?v=${vidId}` : url;
+    const base: any = {
+      extractAudio: true,
+      audioFormat: "mp3",
+      audioQuality: 0,
+      noPlaylist: true,
+      noCheckCertificates: true,
+      geoBypass: true,
+      retries: 3,
+      socketTimeout: 30,
+      output,
+    };
+    if (fs.existsSync(youtubeCookiesPath)) base.cookies = youtubeCookiesPath;
+    // Attempt 1: iOS client — most reliable on server IPs (bypasses sign-in checks)
+    try {
+      addLog(`Download attempt 1: iOS client...`, "info");
+      await youtubedl(cleanUrl, {
+        ...base,
+        extractorArgs: "youtube:player_client=ios",
+        userAgent:
+          "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iPhone OS 17_5_1 like Mac OS X;)",
+        format: "bestaudio[ext=m4a]/bestaudio/best",
+      });
+      return;
+    } catch (e1: any) {
+      addLog(`iOS client failed: ${e1.message}. Trying TV embedded...`, "warn");
+    }
+    // Attempt 2: TV embedded client
+    try {
+      await youtubedl(cleanUrl, {
+        ...base,
+        extractorArgs: "youtube:player_client=tv_embedded",
+        format: "bestaudio/best",
+      });
+      return;
+    } catch (e2: any) {
+      addLog(`TV client failed: ${e2.message}. Trying mweb...`, "warn");
+    }
+    // Attempt 3: mweb client
+    try {
+      await youtubedl(cleanUrl, {
+        ...base,
+        extractorArgs: "youtube:player_client=mweb",
+        userAgent:
+          "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36",
+        format: "bestaudio/best",
+      });
+      return;
+    } catch (e3: any) {
+      addLog(`mweb client failed: ${e3.message}. Trying web_creator...`, "warn");
+    }
+    // Attempt 4: web_creator client (last resort)
+    await youtubedl(cleanUrl, {
+      ...base,
+      extractorArgs: "youtube:player_client=web_creator",
+      format: "bestaudio/best",
     });
-    return result.filepath;
   };
 
   const statusUpdate = async (chatId: any, messageId: number, text: string) => {
@@ -2217,26 +2260,23 @@ async function startServer() {
         const filepath = path.join(musicDir, filename);
 
         try {
-          const actualPath = await downloadYoutube(video.url, filepath);
+          await downloadYoutube(video.url, filepath);
           await effectiveStatus.update(`⚙️ Processing...`);
 
           await client?.sendMessage(message.chatId, {
             message: `🎶 **${video.title}**\n👤 ${video.author.name}\n⏱ ${video.timestamp}`,
-            file: actualPath,
+            file: filepath,
             replyTo: message.id,
           });
 
           await effectiveStatus.done("Done", 0);
           addLog(`Downloaded music: ${video.title}`, "success");
 
-          setTimeout(() => fs.remove(actualPath).catch(() => {}), 10000);
+          setTimeout(() => fs.remove(filepath).catch(() => {}), 10000);
         } catch (downloadErr: any) {
-          const rawMsg = downloadErr?.message || String(downloadErr);
-          const friendlyMsg = rawMsg.includes("All download strategies failed")
-            ? "❌ Music download failed — yt-dlp unavailable on this host. Admin notified."
-            : rawMsg.slice(0, 120);
-          addLog(`Music download error: ${rawMsg}`, "error");
-          await effectiveStatus.fail(friendlyMsg);
+          const msg = downloadErr?.message || String(downloadErr);
+          addLog(`Music download error: ${msg}`, "error");
+          await effectiveStatus.fail(`Download failed: ${msg.slice(0, 120)}`);
         }
       });
     } catch (e) {
@@ -2995,8 +3035,7 @@ async function startServer() {
 
 **Public Commands** 👤
 • \`/ans\` - Reply to get AI answer
-• \`/music <query>\` - Search & download song
-• \`/diagmusic\` - Music downloader diagnostics
+• \`/music\` - Search & download song
 • \`/gif <query>\` - Search & send GIF
 • \`/sticker\` - Reply to photo for sticker
 • \`/pdf\` - Reply to text for PDF
@@ -3073,33 +3112,6 @@ _Visit the dashboard for advanced configuration._`;
                 textRaw,
                 async (status) => {
                   await handleMusicCommand(message, textRaw, status);
-                },
-              );
-              return;
-            }
-
-            if (text === "/diagmusic" || text === ".diagmusic") {
-              await CommandProcessor.process(
-                client,
-                message,
-                config,
-                myId,
-                "diagmusic",
-                textRaw,
-                async (status) => {
-                  const diag = getDiagnosticsStatus();
-                  const ytdlpLine = diag.ytdlp.ok
-                    ? `✅ yt-dlp: ${diag.ytdlp.path} (${diag.ytdlp.version || "unknown"})`
-                    : "❌ yt-dlp: not found";
-                  const ffmpegLine = diag.ffmpeg.ok
-                    ? `✅ ffmpeg: ${diag.ffmpeg.path}`
-                    : "❌ ffmpeg: not found";
-                  const pythonLine = diag.python3YtDlp.ok
-                    ? `✅ python3 -m yt_dlp: available (${diag.python3YtDlp.version || "?"})`
-                    : "⚠️ python3 -m yt_dlp: not available";
-                  await status.finish(
-                    `🎵 **Music Downloader Diagnostics**\n\n${ytdlpLine}\n${ffmpegLine}\n${pythonLine}\n\n🔧 **Active strategy:** ${diag.activeStrategy}\n📁 **Temp dir:** \`${diag.tempDir}\``,
-                  );
                 },
               );
               return;
@@ -3599,9 +3611,6 @@ _Visit the dashboard for advanced configuration._`;
 
     loop(); // Kick off the background loop
   };
-
-  // Startup diagnostics — runs once, non-blocking
-  setImmediate(() => runStartupDiagnostics(addLog));
 
   // Recover state on boot
   loadTelethon().then(() => {
