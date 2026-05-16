@@ -139,6 +139,8 @@ export function optimizeQuery(raw, corrected, intent) {
     case 'weather':
       if (!/\bweather\b/i.test(q)) q = 'weather ' + q;
       if (!/\btoday|now|current|right now\b/i.test(q)) q += ' today';
+      // Ask for the full weather card including detail metrics
+      q += ' humidity wind speed air quality';
       break;
     case 'news':
       if (!/\bnews|latest|breaking\b/i.test(q)) q = 'latest news ' + q;
@@ -184,9 +186,99 @@ async function fetchWithTimeout(url, opts, ms = SERPER_TIMEOUT) {
   }
 }
 
+// ── Weather-specific extractor ────────────────────────────────────────────────
+function extractWeatherData(data) {
+  const parts = [];
+
+  if (data.answerBox) {
+    const ab = data.answerBox;
+
+    // Location header
+    const location = ab.title || ab.place || '';
+    if (location) parts.push(`Location: ${location}`);
+
+    // Temperature — try dedicated fields first, then snippet
+    const tempC = ab.temperature || ab.temp || ab.tempC || '';
+    const tempF = ab.temperatureF || ab.tempF || '';
+    const condition = ab.description || ab.weather || ab.condition || ab.subtitle || '';
+    if (tempC || tempF) {
+      const tempStr = tempC && tempF ? `${tempC}°C (${tempF}°F)` : tempC ? `${tempC}°C` : `${tempF}°F`;
+      parts.push(`Temperature: ${tempStr}${condition ? ' · ' + condition : ''}`);
+    } else if (condition) {
+      parts.push(`Condition: ${condition}`);
+    }
+
+    // Feels like
+    if (ab.feelsLike || ab.feels_like || ab.apparentTemp) {
+      parts.push(`Feels like: ${ab.feelsLike || ab.feels_like || ab.apparentTemp}`);
+    }
+
+    // Humidity
+    if (ab.humidity) parts.push(`Humidity: ${ab.humidity}`);
+
+    // Wind
+    if (ab.wind || ab.windSpeed || ab.wind_speed) {
+      parts.push(`Wind: ${ab.wind || ab.windSpeed || ab.wind_speed}`);
+    }
+
+    // Visibility
+    if (ab.visibility) parts.push(`Visibility: ${ab.visibility}`);
+
+    // UV index
+    if (ab.uvIndex || ab.uv) parts.push(`UV Index: ${ab.uvIndex || ab.uv}`);
+
+    // AQI / air quality
+    if (ab.airQuality || ab.aqi || ab.air_quality) {
+      parts.push(`Air Quality: ${ab.airQuality || ab.aqi || ab.air_quality}`);
+    }
+
+    // High / Low for today
+    if (ab.high || ab.low) {
+      const hl = [ab.high && `High: ${ab.high}`, ab.low && `Low: ${ab.low}`].filter(Boolean).join('  ');
+      parts.push(`Today: ${hl}`);
+    }
+
+    // Forecast array
+    if (Array.isArray(ab.forecast) && ab.forecast.length) {
+      const fc = ab.forecast.slice(0, 3).map(d => {
+        const day = d.day || d.date || '';
+        const hi = d.high || d.tempHigh || '';
+        const lo = d.low || d.tempLow || '';
+        const cond = d.description || d.condition || '';
+        return `${day}: ${cond}${hi ? ' · High ' + hi : ''}${lo ? ' / Low ' + lo : ''}`.trim();
+      });
+      if (fc.length) parts.push('Forecast:\n' + fc.map(f => '· ' + f).join('\n'));
+    }
+
+    // If we only got a raw snippet and nothing structured, fall back to snippet
+    if (parts.length <= 1 && (ab.snippet || ab.answer)) {
+      parts.push(ab.snippet || ab.answer);
+    }
+  }
+
+  // Supplement with organic snippets that contain weather detail keywords
+  if (data.organic?.length && parts.length < 4) {
+    const weatherDetail = /humid|wind|aqi|air quality|feels like|visib|uv|forecast|high.*low/i;
+    for (const r of data.organic.slice(0, 5)) {
+      if (r.snippet && weatherDetail.test(r.snippet)) {
+        parts.push('Detail: ' + r.snippet.slice(0, 200));
+        break;
+      }
+    }
+  }
+
+  return parts.length ? parts.join('\n') : null;
+}
+
 // ── Extract + summarize Serper response ──────────────────────────────────────
 function extractSerperSummary(data, intent) {
   const parts = [];
+
+  // Weather gets its own dedicated rich extractor
+  if (intent === 'weather') {
+    const weatherData = extractWeatherData(data);
+    if (weatherData) return weatherData;
+  }
 
   // 1. Answer / featured snippet
   if (data.answerBox) {
