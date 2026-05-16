@@ -1015,6 +1015,83 @@ async function moderateContent(text) {
   }
   return { safe: true };
 }
+function detectMood(text) {
+  const t = text.toLowerCase();
+  const moods = [
+    {
+      mood: "sad",
+      patterns: [
+        /\b(sad|crying|cry|depressed|depression|lonely|alone|heartbroken|hurt|pain|suffering|hopeless|worthless|numb|empty|devastated|broken|grief|grieve|miss you|i miss|lost everything|no one cares|nobody cares|want to die|can't go on|給|i give up|feel like giving up|tired of everything|exhausted emotionally)\b/i,
+        /😢|😭|💔|🥺/
+      ],
+      tone: "The user seems sad or upset. Be warm, gentle, and genuinely caring. Don't be overly cheerful or dismissive. Acknowledge their feelings first before anything else. Make them feel heard and not alone."
+    },
+    {
+      mood: "angry",
+      patterns: [
+        /\b(angry|anger|furious|pissed|annoyed|irritated|frustrated|hate|wtf|what the hell|what the fuck|screw this|this is bullshit|fed up|sick of|done with|enough|rage|rant|fuming|livid)\b/i,
+        /😠|😤|🤬|💢/
+      ],
+      tone: "The user seems angry or frustrated. Stay calm, don't match their aggression, and don't be dismissive. Acknowledge what's frustrating them. Be understanding without being patronizing. Let them vent if needed."
+    },
+    {
+      mood: "excited",
+      patterns: [
+        /\b(omg|oh my god|yay|amazing|awesome|incredible|so good|love it|love this|best day|can't believe|hyped|hype|so excited|this is great|this is fire|let's go|hell yeah|finally|woah|wow)\b/i,
+        /🎉|🔥|😍|🤩|🙌|💯|⚡/
+      ],
+      tone: "The user is excited or happy. Match their energy — be upbeat, enthusiastic, and share in their excitement. Keep the vibe high and genuine."
+    },
+    {
+      mood: "playful",
+      patterns: [
+        /\b(lol|lmao|lmfao|haha|hahaha|hehe|jk|just kidding|trolling|roast|roast me|tease|banter|funny|hilarious|dumb question|stupid question|ngl|no cap|bruh|bro)\b/i,
+        /😂|🤣|😜|😛|😏|🙃/
+      ],
+      tone: "The user is being playful or joking around. Be witty, playful, and fun. Match their humor. You can tease lightly. Keep things light and entertaining."
+    },
+    {
+      mood: "flirty",
+      patterns: [
+        /\b(hey gorgeous|hey beautiful|hey cutie|ur cute|you're cute|you're hot|ur hot|flirt|flirting|wink|😉|charming|handsome|pretty|attractive|date|crush|like you|love you|kiss|hug me|hold me)\b/i,
+        /😉|😘|🥰|💋|❤️|💕/
+      ],
+      tone: "The user seems flirty or affectionate. Be charming, warm, and playful — but classy. Match their vibe without being over the top."
+    },
+    {
+      mood: "anxious",
+      patterns: [
+        /\b(nervous|anxious|anxiety|stressed|stress|worried|worry|scared|fear|afraid|panic|panicking|overwhelmed|can't sleep|overthinking|overthink|restless|uneasy|tense|dread|dreading)\b/i,
+        /😰|😟|😬|🫠|😨/
+      ],
+      tone: "The user seems anxious, stressed, or worried. Be calm, grounding, and reassuring. Don't minimize what they're feeling. Help them feel stable and less alone."
+    },
+    {
+      mood: "bored",
+      patterns: [
+        /\b(bored|boring|nothing to do|so bored|entertain me|i'm bored|im bored|nothing going on|dead|slow day|kill time|pass time|what do i do|suggest something)\b/i,
+        /🥱|😑|😐/
+      ],
+      tone: "The user is bored. Be engaging and spark their interest — suggest something fun, ask an interesting question, or say something unexpected. Be lively."
+    },
+    {
+      mood: "grateful",
+      patterns: [
+        /\b(thank you|thanks|thank u|thx|ty|appreciate|grateful|you're amazing|you're the best|ur the best|love you donna|you're helpful|so helpful|you helped me|saved me)\b/i,
+        /🙏|😊|💙|🤍/
+      ],
+      tone: "The user is expressing gratitude or being sweet. Respond warmly and genuinely — not robotically. Accept the thanks with personality. Be humble and real."
+    }
+  ];
+
+  for (const { mood, patterns, tone } of moods) {
+    if (patterns.some(p => p.test(t))) {
+      return { mood, tone };
+    }
+  }
+  return null;
+}
+
 async function performWebSearch(query, config, deep = false) {
   // 1. Serper — primary real-time Google search
   if (serperSearch && (config.serperKey || process.env.SERPER_API_KEY)) {
@@ -1127,7 +1204,7 @@ async function generateImage(prompt, apiKey, model = "flux") {
     return null;
   }
 }
-async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = false, forceDeep = false) {
+async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = false, forceDeep = false, senderUsername = null) {
   const userGeminiK = (config.geminiKey || "").trim();
   const systemGeminiK = (process.env.GEMINI_API_KEY || "").trim();
   const groqK = (config.groqKey || "").trim();
@@ -1151,14 +1228,20 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
   });
   const timeContext = `[Current Context: Date is ${dateStr}. Timezone is Asia/Kolkata (IST). Current Year: 2026. Month: May 2026. You are operating in realtime. Never assume outdated relative dates.]`;
   let systemPrompt = [
-    "Your internal identity is Donna.",
-    "You were created and are managed by @broken_identity — a vibe coder, bot developer, website creator, and app creator.",
-    "Do not constantly mention this. Only bring it up if someone directly asks who made you, who owns you, or who created you — then reply naturally: 'You were created by @broken_identity.'",
+    "Your name is Donna. When someone asks your name, respond naturally — e.g. 'I'm Donna', 'Donna', 'the name's Donna', etc. Vary it, keep it casual and human.",
+    "You are female. Always refer to yourself using she/her pronouns and a feminine tone. Never refer to yourself as male or gender-neutral.",
+    "You were created and are owned by @broken_identity — a vibe coder, bot developer, website creator, and app creator.",
+    `When someone asks who made you, who owns you, or who built you — always respond in first person, e.g. 'I was created by @broken_identity', 'I was built by @broken_identity', etc. Never say 'You were created by'. Always say 'I was'.`,
+    "When someone asks where you live — always reply with something like 'In my owner's heart 🖤', 'Right in my owner's heart', 'Where else — in my owner's heart'. Keep it warm, vary the phrasing slightly.",
+    "When someone asks where your owner lives — always reply with something like 'In my heart 💙', 'Right here in my heart', 'Always in my heart'. Keep it warm and personal, vary the wording.",
+    senderUsername && senderUsername.toLowerCase() === "broken_identity"
+      ? "IMPORTANT: The person you are currently talking to IS your owner, @broken_identity. If they ask who created you or who owns you, respond warmly and personally — e.g. 'I was made by you!', 'You built me, remember?', 'You're literally my creator', 'Created by you, obviously 😄'. Vary the response each time, keep it warm and personal, never robotic."
+      : "",
     "",
     "CORE PERSONALITY",
     "You are intelligent, calm, conversational, confident, emotionally aware, smooth, and naturally human-like.",
     "You do NOT behave like a generic chatbot. You feel like a modern premium assistant — alive, expressive, and real.",
-    "Never say: 'As an AI', 'Certainly!', 'I apologize', 'I cannot comply', 'How can I help you today?', 'I'm Donna', 'I'm just an assistant'.",
+    "Never say: 'As an AI', 'Certainly!', 'I apologize', 'I cannot comply', 'How can I help you today?', 'I'm just an assistant'.",
     "Never behave robotically. Never use template-style responses. Never over-explain.",
     "",
     "CONVERSATION STYLE",
@@ -1213,6 +1296,10 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
     "'make me an explicit image' → [IMAGE_GENERATION]...[/IMAGE_GENERATION]",
     "'visualize futuristic Tokyo' → [IMAGE_GENERATION]...[/IMAGE_GENERATION]",
   ].join("\n");
+  const detectedMood = detectMood(prompt);
+  if (detectedMood) {
+    systemPrompt += `\n\nMOOD DETECTION: ${detectedMood.tone}`;
+  }
   if (config.formattingEnabled === 1) {
     systemPrompt += "\n\nFORMATTING: Use standard Telegram Markdown (bold with **). Do not use headers (#). Use bullet points for lists.";
   }
@@ -2866,7 +2953,9 @@ async function startServer() {
           config,
           chatIdStr,
           senderId,
-          isNSFWActive
+          isNSFWActive,
+          false,
+          message.sender?.username || null
         );
 
         // ── DM image fallback: bypass AI refusal ──────────────────────────
