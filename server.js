@@ -2936,11 +2936,13 @@ async function startServer() {
     if (aiProcessingLock.has(lockKey)) return;
     aiProcessingLock.add(lockKey);
     const now = Date.now();
-    const lastReplyKey = `lastAuto:${chatIdStr}`;
+    // Cooldown is per-user (not per-chat) so multiple users tagging at the same
+    // time each get their own independent timer and all receive a reply.
+    const lastReplyKey = `lastAuto:${chatIdStr}:${senderId}`;
     const lastReply = userCooldowns.get(lastReplyKey) || 0;
     const cooldownSec = config.perUserCooldown || 10;
     if (now - lastReply < cooldownSec * 1e3) {
-      console.log(`[AI-Auto] Cooldown active for ${chatIdStr}`);
+      console.log(`[AI-Auto] Cooldown active for user ${senderId} in ${chatIdStr}`);
       aiProcessingLock.delete(lockKey);
       return;
     }
