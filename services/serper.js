@@ -139,8 +139,8 @@ export function optimizeQuery(raw, corrected, intent) {
     case 'weather':
       if (!/\bweather\b/i.test(q)) q = 'weather ' + q;
       if (!/\btoday|now|current|right now\b/i.test(q)) q += ' today';
-      // Ask for the full weather card including detail metrics
-      q += ' humidity wind speed air quality';
+      // Do NOT append extra keywords — keeping the query clean ensures Google
+      // returns the precise weather card for the correct location and station.
       break;
     case 'news':
       if (!/\bnews|latest|breaking\b/i.test(q)) q = 'latest news ' + q;
