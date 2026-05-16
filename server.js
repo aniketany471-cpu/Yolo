@@ -428,6 +428,10 @@ try {
 } catch (e) {
 }
 try {
+  db.exec("ALTER TABLE config ADD COLUMN maintenanceMode INTEGER DEFAULT 0;");
+} catch (e) {
+}
+try {
   db.exec(
     "ALTER TABLE config ADD COLUMN activeModel TEXT DEFAULT 'deepseek.v3.2';"
   );
@@ -1906,7 +1910,8 @@ async function startServer() {
       "cleanupEnabled",
       "telegramApiId",
       "telegramApiHash",
-      "telegramStringSession"
+      "telegramStringSession",
+      "maintenanceMode"
     ];
     // Read current creds BEFORE saving so we can detect actual changes
     const prevCreds = db.prepare(
@@ -3095,6 +3100,16 @@ async function startServer() {
             }
             return;
           }
+
+          // ── Maintenance mode ─────────────────────────────────────────────
+          const isMaintenanceCmd = text === "/maintenance" || text.startsWith("/maintenance ") || text === ".maintenance" || text.startsWith(".maintenance ");
+          if (config2?.maintenanceMode === 1 && !isMe && !isMaintenanceCmd) {
+            await client?.sendMessage(message.chatId, {
+              message: "🔧 **Bot is under maintenance.**\nPlease check back shortly.",
+              replyTo: message.id
+            }).catch(() => {});
+            return;
+          }
           if (text === "/aitest" || text === ".aitest" || text === "/ping" || text === ".ping" || text === "/debug" || text === ".debug") {
             if (isMe || auth.level >= PermissionLevel.SUDO) {
               console.log(
@@ -3410,6 +3425,30 @@ _Visit the dashboard for advanced configuration._`;
               console.log(
                 `[BOT] Blocked protected command "${cmdName}" from ${senderId}`
               );
+            }
+            return;
+          }
+          if (isMaintenanceCmd && (isMe || auth.level >= PermissionLevel.SUDO)) {
+            const arg = textRaw.trim().split(/\s+/)[1]?.toLowerCase();
+            if (arg === "on") {
+              db.prepare("UPDATE config SET maintenanceMode = 1 WHERE id = 1").run();
+              await client?.sendMessage(message.chatId, {
+                message: "🔧 **Maintenance mode ON.** All incoming messages will receive a maintenance notice.",
+                replyTo: message.id
+              }).catch(() => {});
+            } else if (arg === "off") {
+              db.prepare("UPDATE config SET maintenanceMode = 0 WHERE id = 1").run();
+              await client?.sendMessage(message.chatId, {
+                message: "✅ **Maintenance mode OFF.** Bot is back to normal.",
+                replyTo: message.id
+              }).catch(() => {});
+            } else {
+              const current = db.prepare("SELECT maintenanceMode FROM config WHERE id = 1").get();
+              const status = current?.maintenanceMode === 1 ? "🔧 ON" : "✅ OFF";
+              await client?.sendMessage(message.chatId, {
+                message: `**Maintenance Mode:** ${status}\n\nUsage:\n\`/maintenance on\` — enable\n\`/maintenance off\` — disable`,
+                replyTo: message.id
+              }).catch(() => {});
             }
             return;
           }
