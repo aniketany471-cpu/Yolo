@@ -23,6 +23,16 @@ try {
 } catch (_ziErr) {
   console.warn("[img] Image service unavailable:", _ziErr.message);
 }
+// Serper real-time Google search intelligence
+let serperSearch = null, needsSearch = null;
+try {
+  const _serperMod = await import("./services/serper.js");
+  serperSearch = _serperMod.serperSearch;
+  needsSearch = _serperMod.needsSearch;
+  console.log("[serper] Search intelligence service loaded OK");
+} catch (_serperErr) {
+  console.warn("[serper] Search service unavailable:", _serperErr.message);
+}
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 // ── Standalone yt-dlp binary (downloaded at startup, no Python needed) ───────
@@ -175,8 +185,9 @@ db.exec(`
     nsfwEnabled INTEGER DEFAULT 0,
     nsfwPersonality TEXT DEFAULT 'You are a flirty, mature, and consenting adult friend.',
     searchEnabled INTEGER DEFAULT 0,
-    searchProvider TEXT DEFAULT 'tavily',
+    searchProvider TEXT DEFAULT 'serper',
     searchApiKey TEXT DEFAULT '',
+    serperKey TEXT DEFAULT '',
     aiMode TEXT DEFAULT 'intelligent',
     formattingEnabled INTEGER DEFAULT 1,
     cleanupEnabled INTEGER DEFAULT 1,
@@ -389,6 +400,10 @@ try {
 } catch (e) {
 }
 try {
+  db.exec("ALTER TABLE config ADD COLUMN serperKey TEXT DEFAULT '';");
+} catch (e) {
+}
+try {
   db.exec("ALTER TABLE config ADD COLUMN searchApiKey TEXT DEFAULT '';");
 } catch (e) {
 }
@@ -476,7 +491,8 @@ db.exec(`
     nsfwEnabled = COALESCE(nsfwEnabled, 0),
     nsfwPersonality = COALESCE(nsfwPersonality, 'You are a flirty, mature, and consenting adult friend.'),
     searchEnabled = COALESCE(searchEnabled, 0),
-    searchProvider = COALESCE(searchProvider, 'tavily'),
+    searchProvider = COALESCE(searchProvider, 'serper'),
+    serperKey = COALESCE(serperKey, ''),
     searchApiKey = COALESCE(searchApiKey, ''),
     aiMode = COALESCE(aiMode, 'intelligent'),
     formattingEnabled = COALESCE(formattingEnabled, 1),
@@ -992,12 +1008,25 @@ async function moderateContent(text) {
   return { safe: true };
 }
 async function performWebSearch(query, config, deep = false) {
-  // 1. Tavily (paid, if configured)
-  if (config.searchEnabled === 1 && config.searchApiKey) {
+  // 1. Serper — primary real-time Google search
+  if (serperSearch && (config.serperKey || process.env.SERPER_API_KEY)) {
+    try {
+      const result = await serperSearch(query, config);
+      if (result?.summary) {
+        console.log(`[search] Serper OK — intent=${result.intent} query="${result.optimizedQuery}"`);
+        return result.summary;
+      }
+    } catch (e) {
+      console.warn(`[search] Serper error: ${e.message}`);
+    }
+  }
+
+  // 2. Tavily — fallback
+  if (config.searchApiKey) {
     try {
       const depth = deep ? "advanced" : "basic";
       const maxResults = deep ? 6 : 3;
-      console.log(`[Search] Tavily ${depth} search: "${query}"`);
+      console.log(`[search] Tavily ${depth} fallback: "${query}"`);
       const response = await fetch("https://api.tavily.com/search", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1005,14 +1034,15 @@ async function performWebSearch(query, config, deep = false) {
       });
       if (response.ok) {
         const data = await response.json();
-        if (data.results && data.results.length > 0) {
-          return data.results.map((r) => `Source: ${r.title}\nContent: ${r.content}\nURL: ${r.url}`).join("\n\n---\n\n");
+        if (data.results?.length > 0) {
+          return data.results.map((r) => `${r.title}: ${r.content}`).join("\n\n");
         }
       }
     } catch (e) {
-      console.warn(`[Search] Tavily failed: ${e.message}`);
+      console.warn(`[search] Tavily fallback failed: ${e.message}`);
     }
   }
+
   return "";
 }
 function cleanAIResponse(text, config) {
@@ -1210,15 +1240,22 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
     systemPrompt = `[Base Identity: ${personality}] ${systemPrompt}`;
   }
   let searchContext = "";
-  const searchKeywords = [
-    "today", "latest", "current", "news", "score", "price",
-    "who is", "what happened", "election", "match"
-  ];
-  const shouldSearch = config.searchEnabled === 1 && (isDeep || searchKeywords.some((kw) => prompt.toLowerCase().includes(kw)));
-  if (shouldSearch) {
-    const results = await performWebSearch(prompt, config, isDeep);
-    if (results) {
-      searchContext = `[Web Search Results: ${results}] Use this information to provide an up-to-date answer. If the information is missing, state you couldn't find data for today.`;
+  if (config.searchEnabled === 1) {
+    // Intelligent intent detection — handles typos, casual language, short phrases
+    let shouldSearch = isDeep;
+    if (!shouldSearch && needsSearch) {
+      const { needs } = needsSearch(prompt);
+      shouldSearch = needs;
+    } else if (!shouldSearch) {
+      // Fallback keyword check when serper module is unavailable
+      const fallbackKw = ["today", "latest", "current", "news", "score", "price", "who is", "what happened", "election", "match", "weather", "temp", "bitcoin", "crypto", "stock"];
+      shouldSearch = fallbackKw.some((kw) => prompt.toLowerCase().includes(kw));
+    }
+    if (shouldSearch) {
+      const results = await performWebSearch(prompt, config, isDeep);
+      if (results) {
+        searchContext = `[Live Web Search Results — real-time data fetched now:\n${results}]\n\nUse this live information to answer accurately. Do NOT say "as of my training" — this is current data.`;
+      }
     }
   }
   let modelNudge = "";
@@ -1626,6 +1663,7 @@ const HS = {
   exportBuild:  () => _pick(["Building the PDF...", "Almost done with the export...", "Putting it all together..."]),
   sticker:      () => _pick(["Making the sticker...", "One sec on this...", "On it..."]),
   stickerSend:  () => _pick(["Sending it over...", "Almost there..."]),
+  search:       () => _pick(["Lemme check...", "Wait, checking the latest info...", "Yeah one sec...", "Looking into it...", "On it...", "Let me pull that up..."]),
 };
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1846,6 +1884,7 @@ async function startServer() {
       "searchEnabled",
       "searchProvider",
       "searchApiKey",
+      "serperKey",
       "aiMode",
       "formattingEnabled",
       "autoReplyPersonality",
@@ -2811,7 +2850,11 @@ async function startServer() {
           } catch (e) {
           }
         }
-        await status.update(HS.think());
+        // Show smarter status: search-aware message if live data is needed
+        const searchStatus = (config.searchEnabled === 1 && needsSearch)
+          ? needsSearch(text).needs
+          : false;
+        await status.update(searchStatus ? HS.search() : HS.think());
         const aiRes = await getAIResponse(
           text,
           config,

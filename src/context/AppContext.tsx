@@ -45,6 +45,7 @@ export interface AppConfig {
   searchEnabled?: number;
   searchProvider?: string;
   searchApiKey?: string;
+  serperKey?: string;
   aiMode?: string;
   formattingEnabled?: number;
   cleanupEnabled?: number;

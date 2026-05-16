@@ -153,8 +153,9 @@ export function AISettings() {
   const [autoReplyBlacklist, setAutoReplyBlacklist] = useState(config.autoReplyBlacklist || '');
 
   const [searchEnabled, setSearchEnabled] = useState(config.searchEnabled === 1);
-  const [searchProvider, setSearchProvider] = useState(config.searchProvider || 'tavily');
+  const [searchProvider, setSearchProvider] = useState(config.searchProvider || 'serper');
   const [searchApiKey, setSearchApiKey] = useState(config.searchApiKey || '');
+  const [serperKey, setSerperKey] = useState(config.serperKey || '');
   const [aiMode, setAiMode] = useState(config.aiMode || 'intelligent');
   const [formattingEnabled, setFormattingEnabled] = useState(config.formattingEnabled === 1);
   const [cleanupEnabled, setCleanupEnabled] = useState(config.cleanupEnabled === 1);
@@ -198,8 +199,9 @@ export function AISettings() {
     setAutoReplyWhitelist(config.autoReplyWhitelist || '');
     setAutoReplyBlacklist(config.autoReplyBlacklist || '');
     setSearchEnabled(config.searchEnabled === 1);
-    setSearchProvider(config.searchProvider || 'tavily');
+    setSearchProvider(config.searchProvider || 'serper');
     setSearchApiKey(config.searchApiKey || '');
+    setSerperKey(config.serperKey || '');
     setAiMode(config.aiMode || 'intelligent');
     setFormattingEnabled(config.formattingEnabled === 1);
     setCleanupEnabled(config.cleanupEnabled === 1);
@@ -270,6 +272,7 @@ export function AISettings() {
       searchEnabled: searchEnabled ? 1 : 0,
       searchProvider,
       searchApiKey,
+      serperKey,
       aiMode,
       formattingEnabled: formattingEnabled ? 1 : 0,
       cleanupEnabled: cleanupEnabled ? 1 : 0,
@@ -548,18 +551,37 @@ export function AISettings() {
                         onChange={(e) => setSearchProvider(e.target.value)}
                         className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-xs text-slate-300 focus:border-emerald-500 outline-none"
                       >
+                        <option value="serper">Serper (Google — Recommended)</option>
                         <option value="tavily">Tavily</option>
                         <option value="serpapi">SerpAPI</option>
                         <option value="duckduckgo">DuckDuckGo (Free)</option>
                       </select>
-                      <input
-                        type="password"
-                        placeholder="Search API Key"
-                        value={searchApiKey}
-                        onChange={(e) => setSearchApiKey(e.target.value)}
-                        onBlur={handleBlur}
-                        className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-xs text-slate-200 focus:outline-none focus:border-emerald-500 transition-colors"
-                      />
+                      <div className="space-y-1.5">
+                        <label className="text-[10px] text-emerald-700 font-semibold">Serper API Key <span className="text-slate-600 font-normal">(google.serper.dev)</span></label>
+                        <input
+                          type="password"
+                          placeholder="Serper key — primary Google search"
+                          value={serperKey}
+                          onChange={(e) => setSerperKey(e.target.value)}
+                          onBlur={handleBlur}
+                          className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-xs text-slate-200 focus:outline-none focus:border-emerald-500 transition-colors"
+                        />
+                        <div className="flex items-center gap-1.5">
+                          <div className={cn('w-1.5 h-1.5 rounded-full', serperKey ? 'bg-emerald-400' : 'bg-slate-600')} />
+                          <span className="text-[10px] text-slate-600">{serperKey ? 'Serper active — intelligent Google search with typo tolerance' : 'No key set — add for real-time Google search'}</span>
+                        </div>
+                      </div>
+                      <div className="space-y-1.5">
+                        <label className="text-[10px] text-slate-500 font-semibold">Tavily API Key <span className="text-slate-700 font-normal">(fallback if Serper fails)</span></label>
+                        <input
+                          type="password"
+                          placeholder="Tavily key — used as fallback"
+                          value={searchApiKey}
+                          onChange={(e) => setSearchApiKey(e.target.value)}
+                          onBlur={handleBlur}
+                          className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-xs text-slate-200 focus:outline-none focus:border-slate-600 transition-colors"
+                        />
+                      </div>
                     </div>
                   )}
                 </div>
