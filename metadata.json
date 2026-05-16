@@ -1,6 +1,0 @@
-{
-  "name": "Telegram Automation Dashboard",
-  "description": "Dashboard for a Telegram automation system to manage targets, messages, and schedules.",
-  "requestFramePermissions": [],
-  "majorCapabilities": []
-}
