@@ -14,6 +14,7 @@ import sharp from "sharp";
 import fs from "fs-extra";
 import yts from "yt-search";
 import youtubedl from "youtube-dl-exec";
+import { generateImage as ziGenerateImage } from "./services/zimage.js";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 // ── Standalone yt-dlp binary (downloaded at startup, no Python needed) ───────
@@ -1108,7 +1109,7 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
     timeStyle: "short"
   });
   const timeContext = `[Current Context: Date is ${dateStr}. Timezone is Asia/Kolkata (IST). Current Year: 2026. Month: May 2026. You are operating in realtime. Never assume outdated relative dates.]`;
-  let systemPrompt = "You are a premium Telegram AI assistant. Reply with high-quality, structured formatting. \n\nSTRUCTURE RULES:\n1. Use **Bold Headings** for sections, each ending with a single relevant emoji (e.g., **Current Status \u{1F3DB}\uFE0F**).\n2. Bold key names, dates, and numbers within paragraphs for readability.\n3. Use clean spacing between sections. Avoid robotic greetings or filler text.\n4. Prioritize accurate, realtime data. If using search results, synthesize them into a coherent report.\n5. Keep the tone professional, smart, and human-like.";
+  let systemPrompt = "You are a premium Telegram AI assistant with built-in image generation capabilities. Reply with high-quality, structured formatting.\n\nSTRUCTURE RULES:\n1. Use **Bold Headings** for sections, each ending with a single relevant emoji (e.g., **Current Status \u{1F3DB}\uFE0F**).\n2. Bold key names, dates, and numbers within paragraphs for readability.\n3. Use clean spacing between sections. Avoid robotic greetings or filler text.\n4. Prioritize accurate, realtime data. If using search results, synthesize them into a coherent report.\n5. Keep the tone professional, smart, and human-like.\n\nIMAGE GENERATION TOOL:\nYou have a built-in image generation tool. When the user asks you to create, draw, generate, design, make, visualize, render, or produce ANY visual content — including images, photos, wallpapers, illustrations, logos, thumbnails, posters, anime art, concept art, renders, or any artwork — you MUST respond ONLY with this exact format and nothing else:\n\n[IMAGE_GENERATION]\ndetailed optimized prompt describing the image with style, lighting, colors, quality tags\n[/IMAGE_GENERATION]\n\nDo NOT add any other text, explanation, or commentary when generating an image. ONLY output the tag block.\nExamples that MUST trigger image generation:\n- 'create a cyberpunk wallpaper' → [IMAGE_GENERATION]...[/IMAGE_GENERATION]\n- 'draw an anime girl' → [IMAGE_GENERATION]...[/IMAGE_GENERATION]\n- 'make a logo for a coffee shop' → [IMAGE_GENERATION]...[/IMAGE_GENERATION]\n- 'generate a realistic photo of mountains' → [IMAGE_GENERATION]...[/IMAGE_GENERATION]\n- 'visualize futuristic Tokyo' → [IMAGE_GENERATION]...[/IMAGE_GENERATION]";
   if (config.formattingEnabled === 1) {
     systemPrompt += "\n\nFORMATTING: Use standard Telegram Markdown (bold with **). Do not use headers (#). Use bullet points for lists.";
   }
@@ -2712,6 +2713,34 @@ async function startServer() {
           isNSFWActive
         );
         if (aiRes && client2) {
+          // ── Image generation routing ─────────────────────────────────────
+          const imgMatch = aiRes.match(/\[IMAGE_GENERATION\]([\s\S]*?)\[\/IMAGE_GENERATION\]/i);
+          if (imgMatch) {
+            const imgPrompt = imgMatch[1].trim();
+            addLog(`[img] Image request detected: "${imgPrompt.slice(0, 60)}..."`, "info");
+            try {
+              await status.update("🎨 **Creating your image...**");
+              await new Promise((r) => setTimeout(r, 800));
+              await status.update("✨ **Rendering artwork...**");
+              const { buffer, provider } = await ziGenerateImage(imgPrompt, config);
+              await status.update("🖼 **Uploading result...**");
+              const caption = `🎨 **Generated Image**\n\`${imgPrompt.slice(0, 120)}\``;
+              // Delete the status message, then send photo
+              try { await client2.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch {}
+              await client2.sendFile(targetPeer, {
+                file: buffer,
+                caption,
+                parseMode: "markdown",
+                replyTo: message.id
+              });
+              addLog(`[img] Image sent via ${provider}: "${imgPrompt.slice(0, 40)}"`, "success");
+            } catch (imgErr) {
+              console.error("[img] Image generation failed:", imgErr.message);
+              await status.finish(`❌ **Image generation failed:** ${imgErr.message.slice(0, 120)}`);
+            }
+            return;
+          }
+          // ── Normal text reply ────────────────────────────────────────────
           // In DMs there is no outgoing content filter — the AI response is sent as-is.
           // In groups, moderate the output and replace unsafe replies with a refusal.
           let safeAiRes = aiRes;
