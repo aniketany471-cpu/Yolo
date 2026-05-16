@@ -2734,15 +2734,23 @@ async function startServer() {
               const { buffer, provider } = await ziGenerateImage(imgPrompt, config);
               await status.update("🖼 **Uploading result...**");
               const caption = `🎨 **Generated Image**\n\`${imgPrompt.slice(0, 120)}\``;
-              // Delete the status message, then send photo
-              try { await client2.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch {}
-              await client2.sendFile(targetPeer, {
-                file: buffer,
-                caption,
-                parseMode: "markdown",
-                replyTo: message.id
-              });
-              addLog(`[img] Image sent via ${provider}: "${imgPrompt.slice(0, 40)}"`, "success");
+              // Write buffer to a temp .jpg file so GramJS sends it as a photo (not a document)
+              const tmpImgPath = path.join(tempDir, `img_${Date.now()}.jpg`);
+              await fs.writeFile(tmpImgPath, buffer);
+              try {
+                // Delete the status message, then send photo
+                try { await client2.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch {}
+                await client2.sendFile(targetPeer, {
+                  file: tmpImgPath,
+                  caption,
+                  parseMode: "markdown",
+                  replyTo: message.id,
+                  forceDocument: false
+                });
+                addLog(`[img] Image sent via ${provider}: "${imgPrompt.slice(0, 40)}"`, "success");
+              } finally {
+                fs.remove(tmpImgPath).catch(() => {});
+              }
             } catch (imgErr) {
               console.error("[img] Image generation failed:", imgErr.message);
               await status.finish(`❌ **Image generation failed:** ${imgErr.message.slice(0, 120)}`);
