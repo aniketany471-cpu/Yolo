@@ -1847,7 +1847,6 @@ async function startServer() {
         config,
         logs,
         sudoUsers,
-        isRunning: getIsRunning(),
         diagnostics: {
           isListenerActive,
           lastEventTimestamp,
@@ -1860,44 +1859,6 @@ async function startServer() {
       console.error(`[ERR] /api/state:`, e);
       res.status(500).json({ status: "error", error: String(e) });
     }
-  });
-  app.post("/api/action", (req, res) => {
-    const { action } = req.body;
-    try {
-      if (action === "start") startAutomationLoop();
-      else if (action === "stop") setIsRunning(false);
-      res.json({ success: true, isRunning: getIsRunning() });
-    } catch (e) {
-      res.status(500).json({ error: String(e) });
-    }
-  });
-  app.post("/api/messages", (req, res) => {
-    const { text } = req.body;
-    if (!text) return res.status(400).json({ error: "Missing text" });
-    const id = Math.random().toString(36).substring(2);
-    db.prepare(
-      "INSERT INTO messages (id, text, createdAt) VALUES (?, ?, ?)"
-    ).run(id, text, Date.now());
-    res.json({ success: true, id });
-  });
-  app.delete("/api/messages/:id", (req, res) => {
-    db.prepare("DELETE FROM messages WHERE id = ?").run(req.params.id);
-    res.json({ success: true });
-  });
-  app.post("/api/targets", (req, res) => {
-    const { name, type } = req.body;
-    if (!name) return res.status(400).json({ error: "Missing name" });
-    const id = Math.random().toString(36).substring(2);
-    db.prepare("INSERT INTO targets (id, name, type) VALUES (?, ?, ?)").run(
-      id,
-      name,
-      type || "group"
-    );
-    res.json({ success: true, id });
-  });
-  app.delete("/api/targets/:id", (req, res) => {
-    db.prepare("DELETE FROM targets WHERE id = ?").run(req.params.id);
-    res.json({ success: true });
   });
   app.post("/api/config", async (req, res) => {
     const updates = req.body;
@@ -2343,22 +2304,11 @@ async function startServer() {
     );
   });
   let client = null;
-  let runningLoop = false;
   let isConnecting = false;
   let lastConnectError = "";
   let lastConnectFailTime = 0;
   let authDupRetries = 0;
   let retryTimer = null;
-  const getIsRunning = () => {
-    const row = db.prepare("SELECT isRunning FROM config WHERE id = 1").get();
-    return row?.isRunning === 1;
-  };
-  const setIsRunning = (state) => {
-    db.prepare("UPDATE config SET isRunning = ? WHERE id = 1").run(
-      state ? 1 : 0
-    );
-    runningLoop = state;
-  };
   const addLog = (message, type = "info") => {
     try {
       const id = Math.random().toString(36).substring(2);
@@ -3013,6 +2963,7 @@ async function startServer() {
             }
             return;
           }
+
           // ── Normal text reply ────────────────────────────────────────────
           // In DMs there is no outgoing content filter — the AI response is sent as-is.
           // In groups, moderate the output and replace unsafe replies with a refusal.
@@ -3462,37 +3413,6 @@ _Visit the dashboard for advanced configuration._`;
             }
             return;
           }
-          if (text === "/startbot" || text === ".startbot") {
-            await CommandProcessor.process(
-              client,
-              message,
-              config2,
-              myId,
-              "startbot",
-              textRaw,
-              async (status) => {
-                setIsRunning(true);
-                startAutomationLoop();
-                await status.finish("\u2705 Bot automation started.");
-              }
-            );
-            return;
-          }
-          if (text === "/stopbot" || text === ".stopbot") {
-            await CommandProcessor.process(
-              client,
-              message,
-              config2,
-              myId,
-              "stopbot",
-              textRaw,
-              async (status) => {
-                setIsRunning(false);
-                await status.finish("\u{1F6D1} Bot automation stopped.");
-              }
-            );
-            return;
-          }
           if (text.startsWith("/sudoadd ")) {
             const target = textRaw.split(/\s+/)[1]?.trim();
             if (target)
@@ -3644,40 +3564,6 @@ ${mStr}`);
             );
             return;
           }
-          if (text === "/startsend" || text === ".startsend") {
-            setIsRunning(true);
-            startAutomationLoop();
-            await client?.sendMessage(message.chatId, {
-              message: "\u{1F680} Automation loop started. Check Logs for progress."
-            });
-          } else if (text === "/stopsend" || text === ".stopsend") {
-            setIsRunning(false);
-            await client?.sendMessage(message.chatId, {
-              message: "\u{1F6D1} Automation loop stopped."
-            });
-          } else if (text.startsWith("/addmsg ") || text.startsWith(".addmsg ")) {
-            const newMsg = textRaw.substring(8).trim();
-            if (newMsg) {
-              const id = Math.random().toString(36).substring(2);
-              db.prepare(
-                "INSERT INTO messages (id, text, createdAt) VALUES (?, ?, ?)"
-              ).run(id, newMsg, Date.now());
-              await client?.sendMessage(message.chatId, {
-                message: "\u2705 Message added to database."
-              });
-            }
-          } else if (text.startsWith("/addtarget ") || text.startsWith(".addtarget ")) {
-            const targetName = textRaw.substring(11).trim();
-            if (targetName) {
-              const id = Math.random().toString(36).substring(2);
-              db.prepare(
-                "INSERT INTO targets (id, name, type) VALUES (?, ?, ?)"
-              ).run(id, targetName, "group");
-              await client?.sendMessage(message.chatId, {
-                message: `\u2705 Target ${targetName} added.`
-              });
-            }
-          }
         } catch (err) {
           console.error("[BOT] Error in messageHandler:", err);
           addLog(`Handler Error: ${err.message || String(err)}`, "error");
@@ -3747,63 +3633,8 @@ ${mStr}`);
       isConnecting = false;
     }
   };
-  const startAutomationLoop = async () => {
-    if (runningLoop) return;
-    setIsRunning(true);
-    addLog("Automation loop started.", "info");
-    const isClientConnected = client !== null;
-    if (!isClientConnected) {
-      loadTelethon();
-    }
-    const loop = async () => {
-      while (getIsRunning()) {
-        const messages = db.prepare("SELECT * FROM messages").all();
-        const targets = db.prepare("SELECT * FROM targets").all();
-        const config = db.prepare("SELECT * FROM config WHERE id = 1").get();
-        if (!messages.length || !targets.length) {
-          addLog("Cannot send message: Missing targets or messages.", "error");
-          setIsRunning(false);
-          break;
-        }
-        const msg = messages[Math.floor(Math.random() * messages.length)];
-        const target = targets[Math.floor(Math.random() * targets.length)];
-        if (client) {
-          try {
-            await client.sendMessage(target.name, { message: msg.text });
-            addLog(
-              `Sent to ${target.name}: "${msg.text.substring(0, 20)}..."`,
-              "success"
-            );
-          } catch (e) {
-            addLog(`Failed sending to ${target.name}: ${e?.message}`, "error");
-          }
-        } else {
-          addLog(
-            `[MOCK] Sent to ${target.name}: "${msg.text.substring(0, 20)}..."`,
-            "success"
-          );
-        }
-        const delaySec = Math.floor(
-          Math.random() * (config.maxDelaySeconds - config.minDelaySeconds + 1) + config.minDelaySeconds
-        );
-        addLog(`Waiting ${delaySec} seconds before next message...`, "info");
-        for (let i = 0; i < delaySec; i++) {
-          if (!getIsRunning()) break;
-          await new Promise((r) => setTimeout(r, 1e3));
-        }
-      }
-      addLog("Automation loop stopped.", "warn");
-      runningLoop = false;
-    };
-    loop();
-  };
   loadTelethon().then(() => {
-    if (getIsRunning()) {
-      addLog("Resuming automation loop from previous state.", "info");
-      startAutomationLoop();
-    } else {
-      addLog("Backend server initialized.", "info");
-    }
+    addLog("Backend server initialized.", "info");
   });
 }
 startServer();
