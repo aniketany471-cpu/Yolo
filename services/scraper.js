@@ -79,16 +79,44 @@ function weatherEmoji(condition = "") {
 
 // ── Google Search HTML fetch ──────────────────────────────────────────────────
 
-async function fetchGoogleHTML(query) {
-  const url = `https://www.google.com/search?q=${encodeURIComponent(query)}&hl=en&gl=us&num=10&pws=0`;
+const DESKTOP_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+const MOBILE_UA  = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36";
+const CONSENT_COOKIE = "CONSENT=YES+cb.20240101-07-p0.en+FX+953; SOCS=CAESEwgDEgk0ODE3Nzk3MjQaAmVuIAEaBgiA_LyaBg";
+
+async function fetchGoogleDesktop(query, gl = "in") {
+  const url = `https://www.google.com/search?q=${encodeURIComponent(query)}&hl=en&gl=${gl}&num=5&pws=0&safe=off`;
   const res = await fetchWithTimeout(url, {
     headers: {
-      ...HEADERS,
-      "Cookie": "CONSENT=YES+cb; SOCS=CAESEwgDEgk0ODE3Nzk3MjQaAmVuIAEaBgiA_LyaBg",
+      "User-Agent": DESKTOP_UA,
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Accept-Encoding": "gzip, deflate, br",
+      "Cache-Control": "no-cache",
+      "Cookie": CONSENT_COOKIE,
     },
   });
-  if (!res.ok) throw new Error(`Google search HTTP ${res.status}`);
+  if (!res.ok) throw new Error(`Google desktop HTTP ${res.status}`);
   return await res.text();
+}
+
+async function fetchGoogleMobile(query) {
+  const url = `https://www.google.com/search?q=${encodeURIComponent(query)}&hl=en&gl=in&num=5`;
+  const res = await fetchWithTimeout(url, {
+    headers: {
+      "User-Agent": MOBILE_UA,
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Accept-Encoding": "gzip, deflate, br",
+      "Cookie": CONSENT_COOKIE,
+    },
+  });
+  if (!res.ok) throw new Error(`Google mobile HTTP ${res.status}`);
+  return await res.text();
+}
+
+async function fetchGoogleHTML(query) {
+  // Default: desktop with India locale (most accurate for all regions)
+  return fetchGoogleDesktop(query, "in");
 }
 
 // ── WMO weather code → description ───────────────────────────────────────────
@@ -136,44 +164,106 @@ async function fromOpenMeteo(location) {
   };
 }
 
-// ── Google Weather scraper (try first, very fast when it works) ───────────────
+// ── Google Weather parser — extract everything from raw HTML ──────────────────
 
-async function fromGoogleWeather(location) {
-  const html = await fetchGoogleHTML(`weather in ${location}`);
-
+function parseWeatherHTML(html) {
   let tempC = null, condition = "", humidity = "", wind = "", feelsLike = "";
 
-  // wob_t class (Google's standard weather widget)
-  const t1 = html.match(/class="wob_t[^"]*"[^>]*>(\d+)<\/span>/);
-  if (t1) tempC = parseInt(t1[1]);
+  // ── Temperature (6 patterns, most → least specific) ──────────────────────
 
-  // Embedded JSON data pattern: ["42","°C"]
+  // 1. wob_t class: <span class="wob_t ...">42</span>
   if (tempC === null) {
-    const t2 = html.match(/\["(\d{1,3})","°C"\]/);
-    if (t2) tempC = parseInt(t2[1]);
+    const m = html.match(/class="wob_t[^"]*"[^>]*>\s*(-?\d{1,3})\s*<\/span>/);
+    if (m) tempC = parseInt(m[1]);
   }
 
-  // Plain °C pattern near "weather" keyword
+  // 2. Embedded JS/JSON data value attribute: data-value="42"
   if (tempC === null) {
-    const t3 = html.match(/(\d{1,3})°C/);
-    if (t3) tempC = parseInt(t3[1]);
+    const m = html.match(/data-value="(-?\d{1,3})"/);
+    if (m) tempC = parseInt(m[1]);
   }
 
-  const condMatch = html.match(/class="wob_dc[^"]*"[^>]*>([\s\S]*?)<\/span>/);
-  if (condMatch) condition = stripTags(condMatch[1]).trim();
+  // 3. JSON array pattern: ["42","°C"] or ["42", "\u00b0C"]
+  if (tempC === null) {
+    const m = html.match(/\["(-?\d{1,3})","(?:°|\\u00b0)C"\]/);
+    if (m) tempC = parseInt(m[1]);
+  }
 
-  const feelsMatch = html.match(/Feels like[^0-9]*(\d+)/i);
-  if (feelsMatch) feelsLike = feelsMatch[1];
+  // 4. Page title or meta: "42°C" or "42 °C"
+  if (tempC === null) {
+    const titleM = html.match(/<title>[^<]*?(-?\d{1,3})\s*°C[^<]*<\/title>/i);
+    if (titleM) tempC = parseInt(titleM[1]);
+  }
 
-  const humMatch = html.match(/Humidity[^0-9]*(\d+)%/i);
-  if (humMatch) humidity = humMatch[1];
+  // 5. Any span/div content that is just a number right before °C
+  if (tempC === null) {
+    const m = html.match(/>(-?\d{1,3})<\/(?:span|div)>\s*°/);
+    if (m) tempC = parseInt(m[1]);
+  }
 
-  const windMatch = html.match(/Wind[^0-9]*(\d+(?:\.\d+)?)\s*(?:km\/h|kph)/i);
-  if (windMatch) wind = `${windMatch[1]} km/h`;
+  // 6. Last resort — first standalone °C occurrence in the page (weather card is always near top)
+  if (tempC === null) {
+    const slice = html.slice(0, 30000); // weather card is always in first 30KB
+    const m = slice.match(/(-?\d{1,3})\s*°C/);
+    if (m) tempC = parseInt(m[1]);
+  }
 
-  if (tempC === null) throw new Error("Google weather card not parsed");
+  // ── Condition ─────────────────────────────────────────────────────────────
+  const cond1 = html.match(/class="wob_dc[^"]*"[^>]*>([\s\S]*?)<\/span>/);
+  if (cond1) condition = stripTags(cond1[1]).trim();
 
-  return { city: location, tempC, feelsLike, condition, humidity, wind };
+  if (!condition) {
+    // alt: data-local-attribute or aria-label on the weather icon
+    const cond2 = html.match(/(?:aria-label|title)="([A-Za-z][a-z ]+(?:sky|cloud|rain|sun|snow|fog|storm|drizzle|shower|overcast|clear|wind)[a-z ]*)"/i);
+    if (cond2) condition = cond2[1];
+  }
+
+  // ── Feels like ────────────────────────────────────────────────────────────
+  const fl = html.match(/(?:Feels like|feels_like)[^0-9-]*(-?\d{1,3})/i);
+  if (fl) feelsLike = fl[1];
+
+  // ── Humidity ──────────────────────────────────────────────────────────────
+  const hum = html.match(/Humidity[^0-9]*(\d{1,3})%/i) ||
+              html.match(/class="wob_hm[^"]*"[^>]*>(\d{1,3})%/i);
+  if (hum) humidity = hum[1];
+
+  // ── Wind ──────────────────────────────────────────────────────────────────
+  const wd = html.match(/Wind(?:speed)?[^0-9]*(\d+(?:\.\d+)?)\s*(?:km\/h|kph|kmh)/i) ||
+             html.match(/class="wob_ws[^"]*"[^>]*>([^<]+)<\/span>/i);
+  if (wd) wind = wd[1].includes("km") ? wd[1].trim() : `${wd[1].trim()} km/h`;
+
+  return { tempC, condition, feelsLike, humidity, wind };
+}
+
+// ── Google Weather scraper — desktop first, mobile if temp still missing ──────
+
+async function fromGoogleWeather(location) {
+  const query = `weather in ${location}`;
+
+  // Attempt 1: Desktop Google with India locale
+  const desktopHtml = await fetchGoogleDesktop(query, "in");
+  let parsed = parseWeatherHTML(desktopHtml);
+
+  // Attempt 2: Mobile Google — simpler HTML, often has the card even when desktop doesn't
+  if (parsed.tempC === null) {
+    console.warn(`[weather] Desktop parse missed temp for "${location}", trying mobile...`);
+    const mobileHtml = await fetchGoogleMobile(query);
+    const mobileParsed = parseWeatherHTML(mobileHtml);
+    // Merge: use mobile values for anything still missing
+    parsed = {
+      tempC:     mobileParsed.tempC     ?? parsed.tempC,
+      condition: mobileParsed.condition || parsed.condition,
+      feelsLike: mobileParsed.feelsLike || parsed.feelsLike,
+      humidity:  mobileParsed.humidity  || parsed.humidity,
+      wind:      mobileParsed.wind      || parsed.wind,
+    };
+  }
+
+  if (parsed.tempC === null) {
+    throw new Error(`Could not extract temperature for "${location}" from Google`);
+  }
+
+  return { city: location, ...parsed };
 }
 
 // ── Google News RSS ───────────────────────────────────────────────────────────
