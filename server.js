@@ -23,14 +23,18 @@ try {
 } catch (_ziErr) {
   console.warn("[img] Image service unavailable:", _ziErr.message);
 }
-// Weather service — dual-provider (OpenWeatherMap + WeatherAPI)
-let ziGetWeather = null;
+// Scraper service — free real-time data (Google News RSS, DuckDuckGo, wttr.in)
+let scraperSearchNews = null;
+let scraperSearchWeb  = null;
+let scraperGetWeather = null;
 try {
-  const _wMod = await import("./services/weather.js");
-  ziGetWeather = _wMod.getWeather;
-  console.log("[weather] Weather service loaded OK");
-} catch (_wErr) {
-  console.warn("[weather] Weather service unavailable:", _wErr.message);
+  const _scMod = await import("./services/scraper.js");
+  scraperSearchNews = _scMod.searchNews;
+  scraperSearchWeb  = _scMod.searchWeb;
+  scraperGetWeather = _scMod.getWeatherFree;
+  console.log("[scraper] Free scraper service loaded OK");
+} catch (_scErr) {
+  console.warn("[scraper] Scraper service unavailable:", _scErr.message);
 }
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1001,37 +1005,38 @@ async function moderateContent(text) {
   return { safe: true };
 }
 async function performWebSearch(query, config, deep = false) {
-  if (config.searchEnabled !== 1 || !config.searchApiKey) return "";
-  try {
-    const depth = deep ? "advanced" : "basic";
-    const maxResults = deep ? 6 : 3;
-    console.log(
-      `[Search] Performing ${depth} web search for: "${query}" using Tavily...`
-    );
-    const response = await fetch("https://api.tavily.com/search", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        api_key: config.searchApiKey,
-        query,
-        search_depth: depth,
-        max_results: maxResults
-      })
-    });
-    if (!response.ok) {
-      console.error(`[Search] API Error: ${response.status}`);
-      return "";
+  // 1. Tavily (paid, if configured)
+  if (config.searchEnabled === 1 && config.searchApiKey) {
+    try {
+      const depth = deep ? "advanced" : "basic";
+      const maxResults = deep ? 6 : 3;
+      console.log(`[Search] Tavily ${depth} search: "${query}"`);
+      const response = await fetch("https://api.tavily.com/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ api_key: config.searchApiKey, query, search_depth: depth, max_results: maxResults })
+      });
+      if (response.ok) {
+        const data = await response.json();
+        if (data.results && data.results.length > 0) {
+          return data.results.map((r) => `Source: ${r.title}\nContent: ${r.content}\nURL: ${r.url}`).join("\n\n---\n\n");
+        }
+      }
+    } catch (e) {
+      console.warn(`[Search] Tavily failed: ${e.message}`);
     }
-    const data = await response.json();
-    if (data.results && data.results.length > 0) {
-      return data.results.map(
-        (r) => `Source: ${r.title}
-Content: ${r.content}
-URL: ${r.url}`
-      ).join("\n\n---\n\n");
+  }
+  // 2. Free DuckDuckGo scraper (always available, no key needed)
+  if (scraperSearchWeb) {
+    try {
+      console.log(`[Search] DuckDuckGo free search: "${query}"`);
+      const { results } = await scraperSearchWeb(query, deep ? 6 : 4);
+      if (results.length > 0) {
+        return results.map((r) => `Source: ${r.title}\nContent: ${r.snippet}\nURL: ${r.url}`).join("\n\n---\n\n");
+      }
+    } catch (e) {
+      console.warn(`[Search] DuckDuckGo scraper failed: ${e.message}`);
     }
-  } catch (e) {
-    console.error(`[Search] Error:`, e);
   }
   return "";
 }
@@ -1193,7 +1198,28 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
     "Triggers: 'what's the weather in London?' → [WEATHER_QUERY]London, UK[/WEATHER_QUERY]",
     "'temperature in Tokyo' → [WEATHER_QUERY]Tokyo, Japan[/WEATHER_QUERY]",
     "'is it raining in New York' → [WEATHER_QUERY]New York, US[/WEATHER_QUERY]",
-    "'weather dubai' → [WEATHER_QUERY]Dubai, UAE[/WEATHER_QUERY]"
+    "'weather dubai' → [WEATHER_QUERY]Dubai, UAE[/WEATHER_QUERY]",
+    "",
+    "NEWS TOOL",
+    "When the user asks for news, headlines, latest updates, what happened, current events, or recent developments on any topic — you MUST respond ONLY with:",
+    "",
+    "[NEWS_SEARCH]search query here[/NEWS_SEARCH]",
+    "",
+    "Output ONLY the tag. Use a concise search query based on what the user asked.",
+    "Triggers: 'latest news on AI' → [NEWS_SEARCH]AI news today[/NEWS_SEARCH]",
+    "'what's happening in Ukraine' → [NEWS_SEARCH]Ukraine news latest[/NEWS_SEARCH]",
+    "'crypto news' → [NEWS_SEARCH]cryptocurrency news today[/NEWS_SEARCH]",
+    "'news' (no topic) → [NEWS_SEARCH]breaking news today[/NEWS_SEARCH]",
+    "",
+    "WEB SEARCH TOOL",
+    "When the user asks for real-time data, live scores, stock prices, current information, or anything requiring an up-to-date internet search — and it is NOT weather or news — you MUST respond ONLY with:",
+    "",
+    "[WEB_SEARCH]search query here[/WEB_SEARCH]",
+    "",
+    "Output ONLY the tag. Compose a precise search query.",
+    "Triggers: 'BTC price right now' → [WEB_SEARCH]Bitcoin price USD live[/WEB_SEARCH]",
+    "'who won the match today' → [WEB_SEARCH]match result today[/WEB_SEARCH]",
+    "'current gold rate' → [WEB_SEARCH]gold price per gram today[/WEB_SEARCH]"
   ].join("\n");
   if (config.formattingEnabled === 1) {
     systemPrompt += "\n\nFORMATTING: Use standard Telegram Markdown (bold with **). Do not use headers (#). Use bullet points for lists.";
@@ -1239,30 +1265,54 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
       "WEATHER TOOL",
       "When the user asks about weather, temperature, forecast, humidity, wind, rain, or climate for any city or place — respond ONLY with:",
       "[WEATHER_QUERY]City Name, Country[/WEATHER_QUERY]",
+      "Output ONLY the tag. No other text.",
+      "",
+      "NEWS TOOL",
+      "When the user asks for news, headlines, latest updates, or current events — respond ONLY with:",
+      "[NEWS_SEARCH]concise search query[/NEWS_SEARCH]",
+      "Output ONLY the tag. No other text.",
+      "",
+      "WEB SEARCH TOOL",
+      "When the user asks for live data (prices, scores, rates, results) — respond ONLY with:",
+      "[WEB_SEARCH]concise search query[/WEB_SEARCH]",
       "Output ONLY the tag. No other text."
     ].join("\n");
   } else if (personality) {
     systemPrompt = `[Base Identity: ${personality}] ${systemPrompt}`;
   }
   let searchContext = "";
-  const searchKeywords = [
-    "today",
-    "latest",
-    "current",
-    "news",
-    "score",
-    "price",
-    "who is",
-    "what happened",
-    "election",
-    "weather",
-    "match"
-  ];
-  const shouldSearch = config.searchEnabled === 1 && (isDeep || searchKeywords.some((kw) => prompt.toLowerCase().includes(kw)));
+  const lp = prompt.toLowerCase();
+
+  // ── Live weather pre-fetch (wttr.in, zero API key) ───────────────────────
+  if (/weather|temperature|forecast|humidity|raining|snowing|sunny|degrees|celsius|fahrenheit|wind speed|will it rain|is it hot|is it cold/i.test(prompt) && scraperGetWeather) {
+    const locMatch = prompt.match(/(?:in|at|for|near|of)\s+([A-Za-z][A-Za-z\s,]{2,40})(?:[?!.,]|$)/i);
+    const loc = locMatch?.[1]?.trim();
+    if (loc) {
+      try {
+        const { message: wMsg } = await scraperGetWeather(loc);
+        searchContext += `[Live Weather — ${loc}:\n${wMsg}]\n\n`;
+      } catch (e) { console.warn(`[ctx] Weather pre-fetch failed: ${e.message}`); }
+    }
+  }
+
+  // ── Live news pre-fetch (Google News RSS, zero API key) ──────────────────
+  if (/\b(news|headline|latest|what happened|breaking|current event|update|recently|this week|today in|happening now)\b/i.test(prompt) && scraperSearchNews) {
+    try {
+      const { articles } = await scraperSearchNews(prompt.slice(0, 120));
+      if (articles.length > 0) {
+        const newsSnip = articles.slice(0, 5).map((a) => `- ${a.title}${a.snippet ? ": " + a.snippet.slice(0, 100) : ""}`).join("\n");
+        searchContext += `[Live News Results:\n${newsSnip}]\n\n`;
+      }
+    } catch (e) { console.warn(`[ctx] News pre-fetch failed: ${e.message}`); }
+  }
+
+  // ── General web search (DuckDuckGo, zero API key) ────────────────────────
+  const liveKeywords = ["today","latest","current","news","score","price","who is","what happened","election","weather","match","rate","live","right now","stock","crypto","bitcoin","gold","result","standings","vs","won","lost"];
+  const shouldSearch = isDeep || liveKeywords.some((kw) => lp.includes(kw));
   if (shouldSearch) {
     const results = await performWebSearch(prompt, config, isDeep);
     if (results) {
-      searchContext = `[Web Search Results: ${results}] Use this information to provide an up-to-date answer. If the information is missing, state you couldn't find data for today.`;
+      searchContext += `[Live Web Results: ${results}] Use this to give an up-to-date accurate answer.`;
     }
   }
   let modelNudge = "";
@@ -2975,15 +3025,15 @@ async function startServer() {
             }
             return;
           }
-          // ── Weather query routing ─────────────────────────────────────────
+          // ── Weather query routing (wttr.in, no API key) ──────────────────
           const weatherMatch = aiRes.match(/\[WEATHER_QUERY\]([\s\S]*?)\[\/WEATHER_QUERY\]/i);
           if (weatherMatch) {
             const location = weatherMatch[1].trim();
             addLog(`[weather] Weather request for: "${location}"`, "info");
             try {
               await status.update(HS.weather());
-              if (!ziGetWeather) throw new Error("Weather service not loaded — set OPENWEATHER_API_KEY or WEATHERAPI_KEY env vars");
-              const { message: weatherMsg, source } = await ziGetWeather(location);
+              if (!scraperGetWeather) throw new Error("Weather scraper not loaded");
+              const { message: weatherMsg, source } = await scraperGetWeather(location);
               try { await client2.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch {}
               await client2.sendMessage(targetPeer, {
                 message: weatherMsg,
@@ -2994,6 +3044,68 @@ async function startServer() {
             } catch (wErr) {
               console.error("[weather] Weather fetch failed:", wErr.message);
               await status.finish(`❌ **Weather unavailable:** ${wErr.message.slice(0, 200)}`);
+            }
+            return;
+          }
+          // ── News search routing ───────────────────────────────────────────
+          const newsMatch = aiRes.match(/\[NEWS_SEARCH\]([\s\S]*?)\[\/NEWS_SEARCH\]/i);
+          if (newsMatch) {
+            const query = newsMatch[1].trim();
+            addLog(`[news] News search: "${query}"`, "info");
+            try {
+              await status.update(HS.search());
+              if (!scraperSearchNews) throw new Error("News scraper not loaded");
+              const { formatted } = await scraperSearchNews(query);
+              try { await client2.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch {}
+              await client2.sendMessage(targetPeer, {
+                message: formatted,
+                parseMode: "markdown",
+                replyTo: message.id,
+              });
+              addLog(`[news] News sent for "${query}"`, "success");
+            } catch (nErr) {
+              console.error("[news] News fetch failed:", nErr.message);
+              await status.finish(`❌ **News unavailable:** ${nErr.message.slice(0, 200)}`);
+            }
+            return;
+          }
+          // ── Web search routing ────────────────────────────────────────────
+          const webSearchMatch = aiRes.match(/\[WEB_SEARCH\]([\s\S]*?)\[\/WEB_SEARCH\]/i);
+          if (webSearchMatch) {
+            const query = webSearchMatch[1].trim();
+            addLog(`[websearch] Web search: "${query}"`, "info");
+            try {
+              await status.update(HS.search());
+              if (!scraperSearchWeb) throw new Error("Web scraper not loaded");
+              const { results, formatted } = await scraperSearchWeb(query, 5);
+              // Feed results back to AI for a natural answer
+              const searchContext = results.map((r) => `**${r.title}**\n${r.snippet}`).join("\n\n");
+              const aiAnswer = await getAIResponse(
+                `Here are live web search results for "${query}":\n\n${searchContext}\n\nSummarize this into a clean, helpful answer for the user.`,
+                config,
+                chatIdStr,
+                senderId,
+                isNSFWActive
+              );
+              try { await client2.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch {}
+              if (aiAnswer) {
+                const fmtAnswer = formatAiMessage(aiAnswer);
+                await client2.sendMessage(targetPeer, {
+                  message: fmtAnswer.text,
+                  parseMode: fmtAnswer.parseMode,
+                  replyTo: message.id,
+                });
+              } else {
+                await client2.sendMessage(targetPeer, {
+                  message: formatted,
+                  parseMode: "markdown",
+                  replyTo: message.id,
+                });
+              }
+              addLog(`[websearch] Web search reply sent for "${query}"`, "success");
+            } catch (wsErr) {
+              console.error("[websearch] Web search failed:", wsErr.message);
+              await status.finish(`❌ **Web search failed:** ${wsErr.message.slice(0, 200)}`);
             }
             return;
           }
