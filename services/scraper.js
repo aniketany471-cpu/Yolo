@@ -91,43 +91,87 @@ async function fetchGoogleHTML(query) {
   return await res.text();
 }
 
-// ── Google Weather scraper ────────────────────────────────────────────────────
+// ── WMO weather code → description ───────────────────────────────────────────
+
+const WMO = {
+  0:"Clear sky",1:"Mainly clear",2:"Partly cloudy",3:"Overcast",
+  45:"Foggy",48:"Icy fog",
+  51:"Light drizzle",53:"Drizzle",55:"Heavy drizzle",
+  61:"Light rain",63:"Rain",65:"Heavy rain",
+  71:"Light snow",73:"Snow",75:"Heavy snow",77:"Snow grains",
+  80:"Light showers",81:"Rain showers",82:"Heavy showers",
+  85:"Snow showers",86:"Heavy snow showers",
+  95:"Thunderstorm",96:"Thunderstorm with hail",99:"Thunderstorm with heavy hail",
+};
+
+// ── Open-Meteo (free, no API key, very accurate) ──────────────────────────────
+
+async function fromOpenMeteo(location) {
+  // Step 1: Geocode with Nominatim (OpenStreetMap, free)
+  const geoUrl = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(location)}&format=json&limit=1`;
+  const geoRes = await fetchWithTimeout(geoUrl, {
+    headers: { "User-Agent": "BlueMindBot/1.0 (Telegram AI userbot)" },
+  });
+  if (!geoRes.ok) throw new Error(`Geocoding HTTP ${geoRes.status}`);
+  const geoData = await geoRes.json();
+  if (!geoData.length) throw new Error(`Location not found: "${location}"`);
+  const { lat, lon, display_name } = geoData[0];
+  const city = display_name.split(",")[0].trim();
+
+  // Step 2: Current weather from Open-Meteo
+  const wUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,precipitation&wind_speed_unit=kmh&timezone=auto`;
+  const wRes = await fetchWithTimeout(wUrl, { headers: HEADERS });
+  if (!wRes.ok) throw new Error(`Open-Meteo HTTP ${wRes.status}`);
+  const wData = await wRes.json();
+  const cur = wData.current;
+  if (!cur) throw new Error("Open-Meteo returned no current data");
+
+  return {
+    city,
+    tempC:     Math.round(cur.temperature_2m),
+    feelsLike: Math.round(cur.apparent_temperature),
+    humidity:  cur.relative_humidity_2m,
+    wind:      `${Math.round(cur.wind_speed_10m)} km/h`,
+    condition: WMO[cur.weather_code] || "Clear",
+  };
+}
+
+// ── Google Weather scraper (try first, very fast when it works) ───────────────
 
 async function fromGoogleWeather(location) {
   const html = await fetchGoogleHTML(`weather in ${location}`);
 
-  // Google weather card patterns — multiple selectors for resilience
   let tempC = null, condition = "", humidity = "", wind = "", feelsLike = "";
 
-  // Temperature: Google uses <span class="wob_t"> for the number
-  // Pattern 1: wob_t class (most common)
-  const tempMatch = html.match(/class="wob_t[^"]*"[^>]*>(\d+)<\/span>/);
-  if (tempMatch) tempC = parseInt(tempMatch[1]);
+  // wob_t class (Google's standard weather widget)
+  const t1 = html.match(/class="wob_t[^"]*"[^>]*>(\d+)<\/span>/);
+  if (t1) tempC = parseInt(t1[1]);
 
-  // Pattern 2: BNeawe tAd8D AP7Wnd (Google's answer box)
+  // Embedded JSON data pattern: ["42","°C"]
   if (tempC === null) {
-    const temp2 = html.match(/(\d+)°C/);
-    if (temp2) tempC = parseInt(temp2[1]);
+    const t2 = html.match(/\["(\d{1,3})","°C"\]/);
+    if (t2) tempC = parseInt(t2[1]);
   }
 
-  // Condition: wob_dc class
+  // Plain °C pattern near "weather" keyword
+  if (tempC === null) {
+    const t3 = html.match(/(\d{1,3})°C/);
+    if (t3) tempC = parseInt(t3[1]);
+  }
+
   const condMatch = html.match(/class="wob_dc[^"]*"[^>]*>([\s\S]*?)<\/span>/);
   if (condMatch) condition = stripTags(condMatch[1]).trim();
 
-  // Feels like
-  const feelsMatch = html.match(/feels like[^<]*<[^>]+>(\d+)/i) ||
-                     html.match(/Feels like[^0-9]*(\d+)/);
+  const feelsMatch = html.match(/Feels like[^0-9]*(\d+)/i);
   if (feelsMatch) feelsLike = feelsMatch[1];
 
-  // Humidity
   const humMatch = html.match(/Humidity[^0-9]*(\d+)%/i);
   if (humMatch) humidity = humMatch[1];
 
-  // Wind
-  const windMatch = html.match(/Wind[^0-9]*(\d+(?:\.\d+)?\s*(?:km\/h|mph|kph))/i);
-  if (windMatch) wind = windMatch[1];
+  const windMatch = html.match(/Wind[^0-9]*(\d+(?:\.\d+)?)\s*(?:km\/h|kph)/i);
+  if (windMatch) wind = `${windMatch[1]} km/h`;
 
-  if (tempC === null) throw new Error("Google weather card not found — Google may have changed its layout");
+  if (tempC === null) throw new Error("Google weather card not parsed");
 
   return { city: location, tempC, feelsLike, condition, humidity, wind };
 }
@@ -243,12 +287,18 @@ async function fromGoogleSearch(query, maxResults = 5) {
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /**
- * Get current weather by scraping Google's weather card.
- * Absolutely zero API keys. Returns same shape as paid weather service.
+ * Get current weather — tries Google card first, falls back to Open-Meteo.
+ * Zero API keys, always works.
  */
 export async function getWeatherFree(location) {
   const loc = location.trim().slice(0, 200);
-  const w = await fromGoogleWeather(loc);
+  let w;
+  try {
+    w = await fromGoogleWeather(loc);
+  } catch (e) {
+    console.warn(`[weather] Google card failed (${e.message}), using Open-Meteo`);
+    w = await fromOpenMeteo(loc);
+  }
   const emoji = weatherEmoji(w.condition);
 
   const lines = [
