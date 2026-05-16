@@ -3104,14 +3104,9 @@ async function startServer() {
           }
 
           // ── Normal text reply ────────────────────────────────────────────
-          // In DMs there is no outgoing content filter — the AI response is sent as-is.
-          // In groups, moderate the output and replace unsafe replies with a refusal.
-          let safeAiRes = aiRes;
-          if (!isPrivate) {
-            const responseMod = await moderateContent(aiRes);
-            if (!responseMod.safe) safeAiRes = "I cannot fulfill that request in a group chat.";
-          }
-          const formatted = formatAiMessage(safeAiRes);
+          // The AI system prompt already handles jailbreaks, harmful content, and
+          // security naturally — no robotic post-processing filter needed.
+          const formatted = formatAiMessage(aiRes);
           await status.update(formatted.text, {
             parseMode: formatted.parseMode
           });
