@@ -14,7 +14,15 @@ import sharp from "sharp";
 import fs from "fs-extra";
 import yts from "yt-search";
 import youtubedl from "youtube-dl-exec";
-import { generateImage as ziGenerateImage } from "./services/zimage.js";
+// Image service — loaded dynamically so a missing/broken module never crashes the bot
+let ziGenerateImage = null;
+try {
+  const _ziMod = await import("./services/zimage.js");
+  ziGenerateImage = _ziMod.generateImage;
+  console.log("[img] Image generation service loaded OK");
+} catch (_ziErr) {
+  console.warn("[img] Image service unavailable:", _ziErr.message);
+}
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 // ── Standalone yt-dlp binary (downloaded at startup, no Python needed) ───────
@@ -2722,6 +2730,7 @@ async function startServer() {
               await status.update("🎨 **Creating your image...**");
               await new Promise((r) => setTimeout(r, 800));
               await status.update("✨ **Rendering artwork...**");
+              if (!ziGenerateImage) throw new Error("Image service not loaded — check server logs");
               const { buffer, provider } = await ziGenerateImage(imgPrompt, config);
               await status.update("🖼 **Uploading result...**");
               const caption = `🎨 **Generated Image**\n\`${imgPrompt.slice(0, 120)}\``;
