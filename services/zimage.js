@@ -1,14 +1,13 @@
 /**
- * Modular Image Generation Service
- * Primary provider: Zimage Turbo
- * Fallback: Bluesminds DALL-E endpoint
- *
- * Add future providers here — they just need to return a Buffer.
+ * Zimage Turbo image generation service
+ * Endpoint: POST https://zimageturbo.ai/api/generate
+ * Auth:     Authorization: Bearer <ZIMAGE_API_KEY>
+ * Response: { code: 200, data: { task_id: "...", images: ["<url>"] } }
  */
 
-const PROVIDER_TIMEOUT_MS = 60_000;
+const GENERATE_URL = "https://zimageturbo.ai/api/generate";
+const PROVIDER_TIMEOUT_MS = 90_000;  // Zimage can take a while
 const DOWNLOAD_TIMEOUT_MS = 30_000;
-const MAX_RETRIES = 2;
 
 function sanitizePrompt(prompt) {
   return prompt
@@ -33,41 +32,23 @@ async function downloadImageBuffer(url) {
   return Buffer.from(await res.arrayBuffer());
 }
 
-function extractImageUrl(data) {
-  // Handles common API response shapes
-  return (
-    data?.url ||
-    data?.image_url ||
-    data?.image ||
-    data?.data?.[0]?.url ||
-    data?.data?.[0]?.b64_json && `data:image/png;base64,${data.data[0].b64_json}` ||
-    data?.output?.[0] ||
-    data?.images?.[0] ||
-    data?.result?.url ||
-    null
-  );
-}
-
 // ── Provider: Zimage Turbo ────────────────────────────────────────────────────
 
 async function zimageTurbo(prompt, options = {}) {
   const apiKey = process.env.ZIMAGE_API_KEY;
-  if (!apiKey) throw new Error("ZIMAGE_API_KEY is not set");
-
-  const baseUrl =
-    process.env.ZIMAGE_API_URL || "https://api.zimage.ai/v1/generate";
+  if (!apiKey) throw new Error("ZIMAGE_API_KEY not set in environment");
 
   const body = {
     prompt: sanitizePrompt(prompt),
     model: options.model || "turbo",
-    width: options.width || 1024,
-    height: options.height || 1024,
-    num_images: 1,
-    ...(options.extra || {}),
+    ...(options.width && { width: options.width }),
+    ...(options.height && { height: options.height }),
+    ...(options.aspect_ratio && { aspect_ratio: options.aspect_ratio }),
+    ...(options.negative_prompt && { negative_prompt: options.negative_prompt }),
   };
 
   const res = await fetchWithTimeout(
-    baseUrl,
+    GENERATE_URL,
     {
       method: "POST",
       headers: {
@@ -79,27 +60,27 @@ async function zimageTurbo(prompt, options = {}) {
     PROVIDER_TIMEOUT_MS
   );
 
-  if (!res.ok) {
-    const errText = await res.text().catch(() => "");
-    throw new Error(`Zimage API ${res.status}: ${errText.slice(0, 200)}`);
+  const data = await res.json();
+
+  if (!res.ok || data.code !== 200) {
+    throw new Error(
+      `Zimage API error ${res.status}: ${data.message || JSON.stringify(data).slice(0, 200)}`
+    );
   }
 
-  const data = await res.json();
-  const imageUrl = extractImageUrl(data);
-  if (!imageUrl) throw new Error("Zimage returned no image URL");
-
-  if (imageUrl.startsWith("data:")) {
-    const b64 = imageUrl.split(",")[1];
-    return Buffer.from(b64, "base64");
+  // Response: { code: 200, data: { task_id: "...", images: ["<url>"] } }
+  const imageUrl = data.data?.images?.[0];
+  if (!imageUrl) {
+    throw new Error(`Zimage returned no image URL. Response: ${JSON.stringify(data).slice(0, 300)}`);
   }
 
   return downloadImageBuffer(imageUrl);
 }
 
-// ── Provider: Bluesminds DALL-E fallback ─────────────────────────────────────
+// ── Provider: Bluesminds fallback ─────────────────────────────────────────────
 
 async function bluesmindsImage(prompt, apiKey) {
-  if (!apiKey) throw new Error("Bluesminds API key not set");
+  if (!apiKey) throw new Error("Bluesminds API key not provided");
 
   const res = await fetchWithTimeout(
     "https://api.bluesminds.com/v1/images/generations",
@@ -125,7 +106,7 @@ async function bluesmindsImage(prompt, apiKey) {
   }
 
   const data = await res.json();
-  const imageUrl = extractImageUrl(data);
+  const imageUrl = data?.data?.[0]?.url;
   if (!imageUrl) throw new Error("Bluesminds returned no image URL");
   return downloadImageBuffer(imageUrl);
 }
@@ -134,7 +115,8 @@ async function bluesmindsImage(prompt, apiKey) {
 
 /**
  * Generate an image for the given prompt.
- * Tries Zimage Turbo first; falls back to Bluesminds.
+ * Primary: Zimage Turbo (requires ZIMAGE_API_KEY env var)
+ * Fallback: Bluesminds DALL-E
  * Returns { buffer: Buffer, provider: string }
  */
 export async function generateImage(prompt, config = {}, options = {}) {
@@ -142,20 +124,19 @@ export async function generateImage(prompt, config = {}, options = {}) {
 
   // 1. Zimage Turbo (primary)
   if (process.env.ZIMAGE_API_KEY) {
-    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-      try {
-        const buffer = await zimageTurbo(prompt, options);
-        console.log(`[img] Zimage Turbo succeeded (attempt ${attempt})`);
-        return { buffer, provider: "zimage-turbo" };
-      } catch (e) {
-        console.warn(`[img] Zimage attempt ${attempt} failed: ${e.message}`);
-        errors.push(`zimage(${attempt}): ${e.message}`);
-        if (attempt < MAX_RETRIES) await new Promise((r) => setTimeout(r, 2000));
-      }
+    try {
+      const buffer = await zimageTurbo(prompt, options);
+      console.log(`[img] Zimage Turbo succeeded`);
+      return { buffer, provider: "zimage-turbo" };
+    } catch (e) {
+      console.warn(`[img] Zimage Turbo failed: ${e.message}`);
+      errors.push(`zimage: ${e.message}`);
     }
+  } else {
+    errors.push("zimage: ZIMAGE_API_KEY not set");
   }
 
-  // 2. Bluesminds DALL-E (fallback)
+  // 2. Bluesminds (fallback)
   const bmKey = (config.bluesmindsApiKey || "").trim();
   if (bmKey) {
     try {
@@ -166,9 +147,9 @@ export async function generateImage(prompt, config = {}, options = {}) {
       console.warn(`[img] Bluesminds fallback failed: ${e.message}`);
       errors.push(`bluesminds: ${e.message}`);
     }
+  } else {
+    errors.push("bluesminds: no API key in config");
   }
-
-  // 3. Future providers: add here (OpenAI, Stability, Replicate, HuggingFace)
 
   throw new Error(
     `All image providers failed:\n${errors.map((e, i) => `  ${i + 1}. ${e}`).join("\n")}`
