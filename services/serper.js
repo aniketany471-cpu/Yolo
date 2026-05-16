@@ -106,6 +106,18 @@ const INTENT_PATTERNS = [
   { intent: 'crypto',    patterns: [/\b(bitcoin|btc|ethereum|eth|crypto|coin|token|nft|blockchain|binance|solana|dogecoin|ripple|defi)\b/i] },
   { intent: 'finance',   patterns: [/\b(stock|share|nifty|sensex|nasdaq|dow jones|forex|dollar|rupee|euro|exchange rate|interest rate|market cap|ipo)\b/i] },
   { intent: 'celebrity', patterns: [/\b(who is|celebrity|actor|actress|singer|musician|born|age|net worth|biography|wiki|famous)\b/i] },
+  // Website / service legitimacy checks — "is sparify genuine?", "is this a scam?"
+  { intent: 'verify',    patterns: [
+    /\b(genuine|legit|legitimate|scam|fake|real|safe|trusted|reliable|fraud|phishing|authentic|sketchy|shady)\b/i,
+    /\b(is .{1,50}(safe|real|good|trusted|working|down|worth it|a scam|genuine|legit))\b/i,
+    /\b(reviews?|rating|trustworthy|worth it|recommend|complaints?)\b/i,
+  ]},
+  // General lookup — "what is X", any website/app/service/company query, URLs
+  { intent: 'lookup',    patterns: [
+    /\b(what is|what are|who made|who owns|tell me about|explain|define|meaning of|about)\b/i,
+    /\b(website|site|app|platform|service|company|brand|product|tool|software|startup)\b/i,
+    /https?:\/\/|www\.|\.com\b|\.io\b|\.net\b|\.org\b|\.in\b/i,
+  ]},
   { intent: 'general',   patterns: [/\b(today|latest|current|recent|now|live|real.?time|breaking|2024|2025|2026|election|launch|release|announce)\b/i] },
 ];
 
@@ -139,6 +151,12 @@ export function optimizeQuery(raw, corrected, intent) {
       break;
     case 'sports':
       if (!/\bscore|result|today|live\b/i.test(q)) q += ' latest score result';
+      break;
+    case 'verify':
+      if (!/\breviews?|legit|scam|safe|genuine\b/i.test(q)) q += ' reviews legit or scam';
+      break;
+    case 'lookup':
+      if (!/\bwhat is|about|review|info\b/i.test(q)) q += ' what is review';
       break;
   }
 

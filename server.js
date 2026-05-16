@@ -1252,7 +1252,7 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
       shouldSearch = needs;
     } else if (!shouldSearch) {
       // Fallback keyword check when serper module is unavailable
-      const fallbackKw = ["today", "latest", "current", "news", "score", "price", "who is", "what happened", "election", "match", "weather", "temp", "bitcoin", "crypto", "stock"];
+      const fallbackKw = ["today", "latest", "current", "news", "score", "price", "who is", "what happened", "election", "match", "weather", "temp", "bitcoin", "crypto", "stock", "genuine", "legit", "scam", "fake", "safe", "real", "trusted", "reviews", "website", "site", "app", "platform", "what is", "who made", "tell me about", "is it", ".com", ".io", ".net"];
       shouldSearch = fallbackKw.some((kw) => prompt.toLowerCase().includes(kw));
     }
     if (shouldSearch) {
