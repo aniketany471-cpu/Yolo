@@ -1,18 +1,12 @@
 import React, { useState } from 'react';
 import { 
   Bot, 
-  MessageSquare, 
-  Users, 
   Settings, 
   LayoutDashboard,
   Menu,
-  X,
-  Play,
-  Square,
   FileText,
   Music,
   Sparkles,
-  Shield,
   ShieldAlert
 } from 'lucide-react';
 import { useAppContext } from '../../context/AppContext';
@@ -20,18 +14,17 @@ import { cn } from '../../lib/utils';
 
 interface LayoutProps {
   children: React.ReactNode;
-  activeTab: 'dashboard' | 'messages' | 'targets' | 'settings' | 'pdf' | 'music' | 'ai' | 'nsfw';
-  setActiveTab: (tab: 'dashboard' | 'messages' | 'targets' | 'settings' | 'pdf' | 'music' | 'ai' | 'nsfw') => void;
+  activeTab: 'dashboard' | 'settings' | 'pdf' | 'music' | 'ai' | 'nsfw';
+  setActiveTab: (tab: 'dashboard' | 'settings' | 'pdf' | 'music' | 'ai' | 'nsfw') => void;
 }
 
 export function Layout({ children, activeTab, setActiveTab }: LayoutProps) {
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const { isRunning, toggleBot } = useAppContext();
+  const { diagnostics } = useAppContext();
+  const isConnected = diagnostics.isListenerActive;
 
   const navItems = [
     { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
-    { id: 'messages', label: 'Messages', icon: MessageSquare },
-    { id: 'targets', label: 'Targets', icon: Users },
     { id: 'pdf', label: 'PDF Converter', icon: FileText },
     { id: 'music', label: 'Music', icon: Music },
     { id: 'ai', label: 'AI Settings', icon: Sparkles },
@@ -41,7 +34,6 @@ export function Layout({ children, activeTab, setActiveTab }: LayoutProps) {
 
   return (
     <div className="flex h-screen bg-slate-950 text-slate-200 overflow-hidden font-sans">
-      {/* Mobile sidebar backdrop */}
       {sidebarOpen && (
         <div 
           className="fixed inset-0 z-20 bg-black/50 lg:hidden backdrop-blur-sm"
@@ -83,27 +75,20 @@ export function Layout({ children, activeTab, setActiveTab }: LayoutProps) {
             );
           })}
         </nav>
-        
+
         <div className="p-4 border-t border-slate-800 shrink-0">
-          <button
-            onClick={toggleBot}
-            className={cn(
-              "w-full flex items-center justify-center gap-2 py-2.5 rounded-lg font-medium transition-all shadow-lg text-sm",
-              isRunning 
-                ? "bg-red-500/10 text-red-500 hover:bg-red-500/20 border border-red-500/20" 
-                : "bg-blue-600 hover:bg-blue-500 text-white shadow-blue-500/20"
-            )}
-          >
-            {isRunning ? (
-              <>
-                <Square className="w-4 h-4 fill-current" /> Stop Bot
-              </>
-            ) : (
-              <>
-                <Play className="w-4 h-4 fill-current" /> Start Sending
-              </>
-            )}
-          </button>
+          <div className={cn(
+            "w-full flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-medium border",
+            isConnected
+              ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
+              : "bg-slate-800/50 text-slate-400 border-slate-700"
+          )}>
+            <span className="relative flex h-2 w-2">
+              {isConnected && <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />}
+              <span className={cn("relative inline-flex rounded-full h-2 w-2", isConnected ? "bg-emerald-500" : "bg-slate-500")} />
+            </span>
+            {isConnected ? "Bot Connected" : "Bot Offline"}
+          </div>
         </div>
       </div>
 
@@ -118,24 +103,17 @@ export function Layout({ children, activeTab, setActiveTab }: LayoutProps) {
               <Menu className="w-6 h-6" />
             </button>
             <h1 className="text-xl font-semibold capitalize bg-clip-text text-transparent bg-gradient-to-r from-white to-slate-400">
-              {activeTab}
+              {activeTab === 'ai' ? 'AI Settings' : activeTab === 'nsfw' ? 'Mature Mode' : activeTab === 'pdf' ? 'PDF Converter' : activeTab}
             </h1>
           </div>
-          <div className="flex items-center gap-3">
-            <div className="flex items-center gap-2 text-sm">
-              <span className="relative flex h-2.5 w-2.5">
-                {isRunning && (
-                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                )}
-                <span className={cn(
-                  "relative inline-flex rounded-full h-2.5 w-2.5",
-                  isRunning ? "bg-emerald-500" : "bg-slate-500"
-                )}></span>
-              </span>
-              <span className={isRunning ? "text-emerald-400 font-medium" : "text-slate-400"}>
-                {isRunning ? "Running" : "Stopped"}
-              </span>
-            </div>
+          <div className="flex items-center gap-2 text-sm">
+            <span className="relative flex h-2.5 w-2.5">
+              {isConnected && <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />}
+              <span className={cn("relative inline-flex rounded-full h-2.5 w-2.5", isConnected ? "bg-emerald-500" : "bg-slate-500")} />
+            </span>
+            <span className={isConnected ? "text-emerald-400 font-medium" : "text-slate-400"}>
+              {isConnected ? "Connected" : "Offline"}
+            </span>
           </div>
         </header>
         
