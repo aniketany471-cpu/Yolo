@@ -1572,7 +1572,7 @@ async function handleSummarize(client, message, config, status) {
   });
   const text = repl[0]?.message;
   if (!text) return status.fail("No text found to summarize.");
-  await status.update("\u{1F4DD} **Summarizing...**");
+  await status.update(HS.summarize());
   const aiRes = await getAIResponse(
     `Summarize this text concisely: ${text}`,
     config,
@@ -1598,7 +1598,7 @@ async function handleTranslate(client, message, config, status, args) {
   const text = repl[0]?.message;
   if (!text) return status.fail("No text found to translate.");
   const targetLang = args || "English";
-  await status.update(`\u{1F310} **Translating to ${targetLang}...**`);
+  await status.update(HS.translate());
   const aiRes = await getAIResponse(
     `Translate this text to ${targetLang}. Only return the translation: ${text}`,
     config,
@@ -1615,7 +1615,7 @@ ${aiRes}`);
 }
 async function handleGif(client, message, config, status, query) {
   if (!query) return status.fail("Usage: /gif <search term>");
-  await status.update(`\u{1F50D} **Searching for GIF: ${query}...**`);
+  await status.update(HS.search());
   await status.fail(
     "GIF search API not configured. Please use /img for custom generations."
   );
@@ -1646,6 +1646,34 @@ async function handleSudoManagement(client, message, myId, cmd, targetId) {
     });
   }
 }
+// ── Human-like status phrase pools ────────────────────────────────────────────
+function _pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+const HS = {
+  think:        () => _pick(["Hmm give me a sec...", "One sec, working on it...", "Wait, I'm looking into it...", "Alright, doing it now...", "Lemme check that properly...", "Give me a moment...", "Working on the best result...", "Yeah hold on...", "On it..."]),
+  think2:       () => _pick(["Still on it...", "Okay this part is taking a sec...", "Almost done...", "Nah wait, still going...", "Yeah this should work..."]),
+  search:       () => _pick(["Looking through sources...", "Trying to verify this...", "Reading about it...", "Checking that...", "Got something, hang on..."]),
+  download:     () => _pick(["Getting the file...", "This one's a bit heavy, hold on...", "Almost downloaded...", "Pulling it down now..."]),
+  upload:       () => _pick(["Uploading it now...", "Sending it over...", "Almost there..."]),
+  image:        () => _pick(["Trying to make this look good...", "Okay this one's cooking...", "Rendering it now...", "Working on it..."]),
+  imageRender:  () => _pick(["Finishing touches...", "Almost ready...", "Yeah this should look nice..."]),
+  music:        () => _pick(["Looking for that track...", "Found it, grabbing it now..."]),
+  musicDl:      () => _pick(["Downloading the audio...", "This one's a bit heavy, bear with me..."]),
+  musicProcess: () => _pick(["Almost done with it...", "Got it, sending now..."]),
+  queue:        () => _pick(["Queuing that up...", "Hold on, one task ahead...", "Almost your turn..."]),
+  pdf:          () => _pick(["On it, give me a sec...", "Reading the content...", "Working on the PDF..."]),
+  pdfConvert:   () => _pick(["Converting that for you...", "Putting it together..."]),
+  pdfUpload:    () => _pick(["Uploading it now...", "Done, sending it over..."]),
+  translate:    () => _pick(["On it...", "Translating that now...", "Give me a sec with this..."]),
+  summarize:    () => _pick(["Reading through it...", "Give me a sec...", "Okay, going through this..."]),
+  weather:      () => _pick(["Checking the weather for you...", "Looking that up...", "One sec on that..."]),
+  models:       () => _pick(["Pulling the list...", "One sec...", "Grabbing that for you..."]),
+  export:       () => _pick(["Fetching those messages...", "Give me a sec...", "On it..."]),
+  exportBuild:  () => _pick(["Building the PDF...", "Almost done with the export...", "Putting it all together..."]),
+  sticker:      () => _pick(["Making the sticker...", "One sec on this...", "On it..."]),
+  stickerSend:  () => _pick(["Sending it over...", "Almost there..."]),
+};
+// ─────────────────────────────────────────────────────────────────────────────
+
 class SmartStatus {
   constructor(client, chatId, autoDelete = true, replyTo = null) {
     this.messageId = null;
@@ -2476,7 +2504,7 @@ async function startServer() {
       return;
     }
     const effectiveStatus = status || new SmartStatus(client, message.chatId);
-    if (!status && client) await effectiveStatus.update(`\u{1F50D} Searching...`);
+    if (!status && client) await effectiveStatus.update(HS.music());
     try {
       const searchString = query.toLowerCase().includes("audio") || query.toLowerCase().includes("lyric") ? query : query + " audio";
       const r = await yts(searchString);
@@ -2487,15 +2515,15 @@ async function startServer() {
         await effectiveStatus.fail("No results found.");
         return;
       }
-      await effectiveStatus.update(`\u23F3 Waiting in queue...`);
+      await effectiveStatus.update(HS.queue());
       await taskQueue.add(async () => {
-        await effectiveStatus.update(`\u23F3 Downloading...`);
+        await effectiveStatus.update(HS.musicDl());
         const id = Math.random().toString(36).substring(2);
         const filename = `music_${id}.mp3`;
         const filepath = path.join(musicDir, filename);
         try {
           await downloadYoutube(video.url, filepath);
-          await effectiveStatus.update(`\u2699\uFE0F Processing...`);
+          await effectiveStatus.update(HS.musicProcess());
           await client?.sendMessage(message.chatId, {
             message: `\u{1F3B6} **${video.title}**
 \u{1F464} ${video.author.name}
@@ -2520,7 +2548,7 @@ async function startServer() {
   async function handleStickerCommand(client2, message, status) {
     if (!message.replyToMsgId)
       return status.fail("Reply to a message with /stcr");
-    await status.update(`\u23F3 Preparing Quotly sticker...`);
+    await status.update(HS.sticker());
     try {
       const repl = await client2.getMessages(message.chatId, {
         ids: [message.replyToMsgId]
@@ -2613,7 +2641,7 @@ async function startServer() {
       const stcrId = Math.random().toString(36).substring(2);
       const filepath = path.join(exportsDir, `quotly_${stcrId}.webp`);
       await fs.writeFile(filepath, stickerBuffer);
-      await status.update(`\u{1F4E4} Sending Quotly...`);
+      await status.update(HS.stickerSend());
       await client2.sendMessage(message.chatId, {
         file: filepath,
         replyTo: message.id
@@ -2629,7 +2657,7 @@ async function startServer() {
   async function handlePdfCommand(client2, message, status) {
     if (!message.replyToMsgId)
       return status.fail("Reply to a message with /pdf");
-    await status.update(`\u23F3 Processing content...`);
+    await status.update(HS.pdf());
     try {
       const repl = await client2.getMessages(message.chatId, {
         ids: [message.replyToMsgId]
@@ -2643,7 +2671,7 @@ async function startServer() {
       const stream = fs.createWriteStream(filepath);
       doc.pipe(stream);
       if (target.media && target.media.photo) {
-        await status.update(`\u{1F39E}\uFE0F Converting image to PDF...`);
+        await status.update(HS.pdfConvert());
         const buf = await client2.downloadMedia(target.media, {});
         if (buf) {
           const img = await sharp(buf).toBuffer();
@@ -2660,7 +2688,7 @@ async function startServer() {
       await new Promise(
         (resolve) => stream.on("finish", () => resolve())
       );
-      await status.update(`\u{1F4E4} Uploading PDF...`);
+      await status.update(HS.pdfUpload());
       await client2.sendMessage(message.chatId, {
         file: filepath,
         replyTo: message.id
@@ -2828,7 +2856,7 @@ async function startServer() {
           } catch (e) {
           }
         }
-        await status.update("\u{1F50D} **Searching...**");
+        await status.update(HS.think());
         const aiRes = await getAIResponse(
           text,
           config,
@@ -2848,7 +2876,7 @@ async function startServer() {
             // AI refused or missed — use the user's original message as the prompt directly
             addLog(`[img] DM fallback: AI did not produce tag, forcing image from: "${text.slice(0, 60)}"`, "warn");
             try {
-              await status.update("🎨 **Creating your image...**");
+              await status.update(HS.image());
               if (!ziGenerateImage) throw new Error("Image service not loaded");
               const { buffer, provider } = await ziGenerateImage(text, config);
               const tmpImgPath = path.join(tempDir, `img_${Date.now()}.jpg`);
@@ -2915,12 +2943,12 @@ async function startServer() {
             // ─────────────────────────────────────────────────────────────
 
             try {
-              await status.update("🎨 **Creating your image...**");
+              await status.update(HS.image());
               await new Promise((r) => setTimeout(r, 800));
-              await status.update("✨ **Rendering artwork...**");
+              await status.update(HS.imageRender());
               if (!ziGenerateImage) throw new Error("Image service not loaded — check server logs");
               const { buffer, provider } = await ziGenerateImage(imgPrompt, config);
-              await status.update("🖼 **Uploading result...**");
+              await status.update(HS.upload());
               const caption = `🎨 **Generated Image**\n\`${imgPrompt.slice(0, 120)}\`\n\n_${usedCount + 1}/${IMAGE_LIMIT} free generations used_`;
               const tmpImgPath = path.join(tempDir, `img_${Date.now()}.jpg`);
               await fs.writeFile(tmpImgPath, buffer);
@@ -2953,7 +2981,7 @@ async function startServer() {
             const location = weatherMatch[1].trim();
             addLog(`[weather] Weather request for: "${location}"`, "info");
             try {
-              await status.update("🌍 **Fetching weather data...**");
+              await status.update(HS.weather());
               if (!ziGetWeather) throw new Error("Weather service not loaded — set OPENWEATHER_API_KEY or WEATHERAPI_KEY env vars");
               const { message: weatherMsg, source } = await ziGetWeather(location);
               try { await client2.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch {}
@@ -3301,7 +3329,7 @@ _Visit the dashboard for advanced configuration._`;
                   const promptText = (repl[0]?.message || "").trim();
                   if (!promptText)
                     return status.fail("No text content in replied message.");
-                  await status.update(`\u{1F9E0} Thinking...`);
+                  await status.update(HS.think());
                   await taskQueue.add(async () => {
                     const aiRes = await getAIResponse(
                       promptText,
@@ -3495,7 +3523,7 @@ _Visit the dashboard for advanced configuration._`;
               "models",
               textRaw,
               async (status) => {
-                await status.update("\u{1F4E1} **Fetching models...**");
+                await status.update(HS.models());
                 try {
                   const response = await fetch(
                     "https://api.bluesminds.com/v1/models",
@@ -3532,15 +3560,15 @@ ${mStr}`);
               async (status) => {
                 const parts = text.split(" ");
                 const limit = parseInt(parts[1]) || 50;
-                await status.update(`\u23F3 Exporting ${limit} messages...`);
+                await status.update(HS.export());
                 try {
                   const history = await client?.getMessages(message.chatId, {
                     limit
                   });
                   if (history && history.length > 0) {
-                    await status.update(`\u23F3 Waiting in queue...`);
+                    await status.update(HS.queue());
                     await taskQueue.add(async () => {
-                      await status.update(`\u2699\uFE0F Generating PDF...`);
+                      await status.update(HS.exportBuild());
                       const doc = new PDFDocument();
                       const id = Math.random().toString(36).substring(2);
                       const filename = `chat_export_${id}.pdf`;
@@ -3578,7 +3606,7 @@ ${mStr}`);
                         "chat-export",
                         "success"
                       );
-                      await status.update(`\u{1F4E4} Uploading PDF...`);
+                      await status.update(HS.pdfUpload());
                       await client?.sendMessage(message.chatId, {
                         message: "\u2705 Chat export complete!",
                         file: filepath
