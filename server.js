@@ -1307,12 +1307,14 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
   }
 
   // ── General web search (DuckDuckGo, zero API key) ────────────────────────
-  const liveKeywords = ["today","latest","current","news","score","price","who is","what happened","election","weather","match","rate","live","right now","stock","crypto","bitcoin","gold","result","standings","vs","won","lost"];
-  const shouldSearch = isDeep || liveKeywords.some((kw) => lp.includes(kw));
+  // Trigger Google search for any factual question or live-data query
+  const isQuestion = /^(who|what|where|when|why|how|is|are|was|were|will|would|can|could|does|did|should|which|whose|whom)\b/i.test(prompt.trim());
+  const liveKeywords = ["today","latest","current","news","score","price","who is","what is","where is","how far","how much","how many","is it","are they","what happened","election","weather","match","rate","live","right now","stock","crypto","bitcoin","gold","result","standings","vs","won","lost","tell me about","explain","define","meaning of","difference between","best place","good place","safe to","trusted","reliable","population","capital of","president","prime minister","ceo","founded","distance","speed","height","weight"];
+  const shouldSearch = isDeep || isQuestion || liveKeywords.some((kw) => lp.includes(kw));
   if (shouldSearch) {
     const results = await performWebSearch(prompt, config, isDeep);
     if (results) {
-      searchContext += `[Live Web Results: ${results}] Use this to give an up-to-date accurate answer.`;
+      searchContext += `[Google Search Results: ${results}] Use this to give an accurate, up-to-date answer.`;
     }
   }
   let modelNudge = "";
