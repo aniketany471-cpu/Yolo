@@ -184,7 +184,7 @@ db.exec(`
     autoReplyBlacklist TEXT DEFAULT '',
     nsfwEnabled INTEGER DEFAULT 0,
     nsfwPersonality TEXT DEFAULT 'You are a flirty, mature, and consenting adult friend.',
-    searchEnabled INTEGER DEFAULT 0,
+    searchEnabled INTEGER DEFAULT 1,
     searchProvider TEXT DEFAULT 'serper',
     searchApiKey TEXT DEFAULT '',
     serperKey TEXT DEFAULT '',
@@ -390,7 +390,11 @@ try {
 } catch (e) {
 }
 try {
-  db.exec("ALTER TABLE config ADD COLUMN searchEnabled INTEGER DEFAULT 0;");
+  db.exec("ALTER TABLE config ADD COLUMN searchEnabled INTEGER DEFAULT 1;");
+} catch (e) {
+}
+try {
+  db.exec("UPDATE config SET searchEnabled = 1;");
 } catch (e) {
 }
 try {
@@ -490,7 +494,7 @@ db.exec(`
     autoReplyBlacklist = COALESCE(autoReplyBlacklist, ''),
     nsfwEnabled = COALESCE(nsfwEnabled, 0),
     nsfwPersonality = COALESCE(nsfwPersonality, 'You are a flirty, mature, and consenting adult friend.'),
-    searchEnabled = COALESCE(searchEnabled, 0),
+    searchEnabled = COALESCE(searchEnabled, 1),
     searchProvider = COALESCE(searchProvider, 'serper'),
     serperKey = COALESCE(serperKey, ''),
     searchApiKey = COALESCE(searchApiKey, ''),
