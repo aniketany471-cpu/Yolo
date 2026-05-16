@@ -1283,40 +1283,54 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
   let searchContext = "";
   const lp = prompt.toLowerCase();
 
-  // ── Live weather pre-fetch (wttr.in, zero API key) ───────────────────────
-  if (/weather|temperature|forecast|humidity|raining|snowing|sunny|degrees|celsius|fahrenheit|wind speed|will it rain|is it hot|is it cold/i.test(prompt) && scraperGetWeather) {
+  // ── Decide what to fetch (one pass, no sequential awaits) ────────────────
+  const isWeatherQ = /\b(weather|temperature|forecast|humidity|raining|snowing|sunny|degrees|celsius|fahrenheit|will it rain|is it hot|is it cold)\b/i.test(prompt);
+  const isNewsQ    = /\b(news|headline|latest|what happened|breaking|current event|update|this week|today in|happening now)\b/i.test(prompt);
+  const isQuestion = /^(who|what|where|when|why|how|is|are|was|were|will|would|can|could|does|did|should|which)\b/i.test(prompt.trim());
+  const liveKeywords = ["today","latest","current","news","score","price","who is","what is","where is","how far","how much","how many","what happened","election","weather","match","rate","live","right now","stock","crypto","bitcoin","gold","result","prime minister","president","capital","population","distance","height","founded","trusted","safe to"];
+  const shouldSearch = isDeep || isQuestion || liveKeywords.some((kw) => lp.includes(kw));
+
+  // ── Fire all needed fetches IN PARALLEL — never sequential ───────────────
+  const tasks = [];
+
+  // Weather: only when a location is detectable
+  if (isWeatherQ && scraperGetWeather) {
     const locMatch = prompt.match(/(?:in|at|for|near|of)\s+([A-Za-z][A-Za-z\s,]{2,40})(?:[?!.,]|$)/i);
     const loc = locMatch?.[1]?.trim();
     if (loc) {
-      try {
-        const { message: wMsg } = await scraperGetWeather(loc);
-        searchContext += `[Live Weather — ${loc}:\n${wMsg}]\n\n`;
-      } catch (e) { console.warn(`[ctx] Weather pre-fetch failed: ${e.message}`); }
+      tasks.push(
+        scraperGetWeather(loc)
+          .then(({ message: wMsg }) => { searchContext += `[Live Weather — ${loc}:\n${wMsg}]\n\n`; })
+          .catch((e) => console.warn(`[ctx] Weather pre-fetch: ${e.message}`))
+      );
     }
   }
 
-  // ── Live news pre-fetch (Google News RSS, zero API key) ──────────────────
-  if (/\b(news|headline|latest|what happened|breaking|current event|update|recently|this week|today in|happening now)\b/i.test(prompt) && scraperSearchNews) {
-    try {
-      const { articles } = await scraperSearchNews(prompt.slice(0, 120));
-      if (articles.length > 0) {
-        const newsSnip = articles.slice(0, 5).map((a) => `- ${a.title}${a.snippet ? ": " + a.snippet.slice(0, 100) : ""}`).join("\n");
-        searchContext += `[Live News Results:\n${newsSnip}]\n\n`;
-      }
-    } catch (e) { console.warn(`[ctx] News pre-fetch failed: ${e.message}`); }
+  // News: only for news-type queries
+  if (isNewsQ && scraperSearchNews) {
+    tasks.push(
+      scraperSearchNews(prompt.slice(0, 120))
+        .then(({ articles }) => {
+          if (articles.length > 0) {
+            const snip = articles.slice(0, 5).map((a) => `- ${a.title}${a.snippet ? ": " + a.snippet.slice(0, 100) : ""}`).join("\n");
+            searchContext += `[Live News:\n${snip}]\n\n`;
+          }
+        })
+        .catch((e) => console.warn(`[ctx] News pre-fetch: ${e.message}`))
+    );
   }
 
-  // ── General web search (DuckDuckGo, zero API key) ────────────────────────
-  // Trigger Google search for any factual question or live-data query
-  const isQuestion = /^(who|what|where|when|why|how|is|are|was|were|will|would|can|could|does|did|should|which|whose|whom)\b/i.test(prompt.trim());
-  const liveKeywords = ["today","latest","current","news","score","price","who is","what is","where is","how far","how much","how many","is it","are they","what happened","election","weather","match","rate","live","right now","stock","crypto","bitcoin","gold","result","standings","vs","won","lost","tell me about","explain","define","meaning of","difference between","best place","good place","safe to","trusted","reliable","population","capital of","president","prime minister","ceo","founded","distance","speed","height","weight"];
-  const shouldSearch = isDeep || isQuestion || liveKeywords.some((kw) => lp.includes(kw));
-  if (shouldSearch) {
-    const results = await performWebSearch(prompt, config, isDeep);
-    if (results) {
-      searchContext += `[Google Search Results: ${results}] Use this to give an accurate, up-to-date answer.`;
-    }
+  // Web search: for factual questions / live data
+  if (shouldSearch && !isWeatherQ) {
+    tasks.push(
+      performWebSearch(prompt, config, isDeep)
+        .then((results) => { if (results) searchContext += `[Google Results: ${results}] Use this for an accurate up-to-date answer.`; })
+        .catch((e) => console.warn(`[ctx] Web search: ${e.message}`))
+    );
   }
+
+  // Wait for all in parallel — max 6 s each, bot never hangs
+  if (tasks.length) await Promise.allSettled(tasks);
   let modelNudge = "";
   if (config.activeModel?.includes("gpt-4")) {
     modelNudge = "\nYou are running on a high-intelligence GPT-4 class model. Provide extremely deep, nuanced, and analytically sound reasoning.";
