@@ -1258,7 +1258,43 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
     if (shouldSearch) {
       const results = await performWebSearch(prompt, config, isDeep);
       if (results) {
-        searchContext = `[Live Web Search Results — real-time data fetched now:\n${results}]\n\nUse this live information to answer accurately. Do NOT say "as of my training" — this is current data.`;
+        searchContext = `[LIVE SEARCH DATA — fetched right now]\n${results}\n[END SEARCH DATA]
+
+SEARCH RESPONSE RULES — follow exactly:
+1. Use this live data to answer. Never say "as of my training" or "I don't have real-time access".
+2. Structure your reply cleanly using Telegram markdown (**bold**, bullet points). No raw JSON, no source URLs, no data dumps.
+3. Use relevant emojis as visual anchors (🌡 for temperature, 📰 for news, 💹 for finance, ⚽ for sports, etc.).
+4. Format like a premium card — lead with a bold header, then key facts in a clean layout, end with a short natural sentence.
+5. Keep it tight — no walls of text. Every line must earn its place.
+
+WEATHER FORMAT EXAMPLE:
+🌤 **Weather — [City]**
+📍 [Region] · Live
+
+🌡 **Now:** X°C (Y°F) · [Condition]
+**Today:** ▲ High: X°C  ▼ Low: X°C
+
+**Upcoming**
+· [Day]: [Condition] — X°C / X°C
+· [Day]: [Condition] — X°C / X°C
+
+[One natural closing line about conditions]
+
+NEWS FORMAT EXAMPLE:
+📰 **[Topic] — Latest**
+· **[Headline]** — [one-line summary]
+· **[Headline]** — [one-line summary]
+· **[Headline]** — [one-line summary]
+
+CRYPTO/FINANCE FORMAT EXAMPLE:
+📊 **[Asset name]**
+💵 **Price:** $X · [+/-X% today]
+· 24h High: $X  |  Low: $X
+· Market Cap: $X
+
+GENERAL FORMAT:
+🔍 **[Topic]**
+[Key facts structured as short bullets or a clean short paragraph]`;
       }
     }
   }
