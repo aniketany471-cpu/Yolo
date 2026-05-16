@@ -17,7 +17,18 @@ import youtubedl from "youtube-dl-exec";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 // ── Standalone yt-dlp binary (downloaded at startup, no Python needed) ───────
-const YTDLP_BIN = path.join(__dirname, "yt-dlp");
+// Prefer /usr/local/bin/yt-dlp (installed by Railway build command) over app-dir copy
+  const YTDLP_BIN = (() => {
+    const candidates = [
+      "/usr/local/bin/yt-dlp",
+      "/usr/bin/yt-dlp",
+      path.join(__dirname, "yt-dlp"),
+    ];
+    for (const p of candidates) {
+      try { if (fs.existsSync(p)) return p; } catch {}
+    }
+    return path.join(__dirname, "yt-dlp"); // fallback (will be downloaded at startup)
+  })();
 function buildYtdlpArgs(url, opts) {
   const args = [];
   if (opts.extractAudio) args.push("--extract-audio");
@@ -2117,24 +2128,26 @@ async function startServer() {
   app.use("/api/*", (req, res) => {
     res.status(404).json({ error: `API route ${req.originalUrl} not found` });
   });
-  if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa"
-    });
-    app.use(vite.middlewares);
-  } else {
+  // Always serve static files in production; Vite dev server only used locally without a build
     const distPath = path.join(__dirname, "dist");
-    if (!fs.existsSync(path.join(distPath, "index.html"))) {
-      console.log("dist/ not found — building frontend now...");
-      execSync("npm run build", { cwd: __dirname, stdio: "inherit" });
-      console.log("Frontend build complete.");
+    const distExists = fs.existsSync(path.join(distPath, "index.html"));
+    if (process.env.NODE_ENV !== "production" && !distExists) {
+      // Local dev without a build — start Vite HMR dev server
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: "spa"
+      });
+      app.use(vite.middlewares);
+    } else {
+      // Production (Railway) — always serve the pre-built frontend
+      if (!distExists) {
+        console.warn("[WARN] dist/index.html not found. Run `npm run build` to generate it.");
+      }
+      app.use(express.static(distPath));
+      app.get("*", (req, res) => {
+        res.sendFile(path.join(distPath, "index.html"));
+      });
     }
-    app.use(express.static(distPath));
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
-    });
-  }
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
     console.log(`AI Configuration Check:`);
