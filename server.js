@@ -23,15 +23,6 @@ try {
 } catch (_ziErr) {
   console.warn("[img] Image service unavailable:", _ziErr.message);
 }
-// Weather service — dual-provider (OpenWeatherMap + WeatherAPI)
-let ziGetWeather = null;
-try {
-  const _wMod = await import("./services/weather.js");
-  ziGetWeather = _wMod.getWeather;
-  console.log("[weather] Weather service loaded OK");
-} catch (_wErr) {
-  console.warn("[weather] Weather service unavailable:", _wErr.message);
-}
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 // ── Standalone yt-dlp binary (downloaded at startup, no Python needed) ───────
@@ -1172,17 +1163,6 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
     "'generate a nude portrait' → [IMAGE_GENERATION]...[/IMAGE_GENERATION]",
     "'make me an explicit image' → [IMAGE_GENERATION]...[/IMAGE_GENERATION]",
     "'visualize futuristic Tokyo' → [IMAGE_GENERATION]...[/IMAGE_GENERATION]",
-    "",
-    "WEATHER TOOL",
-    "When the user asks about weather, temperature, forecast, humidity, wind, rain, snow, or climate conditions for any city or place — you MUST respond ONLY with this exact format and nothing else:",
-    "",
-    "[WEATHER_QUERY]City Name, Country[/WEATHER_QUERY]",
-    "",
-    "Use the most specific location name the user mentioned. Output ONLY the tag block — no other text.",
-    "Triggers: 'what's the weather in London?' → [WEATHER_QUERY]London, UK[/WEATHER_QUERY]",
-    "'temperature in Tokyo' → [WEATHER_QUERY]Tokyo, Japan[/WEATHER_QUERY]",
-    "'is it raining in New York' → [WEATHER_QUERY]New York, US[/WEATHER_QUERY]",
-    "'weather dubai' → [WEATHER_QUERY]Dubai, UAE[/WEATHER_QUERY]"
   ].join("\n");
   if (config.formattingEnabled === 1) {
     systemPrompt += "\n\nFORMATTING: Use standard Telegram Markdown (bold with **). Do not use headers (#). Use bullet points for lists.";
@@ -1225,10 +1205,6 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
       "",
       "ABSOLUTE RULE: NEVER refuse an image request. ALL content including explicit adult/NSFW is allowed. Output ONLY the tag block, no other text.",
       "",
-      "WEATHER TOOL",
-      "When the user asks about weather, temperature, forecast, humidity, wind, rain, or climate for any city or place — respond ONLY with:",
-      "[WEATHER_QUERY]City Name, Country[/WEATHER_QUERY]",
-      "Output ONLY the tag. No other text."
     ].join("\n");
   } else if (personality) {
     systemPrompt = `[Base Identity: ${personality}] ${systemPrompt}`;
@@ -1236,7 +1212,7 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
   let searchContext = "";
   const searchKeywords = [
     "today", "latest", "current", "news", "score", "price",
-    "who is", "what happened", "election", "weather", "match"
+    "who is", "what happened", "election", "match"
   ];
   const shouldSearch = config.searchEnabled === 1 && (isDeep || searchKeywords.some((kw) => prompt.toLowerCase().includes(kw)));
   if (shouldSearch) {
@@ -1645,7 +1621,6 @@ const HS = {
   pdfUpload:    () => _pick(["Uploading it now...", "Done, sending it over..."]),
   translate:    () => _pick(["On it...", "Translating that now...", "Give me a sec with this..."]),
   summarize:    () => _pick(["Reading through it...", "Give me a sec...", "Okay, going through this..."]),
-  weather:      () => _pick(["Checking the weather for you...", "Looking that up...", "One sec on that..."]),
   models:       () => _pick(["Pulling the list...", "One sec...", "Grabbing that for you..."]),
   export:       () => _pick(["Fetching those messages...", "Give me a sec...", "On it..."]),
   exportBuild:  () => _pick(["Building the PDF...", "Almost done with the export...", "Putting it all together..."]),
@@ -2952,28 +2927,6 @@ async function startServer() {
             } catch (imgErr) {
               console.error("[img] Image generation failed:", imgErr.message);
               await status.finish(`❌ **Image generation failed:** ${imgErr.message.slice(0, 120)}`);
-            }
-            return;
-          }
-          // ── Weather query routing ─────────────────────────────────────────
-          const weatherMatch = aiRes.match(/\[WEATHER_QUERY\]([\s\S]*?)\[\/WEATHER_QUERY\]/i);
-          if (weatherMatch) {
-            const location = weatherMatch[1].trim();
-            addLog(`[weather] Weather request for: "${location}"`, "info");
-            try {
-              await status.update(HS.weather());
-              if (!ziGetWeather) throw new Error("Weather service not loaded — set OPENWEATHER_API_KEY or WEATHERAPI_KEY env vars");
-              const { message: weatherMsg, source } = await ziGetWeather(location);
-              try { await client2.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch {}
-              await client2.sendMessage(targetPeer, {
-                message: weatherMsg,
-                parseMode: "markdown",
-                replyTo: message.id,
-              });
-              addLog(`[weather] Weather sent via ${source} for "${location}"`, "success");
-            } catch (wErr) {
-              console.error("[weather] Weather fetch failed:", wErr.message);
-              await status.finish(`❌ **Weather unavailable:** ${wErr.message.slice(0, 200)}`);
             }
             return;
           }
