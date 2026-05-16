@@ -1,26 +1,26 @@
 /**
- * Free real-time data scraper — zero API keys required
+ * Real-time data scraper — Google only, zero API keys required.
  *
  * Sources:
- *   Google News RSS  — https://news.google.com/rss/search
- *   DuckDuckGo HTML  — https://html.duckduckgo.com/html/
- *   wttr.in JSON     — https://wttr.in/<location>?format=j1
- *   Bing News RSS    — https://www.bing.com/news/search (fallback)
+ *   Google Search HTML  — weather card, web results
+ *   Google News RSS     — https://news.google.com/rss/search
+ *   Bing News RSS       — fallback when Google News fails
  *
  * Public API:
- *   searchNews(query)           → { articles: [{title,source,published,url}], formatted: string }
- *   searchWeb(query, maxResults)→ { results: [{title,snippet,url}], formatted: string }
- *   getWeatherFree(location)    → { message: string, data: object }
+ *   searchNews(query)            → { articles, formatted }
+ *   searchWeb(query, maxResults) → { results, formatted }
+ *   getWeatherFree(location)     → { message, data, source }
  */
 
-const TIMEOUT_MS = 12_000;
+const TIMEOUT_MS = 14_000;
 
 const HEADERS = {
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
   "Accept-Language": "en-US,en;q=0.9",
   "Accept-Encoding": "gzip, deflate, br",
   "Cache-Control": "no-cache",
+  "Upgrade-Insecure-Requests": "1",
 };
 
 async function fetchWithTimeout(url, options = {}, ms = TIMEOUT_MS) {
@@ -63,11 +63,82 @@ function timeAgo(dateStr) {
   } catch { return ""; }
 }
 
+function weatherEmoji(condition = "") {
+  const c = condition.toLowerCase();
+  if (c.includes("thunder") || c.includes("storm"))  return "⛈";
+  if (c.includes("drizzle") || c.includes("shower"))  return "🌦";
+  if (c.includes("rain"))                              return "🌧";
+  if (c.includes("snow") || c.includes("blizzard"))   return "❄️";
+  if (c.includes("fog") || c.includes("mist") || c.includes("haze")) return "🌫";
+  if (c.includes("cloud") || c.includes("overcast"))  return "☁️";
+  if (c.includes("partly") || c.includes("mostly"))   return "🌤";
+  if (c.includes("clear") || c.includes("sunny"))     return "☀️";
+  if (c.includes("wind"))                              return "💨";
+  return "🌡";
+}
+
+// ── Google Search HTML fetch ──────────────────────────────────────────────────
+
+async function fetchGoogleHTML(query) {
+  const url = `https://www.google.com/search?q=${encodeURIComponent(query)}&hl=en&gl=us&num=10&pws=0`;
+  const res = await fetchWithTimeout(url, {
+    headers: {
+      ...HEADERS,
+      "Cookie": "CONSENT=YES+cb; SOCS=CAESEwgDEgk0ODE3Nzk3MjQaAmVuIAEaBgiA_LyaBg",
+    },
+  });
+  if (!res.ok) throw new Error(`Google search HTTP ${res.status}`);
+  return await res.text();
+}
+
+// ── Google Weather scraper ────────────────────────────────────────────────────
+
+async function fromGoogleWeather(location) {
+  const html = await fetchGoogleHTML(`weather in ${location}`);
+
+  // Google weather card patterns — multiple selectors for resilience
+  let tempC = null, condition = "", humidity = "", wind = "", feelsLike = "";
+
+  // Temperature: Google uses <span class="wob_t"> for the number
+  // Pattern 1: wob_t class (most common)
+  const tempMatch = html.match(/class="wob_t[^"]*"[^>]*>(\d+)<\/span>/);
+  if (tempMatch) tempC = parseInt(tempMatch[1]);
+
+  // Pattern 2: BNeawe tAd8D AP7Wnd (Google's answer box)
+  if (tempC === null) {
+    const temp2 = html.match(/(\d+)°C/);
+    if (temp2) tempC = parseInt(temp2[1]);
+  }
+
+  // Condition: wob_dc class
+  const condMatch = html.match(/class="wob_dc[^"]*"[^>]*>([\s\S]*?)<\/span>/);
+  if (condMatch) condition = stripTags(condMatch[1]).trim();
+
+  // Feels like
+  const feelsMatch = html.match(/feels like[^<]*<[^>]+>(\d+)/i) ||
+                     html.match(/Feels like[^0-9]*(\d+)/);
+  if (feelsMatch) feelsLike = feelsMatch[1];
+
+  // Humidity
+  const humMatch = html.match(/Humidity[^0-9]*(\d+)%/i);
+  if (humMatch) humidity = humMatch[1];
+
+  // Wind
+  const windMatch = html.match(/Wind[^0-9]*(\d+(?:\.\d+)?\s*(?:km\/h|mph|kph))/i);
+  if (windMatch) wind = windMatch[1];
+
+  if (tempC === null) throw new Error("Google weather card not found — Google may have changed its layout");
+
+  return { city: location, tempC, feelsLike, condition, humidity, wind };
+}
+
 // ── Google News RSS ───────────────────────────────────────────────────────────
 
 async function fromGoogleNewsRSS(query) {
   const url = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=en-US&gl=US&ceid=US:en`;
-  const res = await fetchWithTimeout(url, { headers: { ...HEADERS, Accept: "application/rss+xml,application/xml;q=0.9,*/*;q=0.8" } });
+  const res = await fetchWithTimeout(url, {
+    headers: { ...HEADERS, Accept: "application/rss+xml,application/xml;q=0.9,*/*;q=0.8" },
+  });
   if (!res.ok) throw new Error(`Google News RSS ${res.status}`);
   const xml = await res.text();
 
@@ -75,12 +146,20 @@ async function fromGoogleNewsRSS(query) {
   const itemMatches = xml.matchAll(/<item>([\s\S]*?)<\/item>/gi);
   for (const m of itemMatches) {
     const block = m[1];
-
-    const title   = decodeHtmlEntities(stripTags((block.match(/<title><!\[CDATA\[([\s\S]*?)\]\]><\/title>/) || block.match(/<title>([\s\S]*?)<\/title>/) || [])[1] || ""));
-    const source  = decodeHtmlEntities(stripTags((block.match(/<source[^>]*>([\s\S]*?)<\/source>/) || [])[1] || ""));
+    const title   = decodeHtmlEntities(stripTags(
+      (block.match(/<title><!\[CDATA\[([\s\S]*?)\]\]><\/title>/) ||
+       block.match(/<title>([\s\S]*?)<\/title>/) || [])[1] || ""
+    ));
+    const source  = decodeHtmlEntities(stripTags(
+      (block.match(/<source[^>]*>([\s\S]*?)<\/source>/) || [])[1] || ""
+    ));
     const pubDate = ((block.match(/<pubDate>([\s\S]*?)<\/pubDate>/) || [])[1] || "").trim();
-    const link    = ((block.match(/<link>([\s\S]*?)<\/link>/) || block.match(/<guid[^>]*>([\s\S]*?)<\/guid>/) || [])[1] || "").trim();
-    const desc    = decodeHtmlEntities(stripTags((block.match(/<description><!\[CDATA\[([\s\S]*?)\]\]><\/description>/) || block.match(/<description>([\s\S]*?)<\/description>/) || [])[1] || "")).slice(0, 200);
+    const link    = ((block.match(/<link>([\s\S]*?)<\/link>/) ||
+                      block.match(/<guid[^>]*>([\s\S]*?)<\/guid>/) || [])[1] || "").trim();
+    const desc    = decodeHtmlEntities(stripTags(
+      (block.match(/<description><!\[CDATA\[([\s\S]*?)\]\]><\/description>/) ||
+       block.match(/<description>([\s\S]*?)<\/description>/) || [])[1] || ""
+    )).slice(0, 200);
 
     if (title) items.push({ title, source, published: pubDate, timeAgo: timeAgo(pubDate), url: link, snippet: desc });
     if (items.length >= 8) break;
@@ -114,132 +193,77 @@ async function fromBingNewsRSS(query) {
   return items;
 }
 
-// ── DuckDuckGo HTML search ────────────────────────────────────────────────────
+// ── Google Search web results ─────────────────────────────────────────────────
 
-async function fromDuckDuckGo(query, maxResults = 5) {
-  const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-  const res = await fetchWithTimeout(url, {
-    method: "POST",
-    headers: { ...HEADERS, "Content-Type": "application/x-www-form-urlencoded" },
-    body: `q=${encodeURIComponent(query)}&b=&kl=wt-wt`,
-  });
-  if (!res.ok) throw new Error(`DuckDuckGo ${res.status}`);
-  const html = await res.text();
-
+async function fromGoogleSearch(query, maxResults = 5) {
+  const html = await fetchGoogleHTML(query);
   const results = [];
 
-  // Extract result blocks
-  const resultBlocks = html.matchAll(/<div class="result__body">([\s\S]*?)<\/div>\s*<\/div>/gi);
-  for (const m of resultBlocks) {
-    const block = m[1];
+  // Pattern 1: Standard organic results — <h3> inside <a>
+  const blockRe = /<div[^>]+jsname[^>]*>[\s\S]*?<h3[^>]*>([\s\S]*?)<\/h3>[\s\S]*?<\/div>/gi;
+  const hrefRe  = /href="(https?:\/\/[^"&]+)"/;
 
-    // Title
-    const titleMatch = block.match(/<a[^>]*class="result__a"[^>]*>([\s\S]*?)<\/a>/i);
-    const title = decodeHtmlEntities(stripTags(titleMatch?.[1] || ""));
+  // Simpler reliable parse: find all <a href="http..."> with an <h3> inside
+  const linkBlocks = html.matchAll(/<a href="(https?:\/\/[^"]+)"[^>]*>[\s\S]*?<h3[^>]*>([\s\S]*?)<\/h3>/gi);
+  for (const m of linkBlocks) {
+    const url    = m[1].split("&")[0];
+    const title  = decodeHtmlEntities(stripTags(m[2]));
+    if (!title || title.length < 3) continue;
+    if (url.includes("google.com")) continue;
 
-    // URL
-    const hrefMatch = block.match(/href="([^"]+)"/i);
-    let url2 = hrefMatch?.[1] || "";
-    if (url2.startsWith("//duckduckgo.com/l/?uddg=")) {
-      url2 = decodeURIComponent(url2.split("uddg=")[1]?.split("&")[0] || "");
-    }
+    // Try to find a snippet near this match
+    const idx    = m.index || 0;
+    const nearby = html.slice(idx, idx + 800);
+    const snipM  = nearby.match(/class="[^"]*(?:VwiC3b|s3v9rd|aCOpRe|st)[^"]*"[^>]*>([\s\S]*?)<\/(?:span|div)>/i);
+    const snippet = snipM ? decodeHtmlEntities(stripTags(snipM[1])).slice(0, 250) : "";
 
-    // Snippet
-    const snipMatch = block.match(/<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/i);
-    const snippet = decodeHtmlEntities(stripTags(snipMatch?.[1] || "")).slice(0, 300);
-
-    if (title && title.length > 3) {
-      results.push({ title, url: url2, snippet });
-    }
+    results.push({ title, url, snippet });
     if (results.length >= maxResults) break;
   }
 
-  // Fallback parser for different HTML structure
-  if (!results.length) {
-    const altMatches = html.matchAll(/<h2[^>]*>([\s\S]*?)<\/h2>[\s\S]*?<a[^>]+href="([^"]+)"[^>]*>[\s\S]*?<\/a>/gi);
-    for (const m of altMatches) {
+  // Fallback: any <h3> adjacent to an external href
+  if (results.length < 2) {
+    const h3s = html.matchAll(/<h3[^>]*>([\s\S]*?)<\/h3>/gi);
+    for (const m of h3s) {
       const title = decodeHtmlEntities(stripTags(m[1]));
-      const url2 = m[2];
-      if (title.length > 3) results.push({ title, url: url2, snippet: "" });
-      if (results.length >= maxResults) break;
+      if (!title || title.length < 5) continue;
+      const nearby = html.slice(Math.max(0, m.index - 200), m.index + 200);
+      const hm = nearby.match(/href="(https?:\/\/(?!www\.google)[^"]+)"/);
+      if (hm) {
+        results.push({ title, url: hm[1].split("&")[0], snippet: "" });
+        if (results.length >= maxResults) break;
+      }
     }
   }
 
-  if (!results.length) throw new Error("No DuckDuckGo results parsed");
+  if (!results.length) throw new Error("No Google results parsed");
   return results;
-}
-
-// ── wttr.in free weather ──────────────────────────────────────────────────────
-
-function wttrEmoji(weatherCode) {
-  const c = parseInt(weatherCode);
-  if ([113].includes(c))               return "☀️";
-  if ([116].includes(c))               return "🌤";
-  if ([119, 122].includes(c))          return "☁️";
-  if ([143, 248, 260].includes(c))     return "🌫";
-  if ([176, 185, 293, 296, 299, 302, 305, 308, 353, 356, 359].includes(c)) return "🌧";
-  if ([179, 182, 263, 266, 281, 284, 311, 314, 317, 320, 323, 326, 329, 332, 335, 338, 350, 362, 365, 368, 371, 374, 377].includes(c)) return "❄️";
-  if ([200, 386, 389, 392, 395].includes(c)) return "⛈";
-  return "🌡";
-}
-
-async function fromWttrIn(location) {
-  const url = `https://wttr.in/${encodeURIComponent(location)}?format=j1`;
-  const res = await fetchWithTimeout(url, { headers: { ...HEADERS, Accept: "application/json" } });
-  if (!res.ok) throw new Error(`wttr.in ${res.status}`);
-  const d = await res.json();
-
-  const cur = d.current_condition?.[0];
-  if (!cur) throw new Error("wttr.in returned no data");
-
-  const area = d.nearest_area?.[0];
-  const city    = area?.areaName?.[0]?.value || location;
-  const country = area?.country?.[0]?.value || "";
-  const code    = cur.weatherCode;
-
-  return {
-    city, country,
-    tempC:       parseInt(cur.temp_C),
-    feelsC:      parseInt(cur.FeelsLikeC),
-    condition:   cur.weatherDesc?.[0]?.value || "—",
-    emoji:       wttrEmoji(code),
-    humidity:    parseInt(cur.humidity),
-    windKph:     parseInt(cur.windspeedKmph),
-    windDir:     cur.winddir16Point || "",
-    visKm:       parseInt(cur.visibility),
-    pressureHpa: parseInt(cur.pressure),
-    cloudPct:    parseInt(cur.cloudcover),
-    uvIndex:     parseInt(cur.uvIndex),
-    localTime:   d.nearest_area?.[0]?.country?.[0]?.value ? null : null,
-    source:      "wttr.in (free)",
-  };
-}
-
-function formatWeatherFree(w) {
-  const loc = [w.city, w.country].filter(Boolean).join(", ");
-  const lines = [
-    `${w.emoji} **Weather — ${w.city}**`,
-    `┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄`,
-    `🌡 **Temperature** — ${w.tempC}°C  _(feels like ${w.feelsC}°C)_`,
-    `🌥 **Condition** — ${w.condition}`,
-    `💧 **Humidity** — ${w.humidity}%`,
-    `🌬 **Wind** — ${w.windKph} km/h ${w.windDir}`,
-  ];
-  if (w.visKm  != null) lines.push(`👁 **Visibility** — ${w.visKm} km`);
-  if (w.pressureHpa != null) lines.push(`📊 **Pressure** — ${w.pressureHpa} hPa`);
-  if (w.cloudPct != null) lines.push(`☁️ **Cloud Cover** — ${w.cloudPct}%`);
-  if (w.uvIndex != null) lines.push(`☀️ **UV Index** — ${w.uvIndex}`);
-  lines.push(`┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄`);
-  lines.push(`📍 _${loc}_`);
-  lines.push(`🔌 _Source: ${w.source}_`);
-  return lines.join("\n");
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /**
- * Search latest news for a query (no API key needed).
- * Primary: Google News RSS  |  Fallback: Bing News RSS
+ * Get current weather by scraping Google's weather card.
+ * Absolutely zero API keys. Returns same shape as paid weather service.
+ */
+export async function getWeatherFree(location) {
+  const loc = location.trim().slice(0, 200);
+  const w = await fromGoogleWeather(loc);
+  const emoji = weatherEmoji(w.condition);
+
+  const lines = [
+    `${emoji} **${w.city}**`,
+    `🌡 **${w.tempC}°C**${w.feelsLike ? `  _(feels like ${w.feelsLike}°C)_` : ""}`,
+  ];
+  if (w.condition) lines.push(`☁️ ${w.condition}`);
+  if (w.humidity)  lines.push(`💧 Humidity: ${w.humidity}%`);
+  if (w.wind)      lines.push(`🌬 Wind: ${w.wind}`);
+
+  return { message: lines.join("\n"), data: w, source: "Google" };
+}
+
+/**
+ * Search latest news (Google News RSS → Bing fallback).
  */
 export async function searchNews(query) {
   const q = query.trim().slice(0, 200);
@@ -247,55 +271,45 @@ export async function searchNews(query) {
 
   try {
     articles = await fromGoogleNewsRSS(q);
-    console.log(`[scraper] Google News: ${articles.length} articles for "${q}"`);
   } catch (e) {
     console.warn(`[scraper] Google News failed (${e.message}), trying Bing...`);
     try {
       articles = await fromBingNewsRSS(q);
-      console.log(`[scraper] Bing News: ${articles.length} articles for "${q}"`);
     } catch (e2) {
       throw new Error(`All news sources failed: ${e.message} | ${e2.message}`);
     }
   }
 
-  const lines = [`📰 **Latest News: ${q}**`, `┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄`];
+  const lines = [`📰 **${q}**`, `┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄`];
   articles.slice(0, 6).forEach((a, i) => {
     lines.push(`**${i + 1}. ${a.title}**`);
     if (a.source) lines.push(`   _${a.source}${a.timeAgo ? " · " + a.timeAgo : ""}_`);
     if (a.snippet && a.snippet.length > 10) lines.push(`   ${a.snippet}`);
     lines.push("");
   });
-  lines.push(`🕒 _Updated just now · Scraped live_`);
 
   return { articles, formatted: lines.join("\n").trim() };
 }
 
 /**
- * Search the web for real-time information (no API key needed).
- * Uses DuckDuckGo HTML scraping.
+ * Search the web via Google (no API key needed).
  */
 export async function searchWeb(query, maxResults = 5) {
   const q = query.trim().slice(0, 300);
-  const results = await fromDuckDuckGo(q, maxResults);
-  console.log(`[scraper] DuckDuckGo: ${results.length} results for "${q}"`);
+  let results;
 
-  const lines = [`🔍 **Web Search: ${q}**`, `┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄`];
+  try {
+    results = await fromGoogleSearch(q, maxResults);
+  } catch (e) {
+    throw new Error(`Google search failed: ${e.message}`);
+  }
+
+  const lines = [`🔍 **${q}**`, `┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄`];
   results.forEach((r, i) => {
     lines.push(`**${i + 1}. ${r.title}**`);
     if (r.snippet) lines.push(`   ${r.snippet}`);
     lines.push("");
   });
-  lines.push(`🕒 _Live results · DuckDuckGo_`);
 
   return { results, formatted: lines.join("\n").trim() };
-}
-
-/**
- * Get current weather without any API key via wttr.in.
- * Returns same shape as the paid weather service.
- */
-export async function getWeatherFree(location) {
-  const loc = location.trim().slice(0, 200);
-  const w = await fromWttrIn(loc);
-  return { message: formatWeatherFree(w), data: w, source: "wttr.in" };
 }
