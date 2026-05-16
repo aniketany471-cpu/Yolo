@@ -1,13 +1,11 @@
 {
     "$schema": "https://railway.app/railway.schema.json",
     "build": {
-      "buildCommand": "npm install && npm run build"
+      "buildCommand": "npm install && npm run build && curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && chmod +x /usr/local/bin/yt-dlp && echo 'yt-dlp installed:' && yt-dlp --version"
     },
     "deploy": {
       "startCommand": "npm start",
       "restartPolicyType": "ON_FAILURE",
-      "restartPolicyMaxRetries": 5,
-      "numReplicas": 1
+      "restartPolicyMaxRetries": 5
     }
   }
-  
