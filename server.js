@@ -208,7 +208,13 @@ db.exec(`
     ageConfirmed INTEGER DEFAULT 0,
     updatedAt INTEGER
   );
-  
+
+  CREATE TABLE IF NOT EXISTS user_image_counts (
+    userId TEXT PRIMARY KEY,
+    count INTEGER DEFAULT 0,
+    resetAt INTEGER DEFAULT 0
+  );
+
   CREATE TABLE IF NOT EXISTS nsfw_logs (
     id TEXT PRIMARY KEY,
     timestamp INTEGER,
@@ -1885,6 +1891,27 @@ async function startServer() {
     db.prepare("DELETE FROM nsfw_logs").run();
     res.json({ success: true });
   });
+
+  // ── Image generation quota management ────────────────────────────────────
+  app.get("/api/imagegen/stats", (req, res) => {
+    const rows = db.prepare(
+      "SELECT userId, count, resetAt FROM user_image_counts ORDER BY count DESC"
+    ).all();
+    res.json({ users: rows, limit: 2 });
+  });
+  app.post("/api/imagegen/reset/:userId", (req, res) => {
+    const { userId } = req.params;
+    db.prepare(
+      "INSERT INTO user_image_counts (userId, count, resetAt) VALUES (?, 0, ?) ON CONFLICT(userId) DO UPDATE SET count = 0, resetAt = ?"
+    ).run(userId, Date.now(), Date.now());
+    addLog(`[img] Quota reset for user ${userId} by owner`, "success");
+    res.json({ success: true, userId });
+  });
+  app.post("/api/imagegen/reset-all", (req, res) => {
+    db.prepare("UPDATE user_image_counts SET count = 0, resetAt = ?").run(Date.now());
+    addLog("[img] All image quotas reset by owner", "success");
+    res.json({ success: true });
+  });
   app.delete("/api/logs", (req, res) => {
     db.prepare("DELETE FROM logs").run();
     res.json({ success: true });
@@ -2772,6 +2799,25 @@ async function startServer() {
           if (imgMatch) {
             const imgPrompt = imgMatch[1].trim();
             addLog(`[img] Image request detected: "${imgPrompt.slice(0, 60)}..."`, "info");
+
+            // ── Per-user quota: 2 images max ─────────────────────────────
+            const IMAGE_LIMIT = 2;
+            const quotaRow = db.prepare(
+              "SELECT count FROM user_image_counts WHERE userId = ?"
+            ).get(senderId);
+            const usedCount = quotaRow?.count ?? 0;
+
+            if (usedCount >= IMAGE_LIMIT) {
+              const ownerInfo = (config.adminUsers || "").split(",").map(s => s.trim()).filter(Boolean)[0];
+              const ownerHint = ownerInfo ? ` Contact **${ownerInfo}** to get more.` : " Contact the bot owner to get more.";
+              await status.finish(
+                `🖼 You've used your **${IMAGE_LIMIT} free image generations**.\n\nYou've reached your limit.${ownerHint}`
+              );
+              addLog(`[img] Quota exceeded for ${senderId} (${usedCount}/${IMAGE_LIMIT})`, "warn");
+              return;
+            }
+            // ─────────────────────────────────────────────────────────────
+
             try {
               await status.update("🎨 **Creating your image...**");
               await new Promise((r) => setTimeout(r, 800));
@@ -2779,12 +2825,10 @@ async function startServer() {
               if (!ziGenerateImage) throw new Error("Image service not loaded — check server logs");
               const { buffer, provider } = await ziGenerateImage(imgPrompt, config);
               await status.update("🖼 **Uploading result...**");
-              const caption = `🎨 **Generated Image**\n\`${imgPrompt.slice(0, 120)}\``;
-              // Write buffer to a temp .jpg file so GramJS sends it as a photo (not a document)
+              const caption = `🎨 **Generated Image**\n\`${imgPrompt.slice(0, 120)}\`\n\n_${usedCount + 1}/${IMAGE_LIMIT} free generations used_`;
               const tmpImgPath = path.join(tempDir, `img_${Date.now()}.jpg`);
               await fs.writeFile(tmpImgPath, buffer);
               try {
-                // Delete the status message, then send photo
                 try { await client2.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch {}
                 await client2.sendFile(targetPeer, {
                   file: tmpImgPath,
@@ -2793,7 +2837,11 @@ async function startServer() {
                   replyTo: message.id,
                   forceDocument: false
                 });
-                addLog(`[img] Image sent via ${provider}: "${imgPrompt.slice(0, 40)}"`, "success");
+                // Increment quota after successful send
+                db.prepare(
+                  "INSERT INTO user_image_counts (userId, count, resetAt) VALUES (?, 1, ?) ON CONFLICT(userId) DO UPDATE SET count = count + 1"
+                ).run(senderId, Date.now());
+                addLog(`[img] Image sent via ${provider} (${usedCount + 1}/${IMAGE_LIMIT}): "${imgPrompt.slice(0, 40)}"`, "success");
               } finally {
                 fs.remove(tmpImgPath).catch(() => {});
               }
