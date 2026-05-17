@@ -14,6 +14,12 @@ import sharp from "sharp";
 import fs from "fs-extra";
 import yts from "yt-search";
 import youtubedl from "youtube-dl-exec";
+import { detectIntent } from "./router/intentRouter.js";
+import { TOOLS } from "./tools/index.js";
+import { createMemoryStore } from "./memory/memoryStore.js";
+import { normalizeToolText, cleanupFinalResponse, summarizeForContext } from "./tools/normalizer.js";
+import { parseSportsSnapshot, formatSportsUpdate } from "./tools/sportsParser.js";
+import { optimizeResponse, formatTelegramMessage, safeUserFacingError, buildConversationalToolContext } from "./handlers/responseFormatter.js";
 // Image service — loaded dynamically so a missing/broken module never crashes the bot
 let ziGenerateImage = null;
 try {
@@ -136,6 +142,7 @@ process.on("unhandledRejection", (err) => {
   console.error("UNHANDLED: " + (err?.stack || err));
 });
 const db = new Database(path.join(__dirname, "bot_database.sqlite"));
+const memoryStore = createMemoryStore(path.join(__dirname, "bot_database.sqlite"));
 db.pragma("journal_mode = WAL");
 db.exec(`
   CREATE TABLE IF NOT EXISTS messages (
@@ -475,7 +482,7 @@ db.exec(`
   );
 
   INSERT OR IGNORE INTO config (id, minDelaySeconds, maxDelaySeconds, adminUsers, isRunning, youtube_cookies, globalCooldown, perUserCooldown, maxConcurrentTasks, aiEnabled, aiProvider, openRouterKey, autoReplyDM, autoReplyMention) 
-  VALUES (1, 600, 1200, 'YOUR_TELEGRAM_ID', 0, '', 3, 10, 2, 1, 'bluesminds', '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', 1, 1);
+  VALUES (1, 600, 1200, 'YOUR_TELEGRAM_ID', 0, '', 3, 10, 2, 1, 'gemini', '', 1, 1);
 
   -- Ensure existing columns have defaults if they were null from migrations
   UPDATE config SET 
@@ -483,7 +490,7 @@ db.exec(`
     perUserCooldown = COALESCE(perUserCooldown, 10),
     maxConcurrentTasks = COALESCE(maxConcurrentTasks, 2),
     aiEnabled = COALESCE(aiEnabled, 1),
-    aiProvider = COALESCE(aiProvider, 'bluesminds'),
+    aiProvider = COALESCE(aiProvider, 'gemini'),
     autoDeleteCommands = COALESCE(autoDeleteCommands, 0),
     autoDeleteDelay = COALESCE(autoDeleteDelay, 0),
     autoDeleteWhitelist = COALESCE(autoDeleteWhitelist, ''),
@@ -506,28 +513,25 @@ db.exec(`
     formattingEnabled = COALESCE(formattingEnabled, 1),
     cleanupEnabled = COALESCE(cleanupEnabled, 1),
     bluesmindsApiKey = COALESCE(bluesmindsApiKey, ''),
-    activeModel = COALESCE(activeModel, 'deepseek.v3.2')
+    activeModel = COALESCE(activeModel, 'gpt-4o-mini')
   WHERE id = 1;
 `);
-const existingConfig = db.prepare("SELECT openRouterKey, aiProvider, bluesmindsApiKey FROM config WHERE id = 1").get();
-if (!existingConfig?.openRouterKey || existingConfig.openRouterKey.length < 10) {
-  db.prepare("UPDATE config SET openRouterKey = ? WHERE id = 1").run(
-    "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"
-  );
+console.log("[startup] Bootstrap complete — provider/model preserved from config (no forced provider lock).");
+{
+  const cfg = db.prepare("SELECT aiProvider, activeModel, geminiKey, groqKey, openRouterKey, xaiKey, bluesmindsApiKey FROM config WHERE id = 1").get() || {};
+  const diag = {
+    provider: cfg.aiProvider || "unknown",
+    activeModel: cfg.activeModel || "unset",
+    geminiKey: !!(cfg.geminiKey || process.env.GEMINI_API_KEY),
+    groqKey: !!cfg.groqKey,
+    openRouterKey: !!cfg.openRouterKey,
+    xaiKey: !!(cfg.xaiKey || process.env.XAI_API_KEY),
+    bluesmindsKey: !!(cfg.bluesmindsApiKey || process.env.BLUEMINDS_API_KEY),
+    openrouterReferer: OPENROUTER_REFERER ? "set" : "missing",
+    openrouterTitle: OPENROUTER_TITLE ? "set" : "missing"
+  };
+  console.log("[startup][providers]", JSON.stringify(diag));
 }
-if (!existingConfig?.bluesmindsApiKey || existingConfig.bluesmindsApiKey.length < 10) {
-  db.prepare("UPDATE config SET bluesmindsApiKey = ? WHERE id = 1").run(
-    "sk-N1seJklpTA8FleqvsXg0bwg9pbgBR8uVuAuAv1qNOzSpZZjJ"
-  );
-}
-// Hard bootstrap: ensure auto-reply and BluesMinds are ON out of the box on every fresh deploy
-db.prepare(
-  "UPDATE config SET aiProvider = 'bluesminds', activeModel = 'gpt-4o-mini', aiEnabled = 1, autoReplyDM = 1, autoReplyMention = 1, bluesmindsApiKey = 'sk-N1seJklpTA8FleqvsXg0bwg9pbgBR8uVuAuAv1qNOzSpZZjJ' WHERE id = 1 AND (autoReplyDM = 0 OR autoReplyMention = 0 OR aiProvider = 'openrouter' OR aiProvider = 'gemini')"
-).run();
-// Always enforce deepseek.v3.2 as the active model on every startup/redeploy.
-// This runs unconditionally so even an existing DB row is corrected.
-db.prepare("UPDATE config SET activeModel = 'deepseek.v3.2' WHERE id = 1").run();
-console.log("[startup] Bootstrap complete — BluesMinds provider, autoReply ON, model locked to deepseek.v3.2");
 
 // Bootstrap credentials from env vars so Railway redeployments don't wipe them from the UI
 {
@@ -555,6 +559,18 @@ const REQUEST_TIMEOUT_MS = 15000;  // 15s per attempt — fails fast before fall
 const MAX_RETRIES = 1;             // 1 retry = max 30s total before giving up
 
 const BLUEMINDS_BASE_URL = "https://api.bluesminds.com/v1";
+const OPENROUTER_REFERER = process.env.OPENROUTER_REFERER || "https://github.com/Skyemike1/Skye";
+const OPENROUTER_TITLE = process.env.OPENROUTER_TITLE || "Skye Telegram Userbot";
+
+function resolveModelForProvider(provider, requested) {
+  const m = (requested || "").trim();
+  if (provider === "gemini") return m.startsWith("gemini-") ? m : "gemini-1.5-flash";
+  if (provider === "groq") return m && (m.includes("llama") || m.includes("mixtral") || m.includes("gemma") || m.includes("qwen")) ? m : "llama3-8b-8192";
+  if (provider === "xai") return ["grok-4","grok-4-0709","grok-3","grok-3-fast","grok-3-mini","grok-3-mini-fast","grok-2-1212","grok-2-vision-1212","grok-vision-beta","grok-beta"].includes(m) ? m : "grok-3";
+  if (provider === "openrouter") return (m.includes("/") || m.includes(":")) ? m : "openai/gpt-4o-mini";
+  if (provider === "bluesminds") return m || "gpt-4o-mini";
+  return m || "gpt-4o-mini";
+}
 
 // Models confirmed broken: tier restriction, suspended, 404 not found, or permanent timeout.
 // Updated from live audit May 2026.
@@ -631,13 +647,15 @@ function normalizeContextMessages(prompt, context = [], systemInstruction) {
 }
 
 async function fetchJsonWithRetry(url, options, meta) {
+  const authHeader = options?.headers?.Authorization || options?.headers?.authorization || "";
+  const authState = typeof authHeader === "string" && authHeader.startsWith("Bearer ") && authHeader.length > 20 ? "bearer_present" : "missing_or_invalid";
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     const started = Date.now();
     try {
       console.log(
-        `[${meta.provider}][Model=${meta.model}][Attempt=${attempt + 1}] → ${meta.endpoint}`
+        `[${meta.provider}][Model=${meta.model}][Auth=${authState}][Attempt=${attempt + 1}] → ${meta.endpoint}`
       );
       const response = await fetch(url, { ...options, signal: controller.signal });
       const latency = Date.now() - started;
@@ -646,9 +664,18 @@ async function fetchJsonWithRetry(url, options, meta) {
       if (!response.ok) {
         const rawBody = await response.text();
         const errText = rawBody.trim() || `(empty body, status ${response.status})`;
+        const low = errText.toLowerCase();
+        const parsedReason =
+          low.includes("invalid token") ? "invalid_token" :
+          low.includes("user not found") ? "user_not_found" :
+          low.includes("unauthorized") ? "unauthorized" :
+          low.includes("forbidden") ? "forbidden" : "other";
         console.error(
-          `[${meta.provider}][Model=${meta.model}][Status=${response.status}][Latency=${latency}ms] ERROR: ${errText.substring(0, 200)}`
+          `[${meta.provider}][Model=${meta.model}][Status=${response.status}][Latency=${latency}ms][Reason=${parsedReason}] ERROR: ${errText.substring(0, 200)}`
         );
+        if (response.status === 401 || response.status === 403) {
+          return { ok: false, status: response.status, text: rawBody, authFailed: true };
+        }
         // Don't retry broken models — waste of time
         if (isBmModelBroken(response.status, rawBody)) {
           return { ok: false, status: response.status, text: rawBody, broken: true };
@@ -787,7 +814,7 @@ async function getOpenRouterResponse(prompt, apiKey, model = "google/gemini-2.0-
     const cleanKey = apiKey?.trim();
     if (!cleanKey || cleanKey === "undefined" || cleanKey === "null")
       return null;
-    const finalModel = model && (model.includes("/") || model.includes("-")) ? model : "google/gemini-2.0-flash-001";
+    const finalModel = resolveModelForProvider("openrouter", model);
     const messages = normalizeContextMessages(prompt, context, systemInstruction);
     const result = await fetchJsonWithRetry(
       "https://openrouter.ai/api/v1/chat/completions",
@@ -796,8 +823,8 @@ async function getOpenRouterResponse(prompt, apiKey, model = "google/gemini-2.0-
         headers: {
           Authorization: `Bearer ${cleanKey}`,
           "Content-Type": "application/json",
-          "HTTP-Referer": "https://ais-dev.run.app",
-          "X-Title": "TG Userbot"
+          "HTTP-Referer": OPENROUTER_REFERER,
+          "X-Title": OPENROUTER_TITLE
         },
         body: JSON.stringify({ model: finalModel, messages })
       },
@@ -1205,12 +1232,15 @@ async function generateImage(prompt, apiKey, model = "flux") {
   }
 }
 async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = false, forceDeep = false, senderUsername = null) {
+  const reqStart = Date.now();
   const userGeminiK = (config.geminiKey || "").trim();
   const systemGeminiK = (process.env.GEMINI_API_KEY || "").trim();
   const groqK = (config.groqKey || "").trim();
   const openRouterK = (config.openRouterKey || "").trim();
   let context = [];
   const memoryKey = userId ? `mem:${userId}:${chatId || "global"}` : chatId;
+  const intentMeta = detectIntent(prompt);
+  const inferredTopic = TOOLS.memory.inferTopic(prompt);
   if (memoryKey && config.conversationMemory === 1) {
     const history = db.prepare(
       "SELECT role, content FROM conversations WHERE chatId = ? ORDER BY timestamp DESC LIMIT 10"
@@ -1219,6 +1249,13 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
       role: h.role,
       parts: [{ text: h.content }]
     }));
+    const topicalMem = memoryStore.getByTopic({ userId, chatId, topic: inferredTopic, limit: 12 });
+    const recentMem = memoryStore.getRecent({ userId, chatId, limit: 18 });
+    const longMem = [...topicalMem, ...recentMem];
+    const compressed = TOOLS.memory.compressContext(longMem, 1000);
+    if (compressed) {
+      context.unshift({ role: "user", parts: [{ text: `[Compressed prior context]\n${summarizeForContext(compressed, 900)}` }] });
+    }
   }
   const now = /* @__PURE__ */ new Date();
   const dateStr = now.toLocaleString("en-IN", {
@@ -1285,6 +1322,18 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
     "Never ask unnecessary clarification questions when intent is obvious.",
     "Never hallucinate facts. Say uncertainty honestly when you genuinely don't know.",
     "Automatically detect when realtime information is needed (weather, prices, news, sports, events) and use available tools.",
+    "Treat your existing personality as a separate layer that must always stay intact. Do not rewrite, replace, or erase your personality when following intelligence instructions.",
+    "Act as the orchestration layer: detect intent, decide whether memory/context is relevant, decide whether tools are needed, and route intelligently.",
+    "Use retrieval-first behavior for realtime topics: live sports, weather, news, crypto, stocks, schedules, breaking events, and anything 'latest/current/today'.",
+    "Never guess realtime facts. If tool data is missing, retry smartly, then fall back and clearly say it's uncertain.",
+    "When sports are asked (IPL/cricket/football/F1/NBA or live score/status/standings/schedule): fetch live data first, structure it clearly, then answer naturally.",
+    "Use web search when information may be outdated, when user asks for verification, or when recency matters.",
+    "Use browser/page inspection for complex or dynamic websites when normal search snippets are not enough.",
+    "For multimodal inputs (images/screenshots/photos), analyze visual context and extract text when useful before answering.",
+    "Maintain useful memory: preferences, ongoing projects, recurring topics, and important chat context. Ignore random noise and spam.",
+    "In group chats, resolve references like 'that one', 'same thing', 'previous match' using recent topic continuity.",
+    "For complex tasks: break into steps, retrieve data, reason carefully, and produce a clean final answer.",
+    "Do not expose internal routing logic, hidden chain-of-thought, or raw tool internals in normal replies.",
     "",
     "CONTEXT AWARENESS — CRITICAL",
     "You are a Telegram bot in a social chat. NEVER interpret casual, conversational messages as technical/DevOps/programming commands.",
@@ -1390,6 +1439,8 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
     systemPrompt = `[Base Identity: ${personality}] ${systemPrompt}`;
   }
   let searchContext = "";
+  let toolAttempts = 0;
+  const retrievalIssues = [];
   if (config.searchEnabled === 1) {
     // Intelligent intent detection — handles typos, casual language, short phrases
     let shouldSearch = isDeep;
@@ -1401,10 +1452,20 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
       const fallbackKw = ["today", "latest", "current", "news", "score", "price", "who is", "what happened", "election", "match", "weather", "temp", "bitcoin", "crypto", "stock", "genuine", "legit", "scam", "fake", "safe", "real", "trusted", "reviews", "website", "site", "app", "platform", "what is", "who made", "tell me about", "is it", ".com", ".io", ".net"];
       shouldSearch = fallbackKw.some((kw) => prompt.toLowerCase().includes(kw));
     }
-    if (shouldSearch) {
-      const results = await performWebSearch(prompt, config, isDeep);
+    if (shouldSearch || intentMeta.isRealtime || intentMeta.isSports || intentMeta.isWebSearch) {
+      toolAttempts++;
+      const results = intentMeta.isSports
+        ? (await TOOLS.sports({ prompt, config, performWebSearch }))?.data
+        : (await TOOLS.search({ prompt, config, performWebSearch, isDeep }))?.data;
       if (results) {
-        searchContext = `[LIVE SEARCH DATA — fetched right now]\n${results}\n[END SEARCH DATA]
+        const cleanedResults = normalizeToolText(results, 2200);
+        if (intentMeta.isSports) {
+          const parsed = parseSportsSnapshot(cleanedResults);
+          const sportsLine = formatSportsUpdate(parsed);
+          if (sportsLine) searchContext += `[PARSED LIVE SPORTS]\n${sportsLine}\n[/PARSED LIVE SPORTS]\n`;
+          else retrievalIssues.push("sports_parse_failed");
+        }
+        searchContext += `${buildConversationalToolContext(cleanedResults, { source: intentMeta.isSports ? "sports" : "search", intent: intentMeta.intent })}
 
 SEARCH RESPONSE RULES — follow exactly:
 1. Use this live data to answer. Never say "as of my training" or "I don't have real-time access".
@@ -1441,8 +1502,26 @@ CRYPTO/FINANCE FORMAT EXAMPLE:
 GENERAL FORMAT:
 🔍 **[Topic]**
 [Key facts structured as short bullets or a clean short paragraph]`;
+      } else if (intentMeta.isRealtime || intentMeta.isSports) {
+        toolAttempts++;
+        const browserRes = await TOOLS.browser({ query: prompt });
+        if (browserRes?.ok && browserRes?.data) {
+          const browserClean = normalizeToolText(browserRes.data, 1800);
+          if (intentMeta.isSports) {
+            const parsed = parseSportsSnapshot(browserClean);
+            const sportsLine = formatSportsUpdate(parsed);
+            if (sportsLine) searchContext += `[PARSED LIVE SPORTS]\n${sportsLine}\n[/PARSED LIVE SPORTS]\n`;
+            else retrievalIssues.push("sports_parse_failed");
+          }
+          searchContext += buildConversationalToolContext(browserClean, { source: "browser", intent: intentMeta.intent });
+        } else {
+          retrievalIssues.push(browserRes?.reason || "browser_unavailable");
+        }
       }
     }
+  }
+  if ((intentMeta.isRealtime || intentMeta.isSports) && !searchContext) {
+    searchContext = `[LIVE DATA STATUS]\nLive retrieval did not return reliable data right now. If asked for exact live values, clearly say data couldn't be verified right now and avoid guessing.\n[END LIVE DATA STATUS]`;
   }
   let modelNudge = "";
   if (config.activeModel?.includes("gpt-4")) {
@@ -1461,22 +1540,22 @@ User Message: ${prompt}`;
   const geminiProvider = {
     name: "Gemini",
     key: userGeminiK || systemGeminiK,
-    fn: (p, k, ctx, inst) => getGeminiResponse(p, k, config.activeModel, ctx, inst)
+    fn: (p, k, ctx, inst) => getGeminiResponse(p, k, resolveModelForProvider("gemini", config.activeModel), ctx, inst)
   };
   const groqProvider = {
     name: "Groq",
     key: groqK,
-    fn: (p, k, ctx, inst) => getGroqResponse(p, k, config.activeModel, ctx, inst)
+    fn: (p, k, ctx, inst) => getGroqResponse(p, k, resolveModelForProvider("groq", config.activeModel), ctx, inst)
   };
   const grokProvider = {
     name: "xAI/Grok",
     key: config.xaiKey,
-    fn: (p, k, ctx, inst) => getGrokResponse(p, k, config.activeModel, ctx, inst)
+    fn: (p, k, ctx, inst) => getGrokResponse(p, k, resolveModelForProvider("xai", config.activeModel), ctx, inst)
   };
   const orProvider = {
     name: "OpenRouter",
     key: openRouterK,
-    fn: (p, k, ctx, inst) => getOpenRouterResponse(p, k, config.activeModel, ctx, inst)
+    fn: (p, k, ctx, inst) => getOpenRouterResponse(p, k, resolveModelForProvider("openrouter", config.activeModel), ctx, inst)
   };
   const bluesmindsProvider = {
     name: "BluesMinds",
@@ -1484,7 +1563,7 @@ User Message: ${prompt}`;
     fn: (p, k, ctx, inst) => getBluesMindsResponse(
       p,
       k,
-      config.activeModel || "gpt-4o-mini",
+      resolveModelForProvider("bluesminds", config.activeModel || "gpt-4o-mini"),
       ctx,
       inst
     )
@@ -1510,7 +1589,7 @@ User Message: ${prompt}`;
           `${timeContext} ${systemPrompt} ${searchContext ? "\n\n" + searchContext : ""}`
         );
         if (resRaw) {
-          const res = cleanAIResponse(resRaw, config);
+          const res = cleanupFinalResponse(cleanAIResponse(resRaw, config));
           if (memoryKey && config.conversationMemory === 1) {
             db.prepare(
               "INSERT INTO conversations (chatId, role, content, timestamp) VALUES (?, ?, ?, ?)"
@@ -1518,7 +1597,10 @@ User Message: ${prompt}`;
             db.prepare(
               "INSERT INTO conversations (chatId, role, content, timestamp) VALUES (?, ?, ?, ?)"
             ).run(memoryKey, "model", res, Date.now());
+            memoryStore.save({ userId, chatId, topic: inferredTopic, role: "user", content: prompt });
+            memoryStore.save({ userId, chatId, topic: inferredTopic, role: "model", content: res });
           }
+          console.log(`[orchestrator] intent=${intentMeta.intent} confidence=${intentMeta.confidence} topic=${inferredTopic} toolAttempts=${toolAttempts} retrievalIssues=${retrievalIssues.join(",") || "none"} durationMs=${Date.now() - reqStart}`);
           return res;
         }
       } catch (err) {
@@ -3059,7 +3141,7 @@ async function startServer() {
                 fs.remove(tmpImgPath).catch(() => {});
               }
             } catch (fbErr) {
-              await status.finish(`❌ **Image generation failed:** ${fbErr.message?.slice(0, 100)}`);
+              await status.finish(`❌ ${safeUserFacingError(fbErr, "image")}`);
             }
             return;
           }
@@ -3120,7 +3202,7 @@ async function startServer() {
               }
             } catch (imgErr) {
               console.error("[img] Image generation failed:", imgErr.message);
-              await status.finish(`❌ **Image generation failed:** ${imgErr.message.slice(0, 120)}`);
+              await status.finish(`❌ ${safeUserFacingError(imgErr, "image")}`);
             }
             return;
           }
@@ -3128,7 +3210,8 @@ async function startServer() {
           // ── Normal text reply ────────────────────────────────────────────
           // The AI system prompt already handles jailbreaks, harmful content, and
           // security naturally — no robotic post-processing filter needed.
-          const formatted = formatAiMessage(aiRes);
+          const polished = optimizeResponse(aiRes, { intent: detectIntent(text).intent || "casual_chat" });
+          const formatted = formatTelegramMessage(polished);
           await status.update(formatted.text, {
             parseMode: formatted.parseMode
           });
@@ -3143,6 +3226,7 @@ async function startServer() {
         }
       } catch (e) {
         console.error(`[AI-Auto] Error:`, e.message || e);
+        try { await status.finish(safeUserFacingError(e, "realtime")); } catch {}
       } finally {
         setTimeout(() => aiProcessingLock.delete(lockKey), 6e4);
       }
@@ -3477,7 +3561,8 @@ _Visit the dashboard for advanced configuration._`;
                       senderId
                     );
                     if (aiRes) {
-                      const formatted = formatAiMessage(aiRes);
+                      const polished = optimizeResponse(aiRes, { intent: detectIntent(promptText).intent });
+                      const formatted = formatTelegramMessage(polished);
                       await status.finish(formatted.text, {
                         parseMode: formatted.parseMode,
                         replyTo: repl[0].id
