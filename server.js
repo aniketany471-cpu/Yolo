@@ -2510,16 +2510,16 @@ async function startServer() {
     }
   });
   app.post("/api/live-search", async (req, res) => {
-    const { query, mode } = req.body || {};
+    const { query } = req.body || {};
     if (!query) return res.status(400).json({ error: "query is required" });
-    if (!playwrightLiveSearch) return res.status(503).json({ error: "Playwright not available" });
     try {
-      if (mode === "score") {
-        const text = await playwrightLiveScore(query);
-        return res.json({ result: text, mode: "score" });
+      const cfg = db.prepare("SELECT geminiKey FROM config WHERE id = 1").get();
+      const geminiKey = (cfg?.geminiKey || process.env.GEMINI_API_KEY || "").trim();
+      if (geminiGroundedSearch && geminiKey) {
+        const result = await geminiGroundedSearch(query, geminiKey);
+        if (result) return res.json({ result, mode: "gemini-grounding" });
       }
-      const { text, title } = await playwrightLiveSearch(query);
-      res.json({ result: text, title, mode: "search" });
+      res.status(503).json({ error: "No search backend available — configure a Gemini API key" });
     } catch (e) {
       res.status(500).json({ error: e.message });
     }
