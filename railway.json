@@ -1,7 +1,7 @@
 {
   "$schema": "https://railway.app/railway.schema.json",
   "build": {
-    "buildCommand": "npm install && npm run build && curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && chmod +x /usr/local/bin/yt-dlp && echo \"yt-dlp installed:\" && yt-dlp --version && npx playwright install chromium && echo \"Playwright Chromium installed\""
+    "buildCommand": "npm install && ldconfig && npm run build && curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && chmod +x /usr/local/bin/yt-dlp && yt-dlp --version && npx playwright install --with-deps chromium && echo 'Playwright Chromium installed'"
   },
   "deploy": {
     "startCommand": "npm start",
