@@ -1162,7 +1162,7 @@ async function performWebSearch(query, config, deep = false) {
   const isSportsScoreQuery = /\b(?:live\s+)?(?:ipl|cricket|football|soccer|nba|nfl|f1|formula)\s*(?:score[s]?|result[s]?|match|live|update[s]?|standing[s]?)\b|\b(?:score[s]?|result[s]?)\s+(?:of|for|in)\s+(?:ipl|cricket|football|soccer)\b|\bipl\s+score|\bcricket\s+score|\blive\s+score[s]?\b/i.test(query);
   if (isSportsScoreQuery && playwrightLiveScore) {
     try {
-      console.log(`[search] Sports score query — Cricbuzz via getLiveScore: "${query}"`);
+      console.log(`[search] Sports score query — trying all sources (IPL → Cricbuzz → ESPN → NDTV → Google): "${query}"`);
       const score = await playwrightLiveScore(query);
       if (score && hasActualScoreData(score)) {
         console.log(`[search] getLiveScore OK — ${score.length} chars with real score data`);
@@ -1172,9 +1172,7 @@ async function performWebSearch(query, config, deep = false) {
     } catch (e) {
       console.warn(`[search] getLiveScore error: ${e.message}`);
     }
-    // If we get here, no real score was found — return empty so AI gives honest reply
-    // Do NOT fall through to Serper which only has snippets, not scores
-    return '';
+    // Fall through to Serper/Tavily — system prompt already blocks hallucination for missing scores
   }
 
   // 2. General Playwright — headless Chromium for JS-heavy live pages
