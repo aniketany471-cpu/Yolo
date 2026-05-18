@@ -2894,7 +2894,17 @@ async function startServer() {
     if (!isPrivate) {
       if (config.autoReplyMention === 1) {
         const lowerText = text.toLowerCase();
-        const isMentioned = myUsername && lowerText.includes(`@${myUsername.toLowerCase()}`) || myId && lowerText.includes(myId);
+        // Text-based mention: someone typed @username
+        const isMentionedByText = myUsername && lowerText.includes(`@${myUsername.toLowerCase()}`);
+        // Entity-based mention: covers accounts with no username — Telegram uses
+        // MessageEntityMentionName (tapping someone's name from contacts) which
+        // embeds the userId in the entity, NOT in the raw text.
+        const isMentionedByEntity = Array.isArray(message.entities) && message.entities.some(
+          (e) => (e.className === 'MessageEntityMentionName' || e._ === 'messageEntityMentionName') && e.userId?.toString() === myId
+        );
+        // Also catch when someone literally types the numeric ID (rare but valid)
+        const isMentionedById = !!(myId && lowerText.includes(myId));
+        const isMentioned = isMentionedByText || isMentionedByEntity || isMentionedById;
         let isReplyToMe = false;
         const replyMsgId = message.replyTo?.replyToMsgId;
         if (replyMsgId) {
