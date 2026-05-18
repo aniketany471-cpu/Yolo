@@ -33,6 +33,16 @@ try {
 } catch (_serperErr) {
   console.warn("[serper] Search service unavailable:", _serperErr.message);
 }
+// Playwright live scraper — headless Chromium for JS-rendered live data
+let playwrightLiveSearch = null, playwrightLiveScore = null;
+try {
+  const _pwMod = await import("./services/playwright.js");
+  playwrightLiveSearch = _pwMod.googleLiveSearch;
+  playwrightLiveScore = _pwMod.getLiveScore;
+  console.log("[playwright] Live scraper loaded OK");
+} catch (_pwErr) {
+  console.warn("[playwright] Unavailable:", _pwErr.message);
+}
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 // ── Standalone yt-dlp binary (downloaded at startup, no Python needed) ───────
@@ -2420,6 +2430,22 @@ async function startServer() {
       res.status(500).json({ ok: false, error: e?.message });
     }
   });
+  app.post("/api/live-search", async (req, res) => {
+    const { query, mode } = req.body || {};
+    if (!query) return res.status(400).json({ error: "query is required" });
+    if (!playwrightLiveSearch) return res.status(503).json({ error: "Playwright not available" });
+    try {
+      if (mode === "score") {
+        const text = await playwrightLiveScore(query);
+        return res.json({ result: text, mode: "score" });
+      }
+      const { text, title } = await playwrightLiveSearch(query);
+      res.json({ result: text, title, mode: "search" });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   app.use("/api/*", (req, res) => {
     res.status(404).json({ error: `API route ${req.originalUrl} not found` });
   });
