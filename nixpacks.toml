@@ -1,11 +1,11 @@
 [phases.setup]
-nixPkgs = ["nodejs_20"]
+nixPkgs = ["nodejs_22", "python312", "gcc", "gnumake", "pkg-config"]
 
 [phases.install]
-cmds = ["npm install --legacy-peer-deps --ignore-scripts"]
+cmds = ["npm ci --legacy-peer-deps"]
 
 [phases.build]
-cmds = ["curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && chmod +x /usr/local/bin/yt-dlp"]
+cmds = ["npm run rebuild:native", "npm run build"]
 
 [start]
 cmd = "npm start"

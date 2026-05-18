@@ -9,6 +9,14 @@ const GENERATE_URL = "https://zimageturbo.ai/api/generate";
 const PROVIDER_TIMEOUT_MS = 90_000;  // Zimage can take a while
 const DOWNLOAD_TIMEOUT_MS = 30_000;
 
+function envSecret(...names) {
+  for (const name of names) {
+    const value = (process.env[name] || '').trim();
+    if (value && value !== 'undefined' && value !== 'null') return value;
+  }
+  return '';
+}
+
 function sanitizePrompt(prompt) {
   return prompt
     .replace(/[<>{}|\\^`[\]]/g, "")
@@ -35,7 +43,7 @@ async function downloadImageBuffer(url) {
 // ── Provider: Zimage Turbo ────────────────────────────────────────────────────
 
 async function zimageTurbo(prompt, options = {}) {
-  const apiKey = process.env.ZIMAGE_API_KEY;
+  const apiKey = envSecret('ZIMAGE_API_KEY');
   if (!apiKey) throw new Error("ZIMAGE_API_KEY not set in environment");
 
   const body = {
@@ -123,7 +131,8 @@ export async function generateImage(prompt, config = {}, options = {}) {
   const errors = [];
 
   // 1. Zimage Turbo (primary)
-  if (process.env.ZIMAGE_API_KEY) {
+  const zimageKey = envSecret('ZIMAGE_API_KEY');
+  if (zimageKey) {
     try {
       const buffer = await zimageTurbo(prompt, options);
       console.log(`[img] Zimage Turbo succeeded`);
@@ -137,7 +146,7 @@ export async function generateImage(prompt, config = {}, options = {}) {
   }
 
   // 2. Bluesminds (fallback)
-  const bmKey = (config.bluesmindsApiKey || "").trim();
+  const bmKey = ((config.bluesmindsApiKey || "").trim() || envSecret("BLUEMINDS_API_KEY"));
   if (bmKey) {
     try {
       const buffer = await bluesmindsImage(prompt, bmKey);
