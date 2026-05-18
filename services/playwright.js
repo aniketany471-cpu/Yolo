@@ -1,17 +1,15 @@
 /**
  * Playwright Live Scraper
  * Uses headless Chromium to render JS-heavy pages and extract live data.
- * Handles: live scores, stock prices, real-time data that plain fetch() cannot get.
- *
- * Exported API:
- *   scrapePage(url, opts)   — render any URL and return its visible text
- *   googleLiveSearch(query) — render a Google SERP and return visible text
- *   getLiveScore(query)     — extract live score lines from a Google Sports search
+ * Priority sources per query type:
+ *   Cricket/IPL  → Cricbuzz → ESPN Cricinfo → Google
+ *   Football     → Google Sports → FlashScore
+ *   General      → Google Search
  */
 
 import { chromium } from 'playwright';
 
-const NAV_TIMEOUT = 20_000;
+const NAV_TIMEOUT = 25_000;
 
 let browser = null;
 
@@ -20,13 +18,10 @@ async function getBrowser() {
     browser = await chromium.launch({
       headless: true,
       args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--no-first-run',
-        '--no-zygote',
-        '--single-process',
+        '--no-sandbox', '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage', '--disable-gpu',
+        '--no-first-run', '--no-zygote', '--single-process',
+        '--disable-blink-features=AutomationControlled',
       ],
     });
   }
@@ -36,77 +31,161 @@ async function getBrowser() {
 process.on('exit',    () => { if (browser) browser.close().catch(() => {}); });
 process.on('SIGTERM', () => { if (browser) browser.close().catch(() => {}); });
 
-/**
- * Scrape a URL with a real headless browser and return its visible text.
- * @param {string} url
- * @param {{ waitFor?: string, timeout?: number }} opts
- * @returns {Promise<{ text: string, title: string, url: string }>}
- */
-export async function scrapePage(url, opts = {}) {
+async function newPage() {
   const b = await getBrowser();
   const ctx = await b.newContext({
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    viewport: { width: 1280, height: 800 },
+    userAgent: 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36',
+    viewport: { width: 412, height: 915 },
+    locale: 'en-IN',
+    timezoneId: 'Asia/Kolkata',
   });
-  const page = await ctx.newPage();
-  try {
-    await page.goto(url, {
-      waitUntil: 'domcontentloaded',
-      timeout: opts.timeout || NAV_TIMEOUT,
-    });
+  return { ctx, page: await ctx.newPage() };
+}
 
-    if (opts.waitFor) {
-      await page.waitForSelector(opts.waitFor, { timeout: 8000 }).catch(() => {});
-    } else {
-      await page.waitForTimeout(2500);
-    }
-
-    const title = await page.title().catch(() => '');
-    const text = await page.evaluate(() => {
-      ['script', 'style', 'nav', 'footer', 'iframe', 'noscript'].forEach(tag => {
-        document.querySelectorAll(tag).forEach(el => el.remove());
-      });
-      return document.body?.innerText || '';
-    });
-
-    return {
-      text: text.replace(/
+async function extractText(page) {
+  return page.evaluate(() => {
+    ['script','style','nav','footer','iframe','noscript','header'].forEach(t =>
+      document.querySelectorAll(t).forEach(el => el.remove())
+    );
+    return (document.body?.innerText || '').replace(/
 {3,}/g, '
 
-').trim().slice(0, 8000),
-      title,
-      url,
-    };
+').trim();
+  });
+}
+
+/**
+ * Scrape any URL and return visible text.
+ */
+export async function scrapePage(url, opts = {}) {
+  const { ctx, page } = await newPage();
+  try {
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: opts.timeout || NAV_TIMEOUT });
+    if (opts.waitFor) {
+      await page.waitForSelector(opts.waitFor, { timeout: 8000 }).catch(() => {});
+    }
+    await page.waitForTimeout(opts.wait || 2000);
+    const title = await page.title().catch(() => '');
+    const text  = await extractText(page);
+    return { text: text.slice(0, 8000), title, url };
   } finally {
     await ctx.close().catch(() => {});
   }
 }
 
 /**
- * Search Google with a real browser and return the rendered SERP text.
- * Best for: live scores, weather cards, featured snippets, knowledge panels.
- * @param {string} query
- * @returns {Promise<{ text: string, title: string }>}
+ * Fetch Cricbuzz live scores — best source for IPL / cricket.
  */
-export async function googleLiveSearch(query) {
-  const url = `https://www.google.com/search?q=${encodeURIComponent(query)}&hl=en&gl=us`;
-  return scrapePage(url, { waitFor: '#search', timeout: 20000 });
+async function fromCricbuzz(query) {
+  const { ctx, page } = await newPage();
+  try {
+    await page.goto('https://www.cricbuzz.com/cricket-match/live-scores', {
+      waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT,
+    });
+    await page.waitForTimeout(3000);
+    const text = await extractText(page);
+    const lines = text.split('
+').map(l => l.trim()).filter(l => l.length > 1);
+
+    // Pull match blocks: team names, scores, overs, status
+    const scoreLines = lines.filter(l =>
+      /d+/d+|over[s]?|wkt[s]?|wicket[s]?|run[s]?|live|vs.?|inning[s]?|batting|bowling|IPL|T20|ODI|Test/i.test(l)
+    );
+
+    if (scoreLines.length >= 2) {
+      return '🏏 Live Cricket Scores (Cricbuzz)
+' + scoreLines.slice(0, 30).join('
+');
+    }
+    return null;
+  } catch(e) {
+    console.warn('[playwright] Cricbuzz error:', e.message);
+    return null;
+  } finally {
+    await ctx.close().catch(() => {});
+  }
 }
 
 /**
- * Get live sports scores or any real-time result for a query.
- * Renders Google with Chromium so JS-rendered score cards are fully visible.
- * @param {string} query  e.g. "India vs Australia cricket score"
- * @returns {Promise<string>}
+ * Fetch ESPN Cricinfo live scores — fallback for cricket.
+ */
+async function fromESPN(query) {
+  const { ctx, page } = await newPage();
+  try {
+    await page.goto('https://www.espncricinfo.com/live-cricket-score', {
+      waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT,
+    });
+    await page.waitForTimeout(3000);
+    const text = await extractText(page);
+    const lines = text.split('
+').map(l => l.trim()).filter(l => l.length > 1);
+    const scoreLines = lines.filter(l =>
+      /d+/d+|over[s]?|wicket[s]?|live|vs.?|inning[s]?/i.test(l)
+    );
+    if (scoreLines.length >= 2) {
+      return '🏏 Live Cricket Scores (ESPN Cricinfo)
+' + scoreLines.slice(0, 30).join('
+');
+    }
+    return null;
+  } catch(e) {
+    console.warn('[playwright] ESPN error:', e.message);
+    return null;
+  } finally {
+    await ctx.close().catch(() => {});
+  }
+}
+
+/**
+ * Google search with a real browser — works for general live queries.
+ */
+export async function googleLiveSearch(query) {
+  const { ctx, page } = await newPage();
+  try {
+    const url = 'https://www.google.com/search?q=' + encodeURIComponent(query) + '&hl=en&gl=in';
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
+    // Wait for either search results or a sports/answer card
+    await Promise.race([
+      page.waitForSelector('#search',          { timeout: 8000 }),
+      page.waitForSelector('[data-attrid]',    { timeout: 8000 }),
+      page.waitForSelector('.card-section',    { timeout: 8000 }),
+    ]).catch(() => {});
+    await page.waitForTimeout(2000);
+    const title = await page.title().catch(() => '');
+    const text  = await extractText(page);
+    return { text: text.slice(0, 6000), title };
+  } finally {
+    await ctx.close().catch(() => {});
+  }
+}
+
+/**
+ * Get live scores for any sport query.
+ * Cricket: Cricbuzz → ESPN → Google
+ * Others:  Google
  */
 export async function getLiveScore(query) {
-  const { text } = await googleLiveSearch(query + ' live score');
+  const isCricket = /cricket|ipl|odi|t20|test match|bcci|wicket|batting|bowling|over[s]?|ball by ball|scorecard/i.test(query);
+
+  if (isCricket) {
+    console.log('[playwright] Cricket query — trying Cricbuzz first');
+    const cb = await fromCricbuzz(query);
+    if (cb) return cb;
+
+    console.log('[playwright] Cricbuzz empty — trying ESPN Cricinfo');
+    const espn = await fromESPN(query);
+    if (espn) return espn;
+  }
+
+  // General / fallback: Google
+  console.log('[playwright] Falling back to Google live search');
+  const { text } = await googleLiveSearch(query + ' live score today');
   const lines = text.split('
 ').filter(l => l.trim().length > 2);
   const scoreLines = lines.filter(l =>
-    /d+[-/]d+|over[s]?|innings?|wicket|goal|run[s]?|point[s]?|set|period|live|score/i.test(l)
+    /d+[-/]d+|over[s]?|inning[s]?|wicket|goal|run[s]?|point[s]?|set|period|live|score/i.test(l)
   );
-  const result = (scoreLines.length ? scoreLines : lines.slice(0, 20)).join('
+  const result = (scoreLines.length ? scoreLines : lines.slice(0, 25)).join('
 ').slice(0, 2000);
-  return result || 'No live score data found.';
+  return result || null;
 }
