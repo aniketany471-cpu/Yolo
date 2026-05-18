@@ -12,6 +12,7 @@ aptPkgs = [
   "libxcb1",
   "libxkbcommon0",
   "libx11-6",
+  "libx11-xcb1",
   "libxcomposite1",
   "libxdamage1",
   "libxext6",
@@ -21,8 +22,9 @@ aptPkgs = [
   "libpango-1.0-0",
   "libcairo2",
   "libasound2",
-  "libx11-xcb1",
   "libxshmfence1",
   "libxss1",
-  "fonts-liberation"
+  "libgtk-3-0",
+  "fonts-liberation",
+  "ca-certificates"
 ]
