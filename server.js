@@ -528,11 +528,11 @@ if (!existingConfig?.openRouterKey || existingConfig.openRouterKey.length < 10) 
 }
 // Use env var so Railway redeployments pick up the key set in Railway Variables.
 // Never fall back to a hardcoded key — if the env var is absent the DB value stays as-is.
-const envBluesmindsKey = (process.env.BLUESMINDS_API_KEY || "").trim();
+const envBluesmindsKey = (process.env.BLUEMINDS_API_KEY || "").trim();
 if (envBluesmindsKey.length > 10) {
   db.prepare("UPDATE config SET bluesmindsApiKey = ? WHERE id = 1").run(envBluesmindsKey);
 } else if (!existingConfig?.bluesmindsApiKey || existingConfig.bluesmindsApiKey.length < 10) {
-  console.warn("[startup] BLUESMINDS_API_KEY env var not set and no key in DB — BluesMinds will not work until a key is added via the dashboard or Railway Variables.");
+  console.warn("[startup] BLUEMINDS_API_KEY env var not set and no key in DB — BluesMinds will not work until a key is added via the dashboard or Railway Variables.");
 }
 // Hard bootstrap: ensure auto-reply and BluesMinds are ON out of the box on every fresh deploy.
 // bluesmindsApiKey is intentionally NOT set here — it comes from env var or dashboard only.
