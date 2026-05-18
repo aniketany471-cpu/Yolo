@@ -1427,7 +1427,7 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
     }
     if (shouldSearch) {
       const results = await performWebSearch(prompt, config, isDeep);
-      if (results) {
+      if (results && results.trim().length > 30) {
         searchContext = `[LIVE SEARCH DATA — fetched right now]\n${results}\n[END SEARCH DATA]
 
 SEARCH RESPONSE RULES — follow exactly:
@@ -1465,6 +1465,15 @@ CRYPTO/FINANCE FORMAT EXAMPLE:
 GENERAL FORMAT:
 🔍 **[Topic]**
 [Key facts structured as short bullets or a clean short paragraph]`;
+      } else {
+        // Search attempted but returned nothing — prevent hallucination
+        searchContext = [
+          '[SEARCH ATTEMPTED — NO LIVE DATA RETRIEVED]',
+          'The system tried to fetch live data but got no usable results.',
+          'STRICT RULE: Do NOT make up scores, prices, match results, or any live information.',
+          'Tell the user honestly you could not get that live data right now.',
+          'Suggest they check Cricbuzz (cricket/IPL), Google Finance (stocks), or the relevant site directly.',
+        ].join('\n');
       }
     }
   }
