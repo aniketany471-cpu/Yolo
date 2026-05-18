@@ -13,7 +13,6 @@ import multer from "multer";
 import sharp from "sharp";
 import fs from "fs-extra";
 import yts from "yt-search";
-import youtubedl from "youtube-dl-exec";
 import { detectIntent } from "./router/intentRouter.js";
 import { TOOLS } from "./tools/index.js";
 import { createMemoryStore } from "./memory/memoryStore.js";
@@ -527,6 +526,9 @@ db.exec(`
     activeModel = COALESCE(activeModel, 'gpt-4o-mini')
   WHERE id = 1;
 `);
+const OPENROUTER_REFERER = process.env.OPENROUTER_REFERER || "https://github.com/Skyemike1/Skye";
+const OPENROUTER_TITLE = process.env.OPENROUTER_TITLE || "Skye Telegram Userbot";
+
 console.log("[startup] Bootstrap complete — provider/model preserved from config (no forced provider lock).");
 {
   const cfg = db.prepare("SELECT aiProvider, activeModel, geminiKey, groqKey, openRouterKey, xaiKey, bluesmindsApiKey FROM config WHERE id = 1").get() || {};
@@ -570,9 +572,6 @@ const REQUEST_TIMEOUT_MS = 15000;  // 15s per attempt — fails fast before fall
 const MAX_RETRIES = 1;             // 1 retry = max 30s total before giving up
 
 const BLUEMINDS_BASE_URL = "https://api.bluesminds.com/v1";
-const OPENROUTER_REFERER = process.env.OPENROUTER_REFERER || "https://github.com/Skyemike1/Skye";
-const OPENROUTER_TITLE = process.env.OPENROUTER_TITLE || "Skye Telegram Userbot";
-
 function resolveModelForProvider(provider, requested) {
   const m = (requested || "").trim();
   if (provider === "gemini") return m.startsWith("gemini-") ? m : "gemini-1.5-flash";
@@ -2576,33 +2575,9 @@ async function startServer() {
       console.error("[Log Error]:", e);
     }
   };
-  // ─── yt-dlp standalone binary — download/verify at startup ───────────────
-  // We bypass youtube-dl-exec's bundled binary entirely (it requires Python 3).
-  // Instead we download the official standalone Linux binary once and keep it
-  // inside the project directory so it persists across Railway restarts.
-  (async () => {
-    try {
-      let needsDownload = !fs.existsSync(YTDLP_BIN);
-      if (!needsDownload) {
-        // Verify it actually runs (not a broken/wrong-arch file)
-        try {
-          execSync(`"${YTDLP_BIN}" --version`, { stdio: "pipe", timeout: 10000 });
-          const ver = execSync(`"${YTDLP_BIN}" --version`, { stdio: "pipe", timeout: 10000 }).toString().trim();
-          console.log(`[ytdlp] Standalone binary OK: ${ver}`);
-          // Self-update (async — never block the event loop)
-          try { spawn(YTDLP_BIN, ['-U'], { stdio: 'ignore', detached: true }).unref(); } catch {}
-          return;
-        } catch {
-          needsDownload = true;
-        }
-      }
-      downloadYtdlpBinary();
-      const ver = execSync(`"${YTDLP_BIN}" --version`, { stdio: "pipe", timeout: 10000 }).toString().trim();
-      console.log(`[ytdlp] Binary ready: ${ver}`);
-    } catch (e) {
-      console.warn(`[ytdlp] Startup binary setup failed: ${e?.message}`);
-    }
-  })();
+  // yt-dlp/music download bootstrapping is intentionally not run at startup.
+  // Keeping startup free of external downloader installs prevents Railway runtime
+  // recovery from depending on GitHub/Python/youtube-dl-exec side effects.
 
   /**
    * Download a YouTube video as MP3 audio using yt-dlp.

@@ -10,7 +10,8 @@
     "preview": "vite preview",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
-    "audit:ai": "node scripts_ai_audit.mjs"
+    "audit:ai": "node scripts_ai_audit.mjs",
+    "rebuild:native": "npm_config_build_from_source=true npm_config_nodedir=$(node -p \"process.execPath.replace(/\\/bin\\/node$/, \\\"\\\")\") npm rebuild better-sqlite3 --foreground-scripts --ignore-scripts=false"
   },
   "dependencies": {
     "@distube/ytdl-core": "^4.16.12",
@@ -39,7 +40,6 @@
     "telegram": "^2.26.22",
     "tsx": "^4.21.0",
     "vite": "^6.2.3",
-    "youtube-dl-exec": "^3.1.6",
     "yt-search": "^2.13.1"
   },
   "devDependencies": {
@@ -52,5 +52,9 @@
     "tailwindcss": "^4.1.14",
     "typescript": "~5.8.2",
     "vite": "^6.2.3"
+  },
+  "engines": {
+    "node": "22.x",
+    "npm": ">=10"
   }
 }
