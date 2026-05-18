@@ -1138,6 +1138,21 @@ async function performWebSearch(query, config, deep = false) {
     }
   }
 
+  // 3. Playwright — headless Chromium fallback for JS-rendered live data
+  // Runs when Serper/Tavily are unavailable or return nothing.
+  // Launches a real browser so pages that require JS (scores, prices, live cards) render fully.
+  if (playwrightLiveSearch) {
+    try {
+      console.log(`[search] Playwright live fallback: "${query}"`);
+      const { text } = await playwrightLiveSearch(query);
+      if (text && text.length > 50) {
+        console.log(`[search] Playwright OK — ${text.length} chars`);
+        return text.slice(0, 3000);
+      }
+    } catch (e) {
+      console.warn(`[search] Playwright fallback failed: ${e.message}`);
+    }
+  }
   return "";
 }
 function cleanAIResponse(text, config) {
