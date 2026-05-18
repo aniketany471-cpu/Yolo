@@ -1131,6 +1131,15 @@ function isUsableResult(text, query) {
   return hits >= Math.max(1, Math.floor(words.length * 0.3));
 }
 
+/**
+ * Returns true only when text contains an actual live score pattern.
+ * Prevents search snippets that merely mention a sport (with player names,
+ * commentary links, etc.) from passing as real score data.
+ */
+function hasActualScoreData(text) {
+  return /\d+\/\d+|\d+\s*(?:run[s]?|wkt[s]?|wicket[s]?)|\bover[s]?\s*:\s*\d+|\b\d+\s*\/\s*\d+\s*\(|\b[A-Z]{2,}\s+\d+\/\d+/i.test(text);
+}
+
 async function performWebSearch(query, config, deep = false) {
   // 0. Weather queries — route directly to AccuWeather for accurate, city-aware results
   const isWeatherQuery = /\bweather\b|\btemperature\b|\btemp\b|\bforecast\b|\bhumidity\b|\brain\b.*\btoday|\bclimate\b.*\b(today|now|right now)\b/i.test(query);
@@ -1148,7 +1157,27 @@ async function performWebSearch(query, config, deep = false) {
     }
   }
 
-  // 1. Playwright — PRIORITY: headless Chromium renders JS pages fully for real live data
+  // 1. Sports score queries — route through getLiveScore (Cricbuzz → ESPN → Google filtered)
+  //    This runs BEFORE generic Playwright/Serper to avoid passing bare snippets to the AI.
+  const isSportsScoreQuery = /\b(?:live\s+)?(?:ipl|cricket|football|soccer|nba|nfl|f1|formula)\s*(?:score[s]?|result[s]?|match|live|update[s]?|standing[s]?)\b|\b(?:score[s]?|result[s]?)\s+(?:of|for|in)\s+(?:ipl|cricket|football|soccer)\b|\bipl\s+score|\bcricket\s+score|\blive\s+score[s]?\b/i.test(query);
+  if (isSportsScoreQuery && playwrightLiveScore) {
+    try {
+      console.log(`[search] Sports score query — Cricbuzz via getLiveScore: "${query}"`);
+      const score = await playwrightLiveScore(query);
+      if (score && hasActualScoreData(score)) {
+        console.log(`[search] getLiveScore OK — ${score.length} chars with real score data`);
+        return score;
+      }
+      console.warn('[search] getLiveScore returned no actual score patterns — no live match or Playwright unavailable');
+    } catch (e) {
+      console.warn(`[search] getLiveScore error: ${e.message}`);
+    }
+    // If we get here, no real score was found — return empty so AI gives honest reply
+    // Do NOT fall through to Serper which only has snippets, not scores
+    return '';
+  }
+
+  // 2. General Playwright — headless Chromium for JS-heavy live pages
   if (playwrightLiveSearch) {
     try {
       console.log(`[search] Playwright (priority): "${query}"`);
@@ -1162,7 +1191,7 @@ async function performWebSearch(query, config, deep = false) {
     }
   }
 
-  // 2. Serper — fallback API-based Google search
+  // 3. Serper — fallback API-based Google search
   if (serperSearch && (config.serperKey || process.env.SERPER_API_KEY)) {
     try {
       const result = await serperSearch(query, config);
@@ -1175,7 +1204,7 @@ async function performWebSearch(query, config, deep = false) {
     }
   }
 
-  // 3. Tavily — last resort API fallback
+  // 4. Tavily — last resort API fallback
   if (config.searchApiKey) {
     try {
       const depth = deep ? "advanced" : "basic";
@@ -1226,6 +1255,14 @@ function cleanAIResponse(text, config) {
     /who's batting\??/gi,
     /results? are being (?:tracked|monitored|updated)[^.]*\./gi,
     /live updates? (?:and|are) (?:available|being (?:tracked|provided))[^.]*\./gi,
+    // Robotic offer-to-help / fake-data endings
+    /want me to pull (?:up )?(?:more )?(?:specific )?details?[^?]*\?/gi,
+    /should i (?:check|look up|fetch|pull)[^?]*\?/gi,
+    /(?:shall|should) i (?:get|fetch|grab|pull)[^?]*\?/gi,
+    /(?:let me know|tell me) (?:if you|what you) (?:want|need)[^.]*\./gi,
+    /\bmentioned in the updates?\b[^.]*\./gi,
+    /\bfull ball-by-ball commentary[^.]*\./gi,
+    /\blooks like the current match involves[^.]*\./gi,
   ];
   for (const filler of fillers) {
     cleaned = cleaned.replace(filler, "");
@@ -1506,7 +1543,7 @@ HOW TO USE THIS DATA — read carefully:
 3. Reply like Donna — natural, direct, conversational. Not like a report or a card template.
 4. Use structure (bold, bullets) only when it genuinely helps readability — not by default.
 5. Match the reply length to what was asked: short question = short answer, complex query = detailed reply.
-6. For sports: lead with the actual score and match status, then add context if the data has it.
+6. SPORTS/SCORES — CRITICAL: Only state a score if you see an actual number pattern like "245/6 (20 ovs)" or "X runs, Y wickets" in the data above. If no such pattern exists, you do NOT have the score. Do NOT say "the match involves [player]", do NOT summarise match events, do NOT suggest checking Cricbuzz. Just say you couldn't pull the live score right now.
 7. For finance: lead with the actual price and change %, then add brief context.
 8. For weather: temp + condition first, then forecast if available.
 9. For news: summarize the key facts in plain language — no headline bullet templates.
