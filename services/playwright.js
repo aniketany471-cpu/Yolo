@@ -14,19 +14,68 @@ const NAV_TIMEOUT = 25_000;
 
 let browser = null;
 
-async function getBrowser() {
-  if (!browser || !browser.isConnected()) {
-    browser = await chromium.launch({
-      headless: true,
-      args: [
-        '--no-sandbox', '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage', '--disable-gpu',
-        '--no-first-run', '--no-zygote', '--single-process',
-        '--disable-blink-features=AutomationControlled',
-      ],
-    });
+// System Chromium paths tried if Playwright-managed binary fails
+const SYSTEM_CHROMIUM_PATHS = [
+  '/usr/bin/chromium-browser',
+  '/usr/bin/chromium',
+  '/usr/bin/google-chrome',
+  '/usr/bin/google-chrome-stable',
+];
+
+function findSystemChromium() {
+  for (const p of SYSTEM_CHROMIUM_PATHS) {
+    try {
+      // sync check using node built-in (works in ESM via createRequire trick)
+      const { statSync } = Object.assign({}, { statSync: (() => { try { return require('fs').statSync; } catch { return null; } })() });
+      if (statSync) statSync(p);
+      return p;
+    } catch {}
   }
-  return browser;
+  return undefined;
+}
+
+const LAUNCH_ARGS = [
+  '--no-sandbox',
+  '--disable-setuid-sandbox',
+  '--disable-dev-shm-usage',
+  '--disable-gpu',
+  '--no-first-run',
+  '--no-zygote',
+  '--disable-extensions',
+  '--disable-default-apps',
+  '--disable-background-networking',
+  '--disable-sync',
+  '--mute-audio',
+  '--disable-blink-features=AutomationControlled',
+];
+
+async function getBrowser() {
+  if (browser && browser.isConnected()) return browser;
+  browser = null;
+
+  // 1. Try Playwright-managed Chromium
+  try {
+    browser = await chromium.launch({ headless: true, args: LAUNCH_ARGS });
+    return browser;
+  } catch (e) {
+    console.warn('[playwright] Playwright Chromium failed:', e.message?.split('\n')[0]);
+    browser = null;
+  }
+
+  // 2. Try any system-installed Chromium as fallback
+  const sysChr = findSystemChromium();
+  if (sysChr) {
+    try {
+      console.warn('[playwright] Falling back to system Chromium:', sysChr);
+      browser = await chromium.launch({ headless: true, executablePath: sysChr, args: LAUNCH_ARGS });
+      return browser;
+    } catch (e2) {
+      console.error('[playwright] System Chromium also failed:', e2.message?.split('\n')[0]);
+      browser = null;
+    }
+  }
+
+  throw new Error('Playwright: all Chromium launch attempts failed');
 }
 
 process.on('exit',    () => { if (browser) browser.close().catch(() => {}); });
