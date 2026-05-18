@@ -33,16 +33,14 @@ try {
 } catch (_serperErr) {
   console.warn("[serper] Search service unavailable:", _serperErr.message);
 }
-// Playwright live scraper — headless Chromium for JS-rendered live data
-let playwrightLiveSearch = null, playwrightLiveScore = null, playwrightWeather = null;
+// Gemini grounding search — live web data via Google Search (no Chromium needed)
+let geminiGroundedSearch = null;
 try {
-  const _pwMod = await import("./services/playwright.js");
-  playwrightLiveSearch = _pwMod.googleLiveSearch;
-  playwrightLiveScore = _pwMod.getLiveScore;
-  playwrightWeather   = _pwMod.getWeather;
-  console.log("[playwright] Live scraper loaded OK");
-} catch (_pwErr) {
-  console.warn("[playwright] Unavailable:", _pwErr.message);
+  const _gsm = await import("./tools/geminiSearch.js");
+  geminiGroundedSearch = _gsm.geminiGroundedSearch;
+  console.log("[gemini-search] Grounding search loaded OK");
+} catch (_gsErr) {
+  console.warn("[gemini-search] Unavailable:", _gsErr.message);
 }
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1141,60 +1139,29 @@ function hasActualScoreData(text) {
 }
 
 async function performWebSearch(query, config, deep = false) {
-  // 0. Weather queries — route directly to AccuWeather for accurate, city-aware results
-  const isWeatherQuery = /\bweather\b|\btemperature\b|\btemp\b|\bforecast\b|\bhumidity\b|\brain\b.*\btoday|\bclimate\b.*\b(today|now|right now)\b/i.test(query);
-  if (isWeatherQuery && playwrightWeather) {
+  const geminiKey = (config.geminiKey || process.env.GEMINI_API_KEY || "").trim();
+
+  // 1. Gemini grounding — real-time Google Search via Gemini, no Chromium needed
+  if (geminiGroundedSearch && geminiKey) {
     try {
-      console.log(`[search] Weather query — AccuWeather: "${query}"`);
-      const result = await playwrightWeather(query);
-      if (result && result.length > 60) {
-        console.log(`[search] AccuWeather OK — ${result.length} chars`);
+      console.log(`[search] Gemini grounding: "${query}"`);
+      const result = await geminiGroundedSearch(query, geminiKey);
+      if (result && result.trim().length > 30) {
+        console.log(`[search] Gemini grounding OK — ${result.length} chars`);
         return result;
       }
-      console.warn('[search] AccuWeather returned nothing, falling through to general search');
+      console.warn("[search] Gemini grounding returned nothing — falling through");
     } catch (e) {
-      console.warn(`[search] AccuWeather failed: ${e.message}`);
+      console.warn(`[search] Gemini grounding failed: ${e.message}`);
     }
   }
 
-  // 1. Sports score queries — route through getLiveScore (Cricbuzz → ESPN → Google filtered)
-  //    This runs BEFORE generic Playwright/Serper to avoid passing bare snippets to the AI.
-  const isSportsScoreQuery = /\b(?:live\s+)?(?:ipl|cricket|football|soccer|nba|nfl|f1|formula)\s*(?:score[s]?|result[s]?|match|live|update[s]?|standing[s]?)\b|\b(?:score[s]?|result[s]?)\s+(?:of|for|in)\s+(?:ipl|cricket|football|soccer)\b|\bipl\s+score|\bcricket\s+score|\blive\s+score[s]?\b/i.test(query);
-  if (isSportsScoreQuery && playwrightLiveScore) {
-    try {
-      console.log(`[search] Sports score query — trying all sources (IPL → Cricbuzz → ESPN → NDTV → Google): "${query}"`);
-      const score = await playwrightLiveScore(query);
-      if (score && hasActualScoreData(score)) {
-        console.log(`[search] getLiveScore OK — ${score.length} chars with real score data`);
-        return score;
-      }
-      console.warn('[search] getLiveScore returned no actual score patterns — no live match or Playwright unavailable');
-    } catch (e) {
-      console.warn(`[search] getLiveScore error: ${e.message}`);
-    }
-    // Fall through to Serper/Tavily — system prompt already blocks hallucination for missing scores
-  }
-
-  // 2. General Playwright — headless Chromium for JS-heavy live pages
-  if (playwrightLiveSearch) {
-    try {
-      console.log(`[search] Playwright (priority): "${query}"`);
-      const { text } = await playwrightLiveSearch(query);
-      if (isUsableResult(text, query)) {
-        console.log(`[search] Playwright OK — ${text.length} chars`);
-        return text.slice(0, 3000);
-      }
-    } catch (e) {
-      console.warn(`[search] Playwright failed, trying APIs: ${e.message}`);
-    }
-  }
-
-  // 3. Serper — fallback API-based Google search
+  // 2. Serper — API-based Google search fallback
   if (serperSearch && (config.serperKey || process.env.SERPER_API_KEY)) {
     try {
       const result = await serperSearch(query, config);
       if (result?.summary) {
-        console.log(`[search] Serper fallback OK — intent=${result.intent}`);
+        console.log(`[search] Serper OK — intent=${result.intent}`);
         return result.summary;
       }
     } catch (e) {
@@ -1202,16 +1169,15 @@ async function performWebSearch(query, config, deep = false) {
     }
   }
 
-  // 4. Tavily — last resort API fallback
+  // 3. Tavily — last resort
   if (config.searchApiKey) {
     try {
       const depth = deep ? "advanced" : "basic";
-      const maxResults = deep ? 6 : 3;
       console.log(`[search] Tavily last resort: "${query}"`);
       const response = await fetch("https://api.tavily.com/search", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ api_key: config.searchApiKey, query, search_depth: depth, max_results: maxResults })
+        body: JSON.stringify({ api_key: config.searchApiKey, query, search_depth: depth, max_results: deep ? 6 : 3 })
       });
       if (response.ok) {
         const data = await response.json();
