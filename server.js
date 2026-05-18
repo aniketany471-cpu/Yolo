@@ -60,7 +60,7 @@ const ENV_KEYS = {
   xaiKey: ["XAI_API_KEY"],
   bluesmindsApiKey: ["BLUEMINDS_API_KEY"],
   serperKey: ["SERPER_API_KEY"],
-  searchApiKey: ["TAVILY_API_KEY"],
+  searchApiKey: ["TAVILY_API_KEY", "SEARCH_API_KEY"],
   zimageKey: ["ZIMAGE_API_KEY"],
   openrouterReferer: ["OPENROUTER_REFERER"],
   openrouterTitle: ["OPENROUTER_TITLE"],
@@ -75,11 +75,9 @@ function envSecret(...names) {
 }
 
 function configOrEnv(config, configKey, ...envNames) {
-  const envValue = envSecret(...envNames);
-  if (envValue) return envValue;
   const configValue = (config?.[configKey] ?? "").toString().trim();
   if (configValue && configValue !== "undefined" && configValue !== "null") return configValue;
-  return "";
+  return envSecret(...envNames);
 }
 
 function envPresence(...names) {
@@ -99,32 +97,14 @@ function logRuntimeEnvPresence(label = "startup") {
     XAI_API_KEY: envPresence(...ENV_KEYS.xaiKey),
     BLUEMINDS_API_KEY: envPresence(...ENV_KEYS.bluesmindsApiKey),
     SERPER_API_KEY: envPresence(...ENV_KEYS.serperKey),
-    TAVILY_API_KEY: envPresence(...ENV_KEYS.searchApiKey),
+    TAVILY_API_KEY: envPresence("TAVILY_API_KEY"),
+    SEARCH_API_KEY: envPresence("SEARCH_API_KEY"),
     ZIMAGE_API_KEY: envPresence(...ENV_KEYS.zimageKey),
     OPENROUTER_REFERER: envPresence(...ENV_KEYS.openrouterReferer),
     OPENROUTER_TITLE: envPresence(...ENV_KEYS.openrouterTitle),
     NODE_ENV: process.env.NODE_ENV ? "present" : "missing",
     PORT: process.env.PORT ? "present" : "missing"
   }));
-}
-
-function getProviderDiagnostics(config = {}) {
-  const telegramApiId = configOrEnv(config, "telegramApiId", ...ENV_KEYS.telegramApiId);
-  const telegramReady = /^\d+$/.test(telegramApiId) &&
-    !!configOrEnv(config, "telegramApiHash", ...ENV_KEYS.telegramApiHash) &&
-    !!configOrEnv(config, "telegramStringSession", ...ENV_KEYS.telegramStringSession);
-
-  return {
-    gemini: !!configOrEnv(config, "geminiKey", ...ENV_KEYS.geminiKey),
-    groq: !!configOrEnv(config, "groqKey", ...ENV_KEYS.groqKey),
-    openRouter: !!configOrEnv(config, "openRouterKey", ...ENV_KEYS.openRouterKey),
-    xai: !!configOrEnv(config, "xaiKey", ...ENV_KEYS.xaiKey),
-    bluesminds: !!configOrEnv(config, "bluesmindsApiKey", ...ENV_KEYS.bluesmindsApiKey),
-    serper: !!configOrEnv(config, "serperKey", ...ENV_KEYS.serperKey),
-    tavily: !!configOrEnv(config, "searchApiKey", ...ENV_KEYS.searchApiKey),
-    zimage: !!envSecret(...ENV_KEYS.zimageKey),
-    telegram: telegramReady
-  };
 }
 
 // ── Standalone yt-dlp binary (downloaded at startup, no Python needed) ───────
@@ -604,10 +584,8 @@ db.exec(`
     activeModel = COALESCE(activeModel, 'gpt-4o-mini')
   WHERE id = 1;
 `);
-const OPENROUTER_REFERER = envSecret(...ENV_KEYS.openrouterReferer) || "https://github.com/Skyemike1/Skye";
-const OPENROUTER_TITLE = envSecret(...ENV_KEYS.openrouterTitle) || "Skye Telegram Userbot";
-
-logRuntimeEnvPresence();
+const OPENROUTER_REFERER = process.env.OPENROUTER_REFERER || "https://github.com/Skyemike1/Skye";
+const OPENROUTER_TITLE = process.env.OPENROUTER_TITLE || "Skye Telegram Userbot";
 
 console.log("[startup] Bootstrap complete — provider/model preserved from config (no forced provider lock).");
 {
@@ -615,9 +593,13 @@ console.log("[startup] Bootstrap complete — provider/model preserved from conf
   const diag = {
     provider: cfg.aiProvider || "unknown",
     activeModel: cfg.activeModel || "unset",
-    providers: getProviderDiagnostics(cfg),
-    openrouterReferer: !!OPENROUTER_REFERER,
-    openrouterTitle: !!OPENROUTER_TITLE
+    geminiKey: !!configOrEnv(cfg, "geminiKey", ...ENV_KEYS.geminiKey),
+    groqKey: !!configOrEnv(cfg, "groqKey", ...ENV_KEYS.groqKey),
+    openRouterKey: !!configOrEnv(cfg, "openRouterKey", ...ENV_KEYS.openRouterKey),
+    xaiKey: !!configOrEnv(cfg, "xaiKey", ...ENV_KEYS.xaiKey),
+    bluesmindsKey: !!configOrEnv(cfg, "bluesmindsApiKey", ...ENV_KEYS.bluesmindsApiKey),
+    openrouterReferer: OPENROUTER_REFERER ? "set" : "missing",
+    openrouterTitle: OPENROUTER_TITLE ? "set" : "missing"
   };
   console.log("[startup][providers]", JSON.stringify(diag));
 }
@@ -2185,8 +2167,13 @@ async function startServer() {
           isListenerActive,
           lastEventTimestamp,
           clientReady: !!client,
-          aiConfigured: !!(providers.gemini || providers.groq || providers.openRouter || providers.xai || providers.bluesminds),
-          providers
+          aiConfigured: !!(
+            configOrEnv(config, "geminiKey", ...ENV_KEYS.geminiKey) ||
+            configOrEnv(config, "groqKey", ...ENV_KEYS.groqKey) ||
+            configOrEnv(config, "openRouterKey", ...ENV_KEYS.openRouterKey) ||
+            configOrEnv(config, "xaiKey", ...ENV_KEYS.xaiKey) ||
+            configOrEnv(config, "bluesmindsApiKey", ...ENV_KEYS.bluesmindsApiKey)
+          )
         }
       };
       res.json(payload);

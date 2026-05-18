@@ -11,7 +11,7 @@
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
     "audit:ai": "node scripts_ai_audit.mjs",
-    "rebuild:native": "node -e \"const Database=require(\\\"better-sqlite3\\\"); const db=new Database(\\\":memory:\\\"); db.close();\" || (cd node_modules/better-sqlite3 && npm_config_build_from_source=true npm_config_nodedir=$(node -p \"process.execPath.replace(/\\/bin\\/node$/, \\\"\\\")\") npm run build-release --foreground-scripts)"
+    "rebuild:native": "npm_config_build_from_source=true npm_config_nodedir=$(node -p \"process.execPath.replace(/\\/bin\\/node$/, \\\"\\\")\") npm rebuild better-sqlite3 --foreground-scripts --ignore-scripts=false"
   },
   "dependencies": {
     "@distube/ytdl-core": "^4.16.12",

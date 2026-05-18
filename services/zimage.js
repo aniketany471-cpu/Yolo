@@ -146,7 +146,7 @@ export async function generateImage(prompt, config = {}, options = {}) {
   }
 
   // 2. Bluesminds (fallback)
-  const bmKey = envSecret("BLUEMINDS_API_KEY") || (config.bluesmindsApiKey || "").trim();
+  const bmKey = ((config.bluesmindsApiKey || "").trim() || envSecret("BLUEMINDS_API_KEY"));
   if (bmKey) {
     try {
       const buffer = await bluesmindsImage(prompt, bmKey);
