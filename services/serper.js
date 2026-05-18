@@ -336,7 +336,7 @@ export function needsSearch(text) {
  * @returns {{ summary: string, intent: string, optimizedQuery: string, corrected: string, confidence: number } | null}
  */
 export async function serperSearch(rawQuery, config) {
-  const key = config.serperKey || process.env.SERPER_API_KEY;
+  const key = ((config.serperKey || "").trim() || (process.env.SERPER_API_KEY || "").trim());
   if (!key) return null;
 
   const corrected = correctTypos(rawQuery);
