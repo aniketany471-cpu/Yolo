@@ -1,5 +1,0 @@
-[phases.install]
-cmds = ['npm install']
-
-[phases.build]
-cmds = ['npm run build', 'curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && chmod +x /usr/local/bin/yt-dlp && yt-dlp --version', 'npx playwright install chromium --with-deps && echo Playwright Chromium installed']
