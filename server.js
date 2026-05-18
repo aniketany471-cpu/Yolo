@@ -584,10 +584,8 @@ db.exec(`
     activeModel = COALESCE(activeModel, 'gpt-4o-mini')
   WHERE id = 1;
 `);
-const OPENROUTER_REFERER = envSecret(...ENV_KEYS.openrouterReferer) || "https://github.com/Skyemike1/Skye";
-const OPENROUTER_TITLE = envSecret(...ENV_KEYS.openrouterTitle) || "Skye Telegram Userbot";
-
-logRuntimeEnvPresence();
+const OPENROUTER_REFERER = process.env.OPENROUTER_REFERER || "https://github.com/Skyemike1/Skye";
+const OPENROUTER_TITLE = process.env.OPENROUTER_TITLE || "Skye Telegram Userbot";
 
 console.log("[startup] Bootstrap complete — provider/model preserved from config (no forced provider lock).");
 {
