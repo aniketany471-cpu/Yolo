@@ -34,11 +34,12 @@ try {
   console.warn("[serper] Search service unavailable:", _serperErr.message);
 }
 // Playwright live scraper — headless Chromium for JS-rendered live data
-let playwrightLiveSearch = null, playwrightLiveScore = null;
+let playwrightLiveSearch = null, playwrightLiveScore = null, playwrightWeather = null;
 try {
   const _pwMod = await import("./services/playwright.js");
   playwrightLiveSearch = _pwMod.googleLiveSearch;
   playwrightLiveScore = _pwMod.getLiveScore;
+  playwrightWeather   = _pwMod.getWeather;
   console.log("[playwright] Live scraper loaded OK");
 } catch (_pwErr) {
   console.warn("[playwright] Unavailable:", _pwErr.message);
@@ -1131,6 +1132,22 @@ function isUsableResult(text, query) {
 }
 
 async function performWebSearch(query, config, deep = false) {
+  // 0. Weather queries — route directly to AccuWeather for accurate, city-aware results
+  const isWeatherQuery = /\bweather\b|\btemperature\b|\btemp\b|\bforecast\b|\bhumidity\b|\brain\b.*\btoday|\bclimate\b.*\b(today|now|right now)\b/i.test(query);
+  if (isWeatherQuery && playwrightWeather) {
+    try {
+      console.log(`[search] Weather query — AccuWeather: "${query}"`);
+      const result = await playwrightWeather(query);
+      if (result && result.length > 60) {
+        console.log(`[search] AccuWeather OK — ${result.length} chars`);
+        return result;
+      }
+      console.warn('[search] AccuWeather returned nothing, falling through to general search');
+    } catch (e) {
+      console.warn(`[search] AccuWeather failed: ${e.message}`);
+    }
+  }
+
   // 1. Playwright — PRIORITY: headless Chromium renders JS pages fully for real live data
   if (playwrightLiveSearch) {
     try {
