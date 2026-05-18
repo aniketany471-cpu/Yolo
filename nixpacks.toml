@@ -1,0 +1,8 @@
+[phases.install]
+cmds = ["npm install --legacy-peer-deps --ignore-scripts"]
+
+[phases.build]
+cmds = ["curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && chmod +x /usr/local/bin/yt-dlp"]
+
+[start]
+cmd = "npm start"
