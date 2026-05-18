@@ -2,7 +2,7 @@
 nixPkgs = ["nodejs_22", "python312", "gcc", "gnumake", "pkg-config"]
 
 [phases.install]
-cmds = ["npm ci --legacy-peer-deps"]
+cmds = ["npm ci --legacy-peer-deps --ignore-scripts"]
 
 [phases.build]
 cmds = ["npm run rebuild:native", "npm run build"]
