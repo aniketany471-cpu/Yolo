@@ -1103,12 +1103,26 @@ function detectMood(text) {
 }
 
 async function performWebSearch(query, config, deep = false) {
-  // 1. Serper — primary real-time Google search
+  // 1. Playwright — PRIORITY: headless Chromium renders JS pages fully for real live data
+  if (playwrightLiveSearch) {
+    try {
+      console.log(`[search] Playwright (priority): "${query}"`);
+      const { text } = await playwrightLiveSearch(query);
+      if (text && text.length > 50) {
+        console.log(`[search] Playwright OK — ${text.length} chars`);
+        return text.slice(0, 3000);
+      }
+    } catch (e) {
+      console.warn(`[search] Playwright failed, trying APIs: ${e.message}`);
+    }
+  }
+
+  // 2. Serper — fallback API-based Google search
   if (serperSearch && (config.serperKey || process.env.SERPER_API_KEY)) {
     try {
       const result = await serperSearch(query, config);
       if (result?.summary) {
-        console.log(`[search] Serper OK — intent=${result.intent} query="${result.optimizedQuery}"`);
+        console.log(`[search] Serper fallback OK — intent=${result.intent}`);
         return result.summary;
       }
     } catch (e) {
@@ -1116,12 +1130,12 @@ async function performWebSearch(query, config, deep = false) {
     }
   }
 
-  // 2. Tavily — fallback
+  // 3. Tavily — last resort API fallback
   if (config.searchApiKey) {
     try {
       const depth = deep ? "advanced" : "basic";
       const maxResults = deep ? 6 : 3;
-      console.log(`[search] Tavily ${depth} fallback: "${query}"`);
+      console.log(`[search] Tavily last resort: "${query}"`);
       const response = await fetch("https://api.tavily.com/search", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1134,25 +1148,10 @@ async function performWebSearch(query, config, deep = false) {
         }
       }
     } catch (e) {
-      console.warn(`[search] Tavily fallback failed: ${e.message}`);
+      console.warn(`[search] Tavily failed: ${e.message}`);
     }
   }
 
-  // 3. Playwright — headless Chromium fallback for JS-rendered live data
-  // Runs when Serper/Tavily are unavailable or return nothing.
-  // Launches a real browser so pages that require JS (scores, prices, live cards) render fully.
-  if (playwrightLiveSearch) {
-    try {
-      console.log(`[search] Playwright live fallback: "${query}"`);
-      const { text } = await playwrightLiveSearch(query);
-      if (text && text.length > 50) {
-        console.log(`[search] Playwright OK — ${text.length} chars`);
-        return text.slice(0, 3000);
-      }
-    } catch (e) {
-      console.warn(`[search] Playwright fallback failed: ${e.message}`);
-    }
-  }
   return "";
 }
 function cleanAIResponse(text, config) {
