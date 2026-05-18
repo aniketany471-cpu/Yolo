@@ -3184,6 +3184,12 @@ async function startServer() {
 
         if (aiRes && client2) {
           // ── Image generation routing ─────────────────────────────────────
+          // Strip any [IMAGE_GENERATION] tags the AI hallucinated without the user asking
+          const userActuallyWantsImage = /\b(create|generate|make|draw|design|paint|render|visualize|imagine|sketch|depict|give me|send me)\b[\s\S]{0,80}\b(image|photo|pic|picture|wallpaper|artwork|illustration|anime|drawing|portrait|logo|banner|poster)\b/i.test(text);
+          if (!userActuallyWantsImage && /\[IMAGE_GENERATION\]/i.test(aiRes)) {
+            addLog(`[img] AI hallucinated [IMAGE_GENERATION] tag — user did not request an image. Stripping tag.`, "warn");
+            aiRes = aiRes.replace(/\[IMAGE_GENERATION\][\s\S]*?\[\/IMAGE_GENERATION\]/gi, '').trim();
+          }
           const imgMatch = aiRes.match(/\[IMAGE_GENERATION\]([\s\S]*?)\[\/IMAGE_GENERATION\]/i);
           if (imgMatch) {
             const imgPrompt = imgMatch[1].trim();
