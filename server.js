@@ -1,3 +1,4 @@
+import "dotenv/config";
 import { execSync, spawn } from "child_process";
 import express from "express";
 import { createServer as createViteServer } from "vite";
@@ -13,7 +14,6 @@ import multer from "multer";
 import sharp from "sharp";
 import fs from "fs-extra";
 import yts from "yt-search";
-import youtubedl from "youtube-dl-exec";
 import { detectIntent } from "./router/intentRouter.js";
 import { TOOLS } from "./tools/index.js";
 import { createMemoryStore } from "./memory/memoryStore.js";
@@ -50,6 +50,83 @@ try {
 }
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const ENV_KEYS = {
+  telegramApiId: ["TELEGRAM_API_ID"],
+  telegramApiHash: ["TELEGRAM_API_HASH"],
+  telegramStringSession: ["TELEGRAM_STRING_SESSION"],
+  geminiKey: ["GEMINI_API_KEY"],
+  groqKey: ["GROQ_API_KEY"],
+  openRouterKey: ["OPENROUTER_API_KEY"],
+  xaiKey: ["XAI_API_KEY"],
+  bluesmindsApiKey: ["BLUEMINDS_API_KEY"],
+  serperKey: ["SERPER_API_KEY"],
+  searchApiKey: ["TAVILY_API_KEY"],
+  zimageKey: ["ZIMAGE_API_KEY"],
+  openrouterReferer: ["OPENROUTER_REFERER"],
+  openrouterTitle: ["OPENROUTER_TITLE"],
+};
+
+function envSecret(...names) {
+  for (const name of names) {
+    const value = (process.env[name] || "").trim();
+    if (value && value !== "undefined" && value !== "null") return value;
+  }
+  return "";
+}
+
+function configOrEnv(config, configKey, ...envNames) {
+  const envValue = envSecret(...envNames);
+  if (envValue) return envValue;
+  const configValue = (config?.[configKey] ?? "").toString().trim();
+  if (configValue && configValue !== "undefined" && configValue !== "null") return configValue;
+  return "";
+}
+
+function envPresence(...names) {
+  return names.some((name) => !!envSecret(name)) ? "present" : "missing";
+}
+
+function logRuntimeEnvPresence(label = "startup") {
+  const telegramApiId = envSecret(...ENV_KEYS.telegramApiId);
+  console.log(`[${label}][env]`, JSON.stringify({
+    TELEGRAM_API_ID: envPresence(...ENV_KEYS.telegramApiId),
+    TELEGRAM_API_ID_NUMERIC: /^\d+$/.test(telegramApiId) ? "yes" : (telegramApiId ? "no" : "missing"),
+    TELEGRAM_API_HASH: envPresence(...ENV_KEYS.telegramApiHash),
+    TELEGRAM_STRING_SESSION: envPresence(...ENV_KEYS.telegramStringSession),
+    GEMINI_API_KEY: envPresence(...ENV_KEYS.geminiKey),
+    GROQ_API_KEY: envPresence(...ENV_KEYS.groqKey),
+    OPENROUTER_API_KEY: envPresence(...ENV_KEYS.openRouterKey),
+    XAI_API_KEY: envPresence(...ENV_KEYS.xaiKey),
+    BLUEMINDS_API_KEY: envPresence(...ENV_KEYS.bluesmindsApiKey),
+    SERPER_API_KEY: envPresence(...ENV_KEYS.serperKey),
+    TAVILY_API_KEY: envPresence(...ENV_KEYS.searchApiKey),
+    ZIMAGE_API_KEY: envPresence(...ENV_KEYS.zimageKey),
+    OPENROUTER_REFERER: envPresence(...ENV_KEYS.openrouterReferer),
+    OPENROUTER_TITLE: envPresence(...ENV_KEYS.openrouterTitle),
+    NODE_ENV: process.env.NODE_ENV ? "present" : "missing",
+    PORT: process.env.PORT ? "present" : "missing"
+  }));
+}
+
+function getProviderDiagnostics(config = {}) {
+  const telegramApiId = configOrEnv(config, "telegramApiId", ...ENV_KEYS.telegramApiId);
+  const telegramReady = /^\d+$/.test(telegramApiId) &&
+    !!configOrEnv(config, "telegramApiHash", ...ENV_KEYS.telegramApiHash) &&
+    !!configOrEnv(config, "telegramStringSession", ...ENV_KEYS.telegramStringSession);
+
+  return {
+    gemini: !!configOrEnv(config, "geminiKey", ...ENV_KEYS.geminiKey),
+    groq: !!configOrEnv(config, "groqKey", ...ENV_KEYS.groqKey),
+    openRouter: !!configOrEnv(config, "openRouterKey", ...ENV_KEYS.openRouterKey),
+    xai: !!configOrEnv(config, "xaiKey", ...ENV_KEYS.xaiKey),
+    bluesminds: !!configOrEnv(config, "bluesmindsApiKey", ...ENV_KEYS.bluesmindsApiKey),
+    serper: !!configOrEnv(config, "serperKey", ...ENV_KEYS.serperKey),
+    tavily: !!configOrEnv(config, "searchApiKey", ...ENV_KEYS.searchApiKey),
+    zimage: !!envSecret(...ENV_KEYS.zimageKey),
+    telegram: telegramReady
+  };
+}
+
 // ── Standalone yt-dlp binary (downloaded at startup, no Python needed) ───────
 // Prefer /usr/local/bin/yt-dlp (installed by Railway build command) over app-dir copy
   const YTDLP_BIN = (() => {
@@ -527,19 +604,20 @@ db.exec(`
     activeModel = COALESCE(activeModel, 'gpt-4o-mini')
   WHERE id = 1;
 `);
+const OPENROUTER_REFERER = envSecret(...ENV_KEYS.openrouterReferer) || "https://github.com/Skyemike1/Skye";
+const OPENROUTER_TITLE = envSecret(...ENV_KEYS.openrouterTitle) || "Skye Telegram Userbot";
+
+logRuntimeEnvPresence();
+
 console.log("[startup] Bootstrap complete — provider/model preserved from config (no forced provider lock).");
 {
   const cfg = db.prepare("SELECT aiProvider, activeModel, geminiKey, groqKey, openRouterKey, xaiKey, bluesmindsApiKey FROM config WHERE id = 1").get() || {};
   const diag = {
     provider: cfg.aiProvider || "unknown",
     activeModel: cfg.activeModel || "unset",
-    geminiKey: !!(cfg.geminiKey || process.env.GEMINI_API_KEY),
-    groqKey: !!cfg.groqKey,
-    openRouterKey: !!cfg.openRouterKey,
-    xaiKey: !!(cfg.xaiKey || process.env.XAI_API_KEY),
-    bluesmindsKey: !!(cfg.bluesmindsApiKey || process.env.BLUEMINDS_API_KEY),
-    openrouterReferer: OPENROUTER_REFERER ? "set" : "missing",
-    openrouterTitle: OPENROUTER_TITLE ? "set" : "missing"
+    providers: getProviderDiagnostics(cfg),
+    openrouterReferer: !!OPENROUTER_REFERER,
+    openrouterTitle: !!OPENROUTER_TITLE
   };
   console.log("[startup][providers]", JSON.stringify(diag));
 }
@@ -550,14 +628,14 @@ console.log("[startup] Bootstrap complete — provider/model preserved from conf
     "SELECT telegramApiId, telegramApiHash, telegramStringSession, geminiKey FROM config WHERE id = 1"
   ).get();
   const envUpdates = {};
-  if (!envBootstrap?.telegramApiId && process.env.TELEGRAM_API_ID)
-    envUpdates.telegramApiId = process.env.TELEGRAM_API_ID;
-  if (!envBootstrap?.telegramApiHash && process.env.TELEGRAM_API_HASH)
-    envUpdates.telegramApiHash = process.env.TELEGRAM_API_HASH;
-  if (!envBootstrap?.telegramStringSession && process.env.TELEGRAM_STRING_SESSION)
-    envUpdates.telegramStringSession = process.env.TELEGRAM_STRING_SESSION;
-  if (!envBootstrap?.geminiKey && process.env.GEMINI_API_KEY)
-    envUpdates.geminiKey = process.env.GEMINI_API_KEY;
+  if (!envBootstrap?.telegramApiId && envSecret(...ENV_KEYS.telegramApiId))
+    envUpdates.telegramApiId = envSecret(...ENV_KEYS.telegramApiId);
+  if (!envBootstrap?.telegramApiHash && envSecret(...ENV_KEYS.telegramApiHash))
+    envUpdates.telegramApiHash = envSecret(...ENV_KEYS.telegramApiHash);
+  if (!envBootstrap?.telegramStringSession && envSecret(...ENV_KEYS.telegramStringSession))
+    envUpdates.telegramStringSession = envSecret(...ENV_KEYS.telegramStringSession);
+  if (!envBootstrap?.geminiKey && envSecret(...ENV_KEYS.geminiKey))
+    envUpdates.geminiKey = envSecret(...ENV_KEYS.geminiKey);
   if (Object.keys(envUpdates).length > 0) {
     for (const [k, v] of Object.entries(envUpdates)) {
       db.prepare(`UPDATE config SET ${k} = ? WHERE id = 1`).run(v);
@@ -570,9 +648,6 @@ const REQUEST_TIMEOUT_MS = 15000;  // 15s per attempt — fails fast before fall
 const MAX_RETRIES = 1;             // 1 retry = max 30s total before giving up
 
 const BLUEMINDS_BASE_URL = "https://api.bluesminds.com/v1";
-const OPENROUTER_REFERER = process.env.OPENROUTER_REFERER || "https://github.com/Skyemike1/Skye";
-const OPENROUTER_TITLE = process.env.OPENROUTER_TITLE || "Skye Telegram Userbot";
-
 function resolveModelForProvider(provider, requested) {
   const m = (requested || "").trim();
   if (provider === "gemini") return m.startsWith("gemini-") ? m : "gemini-1.5-flash";
@@ -890,7 +965,7 @@ function extractBmDelta(chunk) {
  * when the model is broken (tier restriction, suspended, not found, timeout, etc.).
  */
 async function getBluesMindsResponse(prompt, apiKey, model = "gpt-4o-mini", context = [], systemInstruction, _visited = new Set()) {
-  const cleanKey = (apiKey || process.env.BLUEMINDS_API_KEY || "").trim();
+  const cleanKey = (apiKey || envSecret(...ENV_KEYS.bluesmindsApiKey)).trim();
   if (!cleanKey || cleanKey === "undefined" || cleanKey === "null" || cleanKey.length < 10) {
     console.warn("[BluesMinds] No valid API key configured.");
     return null;
@@ -965,7 +1040,7 @@ async function _bmFallback(prompt, cleanKey, failedModel, context, systemInstruc
  *   }
  */
 async function* getBluesMindsStream(prompt, apiKey, model = "gpt-4o-mini", context = [], systemInstruction) {
-  const cleanKey = (apiKey || process.env.BLUEMINDS_API_KEY || "").trim();
+  const cleanKey = (apiKey || envSecret(...ENV_KEYS.bluesmindsApiKey)).trim();
   if (!cleanKey || cleanKey.length < 10) return;
 
   const messages = normalizeContextMessages(prompt, context, systemInstruction);
@@ -1132,9 +1207,9 @@ function detectMood(text) {
 
 async function performWebSearch(query, config, deep = false) {
   // 1. Serper — primary real-time Google search
-  if (serperSearch && (config.serperKey || process.env.SERPER_API_KEY)) {
+  if (serperSearch && configOrEnv(config, "serperKey", ...ENV_KEYS.serperKey)) {
     try {
-      const result = await serperSearch(query, config);
+      const result = await serperSearch(query, { ...config, serperKey: configOrEnv(config, "serperKey", ...ENV_KEYS.serperKey) });
       if (result?.summary) {
         console.log(`[search] Serper OK — intent=${result.intent} query="${result.optimizedQuery}"`);
         return result.summary;
@@ -1145,7 +1220,8 @@ async function performWebSearch(query, config, deep = false) {
   }
 
   // 2. Tavily — fallback
-  if (config.searchApiKey) {
+  const tavilyKey = configOrEnv(config, "searchApiKey", ...ENV_KEYS.searchApiKey);
+  if (tavilyKey) {
     try {
       const depth = deep ? "advanced" : "basic";
       const maxResults = deep ? 6 : 3;
@@ -1153,7 +1229,7 @@ async function performWebSearch(query, config, deep = false) {
       const response = await fetch("https://api.tavily.com/search", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ api_key: config.searchApiKey, query, search_depth: depth, max_results: maxResults })
+        body: JSON.stringify({ api_key: tavilyKey, query, search_depth: depth, max_results: maxResults })
       });
       if (response.ok) {
         const data = await response.json();
@@ -1249,10 +1325,11 @@ function formatAiMessage(text) {
 }
 async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = false, forceDeep = false, senderUsername = null) {
   const reqStart = Date.now();
-  const userGeminiK = (config.geminiKey || "").trim();
-  const systemGeminiK = (process.env.GEMINI_API_KEY || "").trim();
-  const groqK = (config.groqKey || "").trim();
-  const openRouterK = (config.openRouterKey || "").trim();
+  const geminiK = configOrEnv(config, "geminiKey", ...ENV_KEYS.geminiKey);
+  const groqK = configOrEnv(config, "groqKey", ...ENV_KEYS.groqKey);
+  const openRouterK = configOrEnv(config, "openRouterKey", ...ENV_KEYS.openRouterKey);
+  const xaiK = configOrEnv(config, "xaiKey", ...ENV_KEYS.xaiKey);
+  const bluesmindsK = configOrEnv(config, "bluesmindsApiKey", ...ENV_KEYS.bluesmindsApiKey);
   let context = [];
   const memoryKey = userId ? `mem:${userId}:${chatId || "global"}` : chatId;
   const intentMeta = detectIntent(prompt);
@@ -1555,7 +1632,7 @@ User Message: ${prompt}`;
   const providers = [];
   const geminiProvider = {
     name: "Gemini",
-    key: userGeminiK || systemGeminiK,
+    key: geminiK,
     fn: (p, k, ctx, inst) => getGeminiResponse(p, k, resolveModelForProvider("gemini", config.activeModel), ctx, inst)
   };
   const groqProvider = {
@@ -1565,7 +1642,7 @@ User Message: ${prompt}`;
   };
   const grokProvider = {
     name: "xAI/Grok",
-    key: config.xaiKey,
+    key: xaiK,
     fn: (p, k, ctx, inst) => getGrokResponse(p, k, resolveModelForProvider("xai", config.activeModel), ctx, inst)
   };
   const orProvider = {
@@ -1575,7 +1652,7 @@ User Message: ${prompt}`;
   };
   const bluesmindsProvider = {
     name: "BluesMinds",
-    key: config.bluesmindsApiKey,
+    key: bluesmindsK,
     fn: (p, k, ctx, inst) => getBluesMindsResponse(
       p,
       k,
@@ -2097,6 +2174,7 @@ async function startServer() {
           if (safeConfig[k]) safeConfig[k] = safeConfig[k].length > 6 ? '***' + safeConfig[k].slice(-4) : '***';
         }
       }
+      const providers = getProviderDiagnostics(config || {});
       const payload = {
         messages,
         targets,
@@ -2107,7 +2185,8 @@ async function startServer() {
           isListenerActive,
           lastEventTimestamp,
           clientReady: !!client,
-          aiConfigured: !!(config?.geminiKey || config?.groqKey || config?.openRouterKey || process.env.GEMINI_API_KEY)
+          aiConfigured: !!(providers.gemini || providers.groq || providers.openRouter || providers.xai || providers.bluesminds),
+          providers
         }
       };
       res.json(payload);
@@ -2242,7 +2321,7 @@ async function startServer() {
   app.get("/api/bluesminds/models", async (req, res) => {
     try {
       const cfg = db.prepare("SELECT bluesmindsApiKey FROM config WHERE id = 1").get();
-      const key = (cfg?.bluesmindsApiKey || process.env.BLUEMINDS_API_KEY || "").trim();
+      const key = configOrEnv(cfg, "bluesmindsApiKey", ...ENV_KEYS.bluesmindsApiKey);
       if (!key) return res.json({ models: [], working: [], bad: [] });
       const ctrl = new AbortController();
       const t = setTimeout(() => ctrl.abort(), 10000);
@@ -2273,16 +2352,16 @@ async function startServer() {
     let text = null;
     try {
       if (selectedProvider === "gemini") {
-        text = await getGeminiResponse(safePrompt, cfg?.geminiKey || process.env.GEMINI_API_KEY || "", selectedModel);
+        text = await getGeminiResponse(safePrompt, configOrEnv(cfg, "geminiKey", ...ENV_KEYS.geminiKey), selectedModel);
       } else if (selectedProvider === "groq") {
-        text = await getGroqResponse(safePrompt, cfg?.groqKey || "", selectedModel);
+        text = await getGroqResponse(safePrompt, configOrEnv(cfg, "groqKey", ...ENV_KEYS.groqKey), selectedModel);
       } else if (selectedProvider === "openrouter") {
-        text = await getOpenRouterResponse(safePrompt, cfg?.openRouterKey || "", selectedModel);
+        text = await getOpenRouterResponse(safePrompt, configOrEnv(cfg, "openRouterKey", ...ENV_KEYS.openRouterKey), selectedModel);
       } else if (selectedProvider === "xai") {
-        text = await getGrokResponse(safePrompt, cfg?.xaiKey || process.env.XAI_API_KEY || "", selectedModel);
+        text = await getGrokResponse(safePrompt, configOrEnv(cfg, "xaiKey", ...ENV_KEYS.xaiKey), selectedModel);
       } else {
         // BluesMinds — skip fallback chain for test (test the specific model directly)
-        const bmKey = (cfg?.bluesmindsApiKey || process.env.BLUEMINDS_API_KEY || "").trim();
+        const bmKey = configOrEnv(cfg, "bluesmindsApiKey", ...ENV_KEYS.bluesmindsApiKey);
         if (!bmKey) {
           return res.status(400).json({ ok: false, error: "No BluesMinds API key configured", provider: selectedProvider, model: selectedModel });
         }
@@ -2326,7 +2405,7 @@ async function startServer() {
     const { model, prompt, context, systemInstruction } = req.body || {};
     const cfg = db.prepare("SELECT * FROM config WHERE id = 1").get();
     const selectedModel = (model || cfg?.activeModel || "gpt-4o-mini").toString();
-    const bmKey = (cfg?.bluesmindsApiKey || process.env.BLUEMINDS_API_KEY || "").trim();
+    const bmKey = configOrEnv(cfg, "bluesmindsApiKey", ...ENV_KEYS.bluesmindsApiKey);
 
     if (!bmKey) {
       return res.status(400).json({ error: "No BluesMinds API key configured" });
@@ -2555,10 +2634,7 @@ async function startServer() {
     }
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
-    console.log(`AI Configuration Check:`);
-    console.log(
-      `- GEMINI_API_KEY: ${process.env.GEMINI_API_KEY ? "Present" : "MISSING"}`
-    );
+    console.log(`Runtime environment presence logged at startup; secrets are never printed.`);
   });
   let client = null;
   let isConnecting = false;
@@ -2576,33 +2652,9 @@ async function startServer() {
       console.error("[Log Error]:", e);
     }
   };
-  // ─── yt-dlp standalone binary — download/verify at startup ───────────────
-  // We bypass youtube-dl-exec's bundled binary entirely (it requires Python 3).
-  // Instead we download the official standalone Linux binary once and keep it
-  // inside the project directory so it persists across Railway restarts.
-  (async () => {
-    try {
-      let needsDownload = !fs.existsSync(YTDLP_BIN);
-      if (!needsDownload) {
-        // Verify it actually runs (not a broken/wrong-arch file)
-        try {
-          execSync(`"${YTDLP_BIN}" --version`, { stdio: "pipe", timeout: 10000 });
-          const ver = execSync(`"${YTDLP_BIN}" --version`, { stdio: "pipe", timeout: 10000 }).toString().trim();
-          console.log(`[ytdlp] Standalone binary OK: ${ver}`);
-          // Self-update (async — never block the event loop)
-          try { spawn(YTDLP_BIN, ['-U'], { stdio: 'ignore', detached: true }).unref(); } catch {}
-          return;
-        } catch {
-          needsDownload = true;
-        }
-      }
-      downloadYtdlpBinary();
-      const ver = execSync(`"${YTDLP_BIN}" --version`, { stdio: "pipe", timeout: 10000 }).toString().trim();
-      console.log(`[ytdlp] Binary ready: ${ver}`);
-    } catch (e) {
-      console.warn(`[ytdlp] Startup binary setup failed: ${e?.message}`);
-    }
-  })();
+  // yt-dlp/music download bootstrapping is intentionally not run at startup.
+  // Keeping startup free of external downloader installs prevents Railway runtime
+  // recovery from depending on GitHub/Python/youtube-dl-exec side effects.
 
   /**
    * Download a YouTube video as MP3 audio using yt-dlp.
@@ -2959,7 +3011,7 @@ async function startServer() {
         if (photoBuffer && Buffer.isBuffer(photoBuffer)) {
           const vTmpPath = path.join(tempDir, `vision_${Date.now()}.jpg`);
           await fs.writeFile(vTmpPath, photoBuffer);
-          const vApiKey = (config.geminiKey || "").trim() || (process.env.GEMINI_API_KEY || "").trim();
+          const vApiKey = configOrEnv(config, "geminiKey", ...ENV_KEYS.geminiKey);
           const vRes = await TOOLS.vision(vTmpPath, vApiKey);
           fs.remove(vTmpPath).catch(() => {});
           if (vRes?.ok && vRes?.data) {
@@ -3294,10 +3346,12 @@ async function startServer() {
   }
   const loadTelethon = async () => {
     const config = db.prepare("SELECT * FROM config WHERE id = 1").get();
-    const apiId = config?.telegramApiId || process.env.TELEGRAM_API_ID;
-    const apiHash = config?.telegramApiHash || process.env.TELEGRAM_API_HASH;
-    const stringSessionStr = config?.telegramStringSession || process.env.TELEGRAM_STRING_SESSION;
-    if (!apiId || !apiHash || !stringSessionStr) {
+    const apiId = configOrEnv(config, "telegramApiId", ...ENV_KEYS.telegramApiId);
+    const apiHash = configOrEnv(config, "telegramApiHash", ...ENV_KEYS.telegramApiHash);
+    const stringSessionStr = configOrEnv(config, "telegramStringSession", ...ENV_KEYS.telegramStringSession);
+    const apiIdIsNumeric = /^\d+$/.test(apiId);
+    const apiIdNumber = apiIdIsNumeric ? Number.parseInt(apiId, 10) : NaN;
+    if (!apiId || !apiIdIsNumeric || !Number.isSafeInteger(apiIdNumber) || !apiHash || !stringSessionStr) {
       addLog(
         "Telegram credentials missing. Please set API ID, Hash, and Session in Settings.",
         "warn"
@@ -3305,6 +3359,8 @@ async function startServer() {
       console.warn(
         "[BOT] Telegram credentials missing. apiId:",
         !!apiId,
+        "apiIdNumeric:",
+        apiIdIsNumeric && Number.isSafeInteger(apiIdNumber),
         "apiHash:",
         !!apiHash,
         "session:",
@@ -3333,7 +3389,7 @@ async function startServer() {
       const stringSession = new StringSession(stringSessionStr);
       client = new TelegramClient(
         stringSession,
-        parseInt(apiId.toString()),
+        apiIdNumber,
         apiHash,
         {
           connectionRetries: 1,
@@ -3807,7 +3863,7 @@ _Visit the dashboard for advanced configuration._`;
                     "https://api.bluesminds.com/v1/models",
                     {
                       headers: {
-                        Authorization: `Bearer ${config2.bluesmindsApiKey}`
+                        Authorization: `Bearer ${configOrEnv(config2, "bluesmindsApiKey", ...ENV_KEYS.bluesmindsApiKey)}`
                       }
                     }
                   );
