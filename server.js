@@ -1469,32 +1469,33 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
   }
   let searchContext = "";
   if (config.searchEnabled === 1) {
-    // Intelligent intent detection — handles typos, casual language, short phrases
-    let shouldSearch = isDeep;
-    if (!shouldSearch && needsSearch) {
+    // Gate 1: never search casual/short messages — saves API quota and avoids false triggers
+    const promptTrimmed = prompt.trim();
+    const isCasualMessage =
+      promptTrimmed.length < 15 ||
+      /^(hi|hey|hello|yo|sup|hii|hlo|hl|ok|okay|k|lol|haha|hehe|😂|😊|👍|thanks|thank you|thx|ty|sure|nice|cool|great|good|wow|oh|hmm|yes|no|nope|yep|yup|bye|later|brb|np|fine|got it|noted|understood|same|lmao|omg|wtf|bro|dude|😅|🙏|❤️|🔥)s*[!?.,😂😊👍🙏❤️🔥]*$/i.test(promptTrimmed);
+
+    let shouldSearch = isDeep && !isCasualMessage;
+
+    if (!shouldSearch && !isCasualMessage && needsSearch) {
+      // Gate 2: intent-based detection via serper module
       const { needs } = needsSearch(prompt);
       shouldSearch = needs;
-    } else if (!shouldSearch) {
-      // Fallback keyword check when serper module is unavailable
+    } else if (!shouldSearch && !isCasualMessage) {
+      // Gate 3: fallback keyword check when serper module is unavailable
       const fallbackKw = [
-        // Time-sensitive — almost always need live data
         "today", "tonight", "right now", "latest", "current", "breaking",
         "news", "score", "scores", "result", "results", "live",
-        // Finance / crypto
         "price", "bitcoin", "btc", "eth", "crypto", "stock", "nifty", "sensex",
-        "inr", "usd", "eur", "rate",
-        // Sports
-        "match", "ipl", "cricket", "football", "goal", "wicket", "over",
-        // Weather
-        "weather", "temp", "temperature", "forecast", "humidity",
-        // People / places / events — specific lookups
-        "who is", "who won", "who made", "what happened", "election", "launch",
-        // Tech / trust signals — need current info
-        "legit", "scam", "trusted", "reviews",
-        // Domain lookups
-        ".com", ".io", ".net", ".org",
+        "match", "ipl", "cricket", "football", "goal", "wicket",
+        "weather", "temperature", "forecast",
+        "who won", "who is", "what happened", "election", "launch",
       ];
       shouldSearch = fallbackKw.some((kw) => prompt.toLowerCase().includes(kw));
+    }
+
+    if (isCasualMessage) {
+      console.log(`[search] Skipped — casual/short message: "${promptTrimmed.slice(0, 40)}"`);
     }
     if (shouldSearch) {
       const results = await performWebSearch(prompt, config, isDeep);
