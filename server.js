@@ -525,14 +525,18 @@ if (!existingConfig?.openRouterKey || existingConfig.openRouterKey.length < 10) 
     "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"
   );
 }
-if (!existingConfig?.bluesmindsApiKey || existingConfig.bluesmindsApiKey.length < 10) {
-  db.prepare("UPDATE config SET bluesmindsApiKey = ? WHERE id = 1").run(
-    "sk-N1seJklpTA8FleqvsXg0bwg9pbgBR8uVuAuAv1qNOzSpZZjJ"
-  );
+// Use env var so Railway redeployments pick up the key set in Railway Variables.
+// Never fall back to a hardcoded key — if the env var is absent the DB value stays as-is.
+const envBluesmindsKey = (process.env.BLUESMINDS_API_KEY || "").trim();
+if (envBluesmindsKey.length > 10) {
+  db.prepare("UPDATE config SET bluesmindsApiKey = ? WHERE id = 1").run(envBluesmindsKey);
+} else if (!existingConfig?.bluesmindsApiKey || existingConfig.bluesmindsApiKey.length < 10) {
+  console.warn("[startup] BLUESMINDS_API_KEY env var not set and no key in DB — BluesMinds will not work until a key is added via the dashboard or Railway Variables.");
 }
-// Hard bootstrap: ensure auto-reply and BluesMinds are ON out of the box on every fresh deploy
+// Hard bootstrap: ensure auto-reply and BluesMinds are ON out of the box on every fresh deploy.
+// bluesmindsApiKey is intentionally NOT set here — it comes from env var or dashboard only.
 db.prepare(
-  "UPDATE config SET aiProvider = 'bluesminds', activeModel = 'gpt-4o-mini', aiEnabled = 1, autoReplyDM = 1, autoReplyMention = 1, bluesmindsApiKey = 'sk-N1seJklpTA8FleqvsXg0bwg9pbgBR8uVuAuAv1qNOzSpZZjJ' WHERE id = 1 AND (autoReplyDM = 0 OR autoReplyMention = 0 OR aiProvider = 'openrouter' OR aiProvider = 'gemini')"
+  "UPDATE config SET aiProvider = 'bluesminds', activeModel = 'gpt-4o-mini', aiEnabled = 1, autoReplyDM = 1, autoReplyMention = 1 WHERE id = 1 AND (autoReplyDM = 0 OR autoReplyMention = 0 OR aiProvider = 'openrouter' OR aiProvider = 'gemini')"
 ).run();
 // Always enforce deepseek.v3.2 as the active model on every startup/redeploy.
 // This runs unconditionally so even an existing DB row is corrected.
