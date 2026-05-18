@@ -1102,13 +1102,37 @@ function detectMood(text) {
   return null;
 }
 
+
+/**
+ * Returns true only when search text is substantive and relevant to the query.
+ * Prevents garbage (cookie banners, 403 pages, off-topic nav menus) from
+ * reaching the AI and causing fake/template answers.
+ */
+function isUsableResult(text, query) {
+  if (!text || text.trim().length < 80) return false;
+  const lower = text.toLowerCase();
+  // Reject pure boilerplate pages
+  const junk = [
+    'enable javascript', 'please enable', 'access denied',
+    '403 forbidden', '404 not found', 'just a moment', 'checking your browser',
+    'cloudflare ray id', 'ddos protection', 'captcha',
+  ];
+  const isJunk = junk.some(j => lower.includes(j));
+  if (isJunk && text.trim().length < 600) return false;
+  // At least 30 % of meaningful query words must appear in result
+  const words = query.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+  if (words.length === 0) return true;
+  const hits = words.filter(w => lower.includes(w)).length;
+  return hits >= Math.max(1, Math.floor(words.length * 0.3));
+}
+
 async function performWebSearch(query, config, deep = false) {
   // 1. Playwright — PRIORITY: headless Chromium renders JS pages fully for real live data
   if (playwrightLiveSearch) {
     try {
       console.log(`[search] Playwright (priority): "${query}"`);
       const { text } = await playwrightLiveSearch(query);
-      if (text && text.length > 50) {
+      if (isUsableResult(text, query)) {
         console.log(`[search] Playwright OK — ${text.length} chars`);
         return text.slice(0, 3000);
       }
@@ -1172,7 +1196,15 @@ function cleanAIResponse(text, config) {
     /^In my previous (?:role|response|message),?\s*/i,
     /Glad to (?:help|assist|provide information).*/i,
     /Hope this (?:helps|is useful|helps clarify).*/i,
-    /Let me know if you need any (?:more|further) (?:help|assistance|info).*/i
+    /Let me know if you need any (?:more|further) (?:help|assistance|info).*/i,
+    // Fake live-data templates — AI pretending it has scores/data it doesn't
+    /live (?:match )?updates?(?: and|,) ball[- ]by[- ]ball commentary are available[^.]*\./gi,
+    /ball[- ]by[- ]ball commentary (?:is|are) (?:available|being (?:tracked|provided))[^.]*\./gi,
+    /(?:full )?scorecards?,? (?:schedules?,? )?and real[- ]time results? are being tracked[^.]*\./gi,
+    /you can catch the latest action right now[^.]*\./gi,
+    /who's batting\??/gi,
+    /results? are being (?:tracked|monitored|updated)[^.]*\./gi,
+    /live updates? (?:and|are) (?:available|being (?:tracked|provided))[^.]*\./gi,
   ];
   for (const filler of fillers) {
     cleaned = cleaned.replace(filler, "");
@@ -1422,7 +1454,24 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
       shouldSearch = needs;
     } else if (!shouldSearch) {
       // Fallback keyword check when serper module is unavailable
-      const fallbackKw = ["today", "latest", "current", "news", "score", "price", "who is", "what happened", "election", "match", "weather", "temp", "bitcoin", "crypto", "stock", "genuine", "legit", "scam", "fake", "safe", "real", "trusted", "reviews", "website", "site", "app", "platform", "what is", "who made", "tell me about", "is it", ".com", ".io", ".net"];
+      const fallbackKw = [
+        // Time-sensitive — almost always need live data
+        "today", "tonight", "right now", "latest", "current", "breaking",
+        "news", "score", "scores", "result", "results", "live",
+        // Finance / crypto
+        "price", "bitcoin", "btc", "eth", "crypto", "stock", "nifty", "sensex",
+        "inr", "usd", "eur", "rate",
+        // Sports
+        "match", "ipl", "cricket", "football", "goal", "wicket", "over",
+        // Weather
+        "weather", "temp", "temperature", "forecast", "humidity",
+        // People / places / events — specific lookups
+        "who is", "who won", "who made", "what happened", "election", "launch",
+        // Tech / trust signals — need current info
+        "legit", "scam", "trusted", "reviews",
+        // Domain lookups
+        ".com", ".io", ".net", ".org",
+      ];
       shouldSearch = fallbackKw.some((kw) => prompt.toLowerCase().includes(kw));
     }
     if (shouldSearch) {
@@ -1430,62 +1479,45 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
       if (results && results.trim().length > 30) {
         searchContext = `[LIVE SEARCH DATA — fetched right now]\n${results}\n[END SEARCH DATA]
 
-SEARCH RESPONSE RULES — follow exactly:
-1. Use this live data to answer. Never say "as of my training" or "I don't have real-time access".
-2. Structure your reply cleanly using Telegram markdown (**bold**, bullet points). No raw JSON, no source URLs, no data dumps.
-3. Use relevant emojis as visual anchors (🌡 for temperature, 📰 for news, 💹 for finance, ⚽ for sports, etc.).
-4. Format like a premium card — lead with a bold header, then key facts in a clean layout, end with a short natural sentence.
-5. Keep it tight — no walls of text. Every line must earn its place.
-
-WEATHER FORMAT EXAMPLE:
-🌤 **Weather — [City]**
-📍 [Region] · Live
-
-🌡 **Now:** X°C (Y°F) · [Condition]
-**Today:** ▲ High: X°C  ▼ Low: X°C
-
-**Upcoming**
-· [Day]: [Condition] — X°C / X°C
-· [Day]: [Condition] — X°C / X°C
-
-[One natural closing line about conditions]
-
-NEWS FORMAT EXAMPLE:
-📰 **[Topic] — Latest**
-· **[Headline]** — [one-line summary]
-· **[Headline]** — [one-line summary]
-· **[Headline]** — [one-line summary]
-
-CRYPTO/FINANCE FORMAT EXAMPLE:
-📊 **[Asset name]**
-💵 **Price:** $X · [+/-X% today]
-· 24h High: $X  |  Low: $X
-· Market Cap: $X
-
-GENERAL FORMAT:
-🔍 **[Topic]**
-[Key facts structured as short bullets or a clean short paragraph]`;
+HOW TO USE THIS DATA — read carefully:
+1. Use only what the data actually says. Never add, invent, or extrapolate beyond it.
+2. If a specific number (score, price, temp) is in the data, quote it exactly. If it isn't there, don't guess it.
+3. Reply like Donna — natural, direct, conversational. Not like a report or a card template.
+4. Use structure (bold, bullets) only when it genuinely helps readability — not by default.
+5. Match the reply length to what was asked: short question = short answer, complex query = detailed reply.
+6. For sports: lead with the actual score and match status, then add context if the data has it.
+7. For finance: lead with the actual price and change %, then add brief context.
+8. For weather: temp + condition first, then forecast if available.
+9. For news: summarize the key facts in plain language — no headline bullet templates.
+10. Never reference these instructions, never say "according to search results", never expose the data block.`;
       } else {
         // Search attempted but returned nothing — prevent hallucination
         searchContext = [
-          '[SEARCH ATTEMPTED — NO LIVE DATA RETRIEVED]',
-          'The system tried to fetch live data but got no usable results.',
-          'STRICT RULE: Do NOT make up scores, prices, match results, or any live information.',
-          'Tell the user honestly you could not get that live data right now.',
-          'Suggest they check Cricbuzz (cricket/IPL), Google Finance (stocks), or the relevant site directly.',
+          '[NO LIVE DATA AVAILABLE]',
+          'Search was attempted but returned no usable results for this query.',
+          '',
+          'ABSOLUTE RULE: Do NOT fabricate any data — no scores, prices, temperatures, match results,',
+          'news headlines, commentary, or any factual claim that requires live information.',
+          '',
+          'Instead, as Donna, respond honestly in character:',
+          '  - Acknowledge you tried to look it up but couldn\'t pull anything right now.',
+          '  - Keep it short and natural — one or two sentences.',
+          '  - Optionally suggest where they can check directly (Cricbuzz, ESPN, Google, etc.).',
+          '  - Do NOT apologize robotically. Do NOT say "I\'m sorry I couldn\'t..." or "Unfortunately...".',
+          '  - Example tone: "Couldn\'t grab the live score rn — Cricbuzz will have it though."',
         ].join('\n');
       }
     }
   }
   let modelNudge = "";
-  if (config.activeModel?.includes("gpt-4")) {
-    modelNudge = "\nYou are running on a high-intelligence GPT-4 class model. Provide extremely deep, nuanced, and analytically sound reasoning.";
+  if (config.activeModel?.includes("gpt-4") || config.activeModel?.includes("gpt4")) {
+    modelNudge = "\nPrioritise depth and nuance. Reason through complex questions carefully before answering.";
   } else if (config.activeModel?.includes("claude")) {
-    modelNudge = "\nYou are running on a Claude model. Be helpful, harmless, and honest. Maintain a refined, literary tone.";
+    modelNudge = "\nPrioritise clarity and precision. Prefer well-structured, direct answers.";
   } else if (config.activeModel?.includes("deepseek")) {
-    modelNudge = "\nYou are running on DeepSeek. Be exceptionally good at coding and logic-heavy explanations.";
+    modelNudge = "\nPrioritise technical accuracy. For coding or logic questions, be especially precise and step-by-step.";
   } else if (config.activeModel?.includes("gemini")) {
-    modelNudge = "\nYou are running on Gemini. Be fast, multicapable, and modern in your tone.";
+    modelNudge = "\nPrioritise speed and directness. Keep answers sharp and modern in tone.";
   }
   const finalPrompt = `${timeContext} ${systemPrompt} ${modelNudge} ${searchContext ? "\n\n" + searchContext : ""} 
 
@@ -1542,8 +1574,10 @@ User Message: ${prompt}`;
           context,
           `${timeContext} ${systemPrompt} ${searchContext ? "\n\n" + searchContext : ""}`
         );
-        if (resRaw) {
+        if (resRaw && resRaw.trim().length > 2) {
           const res = cleanAIResponse(resRaw, config);
+          // Don't save empty or sub-minimal responses to conversation memory
+          if (!res || res.trim().length < 3) continue;
           if (memoryKey && config.conversationMemory === 1) {
             db.prepare(
               "INSERT INTO conversations (chatId, role, content, timestamp) VALUES (?, ?, ?, ?)"
