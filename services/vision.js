@@ -1,4 +1,4 @@
-import { GoogleGenAI } from "@google/genai";
+import { requestGemini } from "./geminiManager.js";
 
 const RETRY_DELAYS_MS = [1500, 3000, 5000];
 const TIMEOUT_MS = 20000;
@@ -66,13 +66,17 @@ function normalizeAndValidate(parsed) {
   return { result, valid };
 }
 
-async function requestVision(ai, model, mimeType, base64Data) {
+async function requestVision(model, mimeType, base64Data, geminiApiKey, requestId, attemptType) {
   const prompt = `Analyze this image and return ONLY valid raw JSON. Do not wrap in markdown. Do not explain. Do not use code blocks. Do not add extra text before or after JSON. Use exactly this schema: {"type":"","summary":"","visible_text":"","objects":[],"detected_context":"","confidence":0.0}. visible_text must include OCR text when present.`;
 
-  const timed = ai.models.generateContent({
+  const timed = requestGemini({
+    source: "vision",
+    requestId,
+    apiKey: geminiApiKey,
     model,
     contents: [{ role: "user", parts: [{ text: prompt }, { inlineData: { mimeType, data: base64Data } }] }],
-    config: { temperature: 0.1 }
+    config: { temperature: 0.1 },
+    attemptType
   });
 
   return await Promise.race([
@@ -80,7 +84,7 @@ async function requestVision(ai, model, mimeType, base64Data) {
     new Promise((_, reject) => setTimeout(() => reject(new Error("vision timeout")), TIMEOUT_MS))
   ]);
 }
-async function runVisionPipeline(ai, mimeType, base64Data) {
+async function runVisionPipeline(mimeType, base64Data, geminiApiKey, requestId) {
   const models = ["gemini-2.5-flash", "gemini-1.5-flash"];
   let lastReason = "unknown";
   console.log("[vision] entering retry wrapper");
@@ -92,7 +96,7 @@ async function runVisionPipeline(ai, mimeType, base64Data) {
       try {
         console.log(`[vision] retry ${attempt}/3 model=${model}`);
         console.log(`[vision] executing attempt ${attempt}/3`);
-        const resp = await requestVision(ai, model, mimeType, base64Data);
+        const resp = await requestVision(model, mimeType, base64Data, geminiApiKey, requestId, modelIndex > 0 ? "fallback" : "primary");
         const raw = (resp?.text || "");
         console.log("[vision] raw response received");
         const cleaned = stripCodeFences(raw).trim();
@@ -135,7 +139,7 @@ async function runVisionPipeline(ai, mimeType, base64Data) {
   throw new Error("VISION_TEMPORARILY_BUSY");
 }
 
-export async function analyzeTelegramImageWithGemini(client, message, geminiApiKey) {
+export async function analyzeTelegramImageWithGemini(client, message, geminiApiKey, requestId = "vision") {
   const imageRef = extractImageFromMessage(message);
   if (!imageRef) return null;
   const cleanKey = (geminiApiKey || "").trim();
@@ -147,8 +151,7 @@ export async function analyzeTelegramImageWithGemini(client, message, geminiApiK
 
   const mimeType = imageRef.media?.document?.mimeType || "image/jpeg";
   const base64Data = imageBuffer.toString("base64");
-  const ai = new GoogleGenAI({ apiKey: cleanKey });
-  return await runVisionPipeline(ai, mimeType, base64Data);
+  return await runVisionPipeline(mimeType, base64Data, cleanKey, requestId);
 }
 
 export function buildVisionPrompt(userText, visionResult) {

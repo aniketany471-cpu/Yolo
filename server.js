@@ -15,6 +15,7 @@ import fs from "fs-extra";
 import yts from "yt-search";
 import youtubedl from "youtube-dl-exec";
 import { analyzeTelegramImageWithGemini, buildVisionPrompt } from "./services/vision.js";
+import { requestGemini, beginGeminiRequestScope } from "./services/geminiManager.js";
 import { getAccuWeather } from "./services/weather.js";
 // Image service — loaded dynamically so a missing/broken module never crashes the bot
 let ziGenerateImage = null;
@@ -709,25 +710,28 @@ async function fetchJsonWithRetry(url, options, meta) {
 }
 // ──────────────────────────────────────────────────────────────────────────────
 
-async function getGeminiResponse(prompt, apiKey, model = "gemini-1.5-flash", context = [], systemInstruction) {
+async function getGeminiResponse(prompt, apiKey, model = "gemini-1.5-flash", context = [], systemInstruction, requestId = "chat") {
   try {
     const cleanKey = apiKey?.trim();
     if (!cleanKey || cleanKey === "undefined" || cleanKey === "null" || cleanKey.length < 5) {
       return null;
     }
-    const ai = new GoogleGenAI({ apiKey: cleanKey });
     let finalModel = model || "gemini-1.5-flash";
     if (!finalModel.startsWith("gemini-")) {
       finalModel = "gemini-1.5-flash";
     }
     const contents = context.length > 0 ? [...context, { role: "user", parts: [{ text: prompt }] }] : [{ role: "user", parts: [{ text: prompt }] }];
-    const response = await ai.models.generateContent({
+    const response = await requestGemini({
+      source: "validation",
+      requestId,
+      apiKey: cleanKey,
       model: finalModel,
       contents,
       config: {
         systemInstruction: systemInstruction || "You are a helpful assistant for a Telegram userbot.",
         temperature: 0.7
-      }
+      },
+      attemptType: "primary"
     });
     const aiText = response.text;
     return aiText?.trim() || null;
@@ -1289,7 +1293,7 @@ async function performWebSearch(query, config, deep = false) {
 
   return "";
 }
-async function performRealtimeGrounding(query, config) {
+async function performRealtimeGrounding(query, config, requestId = "grounding") {
   const now = Date.now();
   if (!globalThis.__geminiGroundingState) {
     globalThis.__geminiGroundingState = {
@@ -1344,7 +1348,6 @@ async function performRealtimeGrounding(query, config) {
     }
     return null;
   }
-  const ai = new GoogleGenAI({ apiKey: geminiKey });
   const models = ["gemini-2.5-flash", "gemini-1.5-flash"];
   const prompt = `Return ONLY valid minified JSON. Do not use markdown. Do not use explanations. Do not use conversational text. Do not speculate. Do not guess. Schema: {"query_type":"","subject":"","answer":"","confidence":0.0,"sources":[],"timestamp":"","verified":true}. Query: ${finalQuery}`;
   const extractJson = (txt) => {
@@ -1356,7 +1359,7 @@ async function performRealtimeGrounding(query, config) {
   const runOnce = async (model, label) => {
     console.log(`[grounding] ${label} attempt`);
     const response = await Promise.race([
-      ai.models.generateContent({ model, contents: [{ role: "user", parts: [{ text: prompt }] }], config: { temperature: 0.1 } }),
+      requestGemini({ source: "realtime_grounding", requestId, apiKey: geminiKey, model, contents: [{ role: "user", parts: [{ text: prompt }] }], config: { temperature: 0.1 }, attemptType: label === "fallback" ? "fallback" : "primary" }),
       new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 20000))
     ]);
     const raw = (response?.text || "").trim();
@@ -1501,7 +1504,7 @@ async function generateImage(prompt, apiKey, model = "flux") {
     return null;
   }
 }
-async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = false, forceDeep = false, senderUsername = null) {
+async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = false, forceDeep = false, senderUsername = null, requestId = "chat") {
   const userGeminiK = (config.geminiKey || "").trim();
   const systemGeminiK = (process.env.GEMINI_API_KEY || "").trim();
   const groqK = (config.groqKey || "").trim();
@@ -1735,7 +1738,7 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
       console.log(`[search] Skipped — casual/short message: "${promptTrimmed.slice(0, 40)}"`);
     }
     if (shouldSearch) {
-      const grounded = await performRealtimeGrounding(prompt, config);
+      const grounded = await performRealtimeGrounding(prompt, config, requestId);
       if (grounded) {
         const srcText = grounded.sources.map((s) => typeof s === "string" ? s : (s?.url || s?.domain || JSON.stringify(s))).slice(0, 5).join(", ");
         searchContext =
@@ -1857,7 +1860,7 @@ User Message: ${prompt}`;
   const geminiProvider = {
     name: "Gemini",
     key: userGeminiK || systemGeminiK,
-    fn: (p, k, ctx, inst) => getGeminiResponse(p, k, config.activeModel, ctx, inst)
+    fn: (p, k, ctx, inst) => getGeminiResponse(p, k, config.activeModel, ctx, inst, requestId)
   };
   const groqProvider = {
     name: "Groq",
@@ -2561,7 +2564,7 @@ async function startServer() {
     let text = null;
     try {
       if (selectedProvider === "gemini") {
-        text = await getGeminiResponse(safePrompt, cfg?.geminiKey || process.env.GEMINI_API_KEY || "", selectedModel);
+        text = await getGeminiResponse(safePrompt, cfg?.geminiKey || process.env.GEMINI_API_KEY || "", selectedModel, [], undefined, "api-test");
       } else if (selectedProvider === "groq") {
         text = await getGroqResponse(safePrompt, cfg?.groqKey || "", selectedModel);
       } else if (selectedProvider === "openrouter") {
@@ -3447,7 +3450,7 @@ async function startServer() {
             if (hasVisionImage) {
               try {
                 const geminiKey = (config.geminiKey || process.env.GEMINI_API_KEY || "").trim();
-                const vision = await analyzeTelegramImageWithGemini(client2, visionSourceMessage, geminiKey);
+                const vision = await analyzeTelegramImageWithGemini(client2, visionSourceMessage, geminiKey, message.__requestId || `msg-${message.id}`);
                 if (!vision) throw new Error("VISION_TEMPORARILY_BUSY");
                 console.log("[vision] DeepSeek formatting started");
                 promptForDeepSeek = buildVisionPrompt(text, vision);
@@ -3464,7 +3467,8 @@ async function startServer() {
               senderId,
               isNSFWActive,
               false,
-              message.sender?.username || null
+              message.sender?.username || null,
+              message.__requestId || `msg-${message.id}`
             );
             if (aiRes) break;
           } catch (retryErr) {
@@ -3684,6 +3688,10 @@ async function startServer() {
           const text = textRaw.toLowerCase();
           const senderId = message.senderId?.toString();
           const chatIdStr = message.chatId?.toString();
+          const requestId = `tg-${chatIdStr || "chat"}-${message.id || Date.now()}`;
+          message.__requestId = requestId;
+          beginGeminiRequestScope(requestId);
+          console.log(`[gemini-manager] requestId=${requestId} source=telegram_message`);
           const isMe = message.out || myId && senderId === myId;
           let config2 = db.prepare("SELECT * FROM config WHERE id = 1").get();
           const admins = config2?.adminUsers ? config2.adminUsers.split(",").map((s) => s.trim()) : [];
