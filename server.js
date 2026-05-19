@@ -15,6 +15,7 @@ import fs from "fs-extra";
 import yts from "yt-search";
 import youtubedl from "youtube-dl-exec";
 import { analyzeTelegramImageWithGemini, buildVisionPrompt } from "./services/vision.js";
+import { getAccuWeather } from "./services/weather.js";
 // Image service — loaded dynamically so a missing/broken module never crashes the bot
 let ziGenerateImage = null;
 try {
@@ -1291,6 +1292,23 @@ async function performRealtimeGrounding(query, config) {
   console.log("[grounding] realtime detected");
   const rtc = resolveRealtimeContext(query);
   const finalQuery = rtc.rewrittenQuery || query;
+  const isWeatherQuery = /\b(weather|temperature|temp|hot|cold|rain|humidity|forecast|windy|climate|today'?s weather|tomorrow weather)\b/i.test(finalQuery);
+  if (isWeatherQuery) {
+    console.log("[weather] detected query");
+    const weather = await performWeatherGrounding(finalQuery, config, geminiKey);
+    if (weather) {
+      return {
+        query_type: "weather",
+        subject: weather.location,
+        answer: `${weather.location}: ${weather.temperature_c}°C, ${weather.condition}. Feels like ${weather.feels_like_c}°C, humidity ${weather.humidity}%, wind ${weather.wind_kph} kph. Forecast: ${weather.forecast}.`,
+        confidence: 0.9,
+        sources: [weather.source],
+        timestamp: weather.timestamp,
+        verified: true
+      };
+    }
+    return null;
+  }
   const ai = new GoogleGenAI({ apiKey: geminiKey });
   const models = ["gemini-2.5-flash", "gemini-1.5-flash"];
   const delays = [1500, 3000, 5000];
@@ -1336,6 +1354,16 @@ async function performRealtimeGrounding(query, config) {
     }
   }
   console.log("[grounding] final failure after retries");
+  return null;
+}
+async function performWeatherGrounding(query, config, geminiKey) {
+  try {
+    console.log("[weather] provider=accuweather");
+    const apiKey = (process.env.ACCUWEATHER_API_KEY || "").trim();
+    const weather = await getAccuWeather(query, apiKey);
+    console.log("[weather] final verified response");
+    return weather;
+  } catch (e) {}
   return null;
 }
 function cleanAIResponse(text, config) {
@@ -1774,6 +1802,9 @@ User Message: ${prompt}`;
   // ── Realtime query + search failed: bypass AI entirely — prevent training-data hallucination ──
   if (realtimeSearchFailed) {
     console.log("[AI bypass] Returning realtime verification failure message");
+    if (/\b(weather|temperature|temp|hot|cold|rain|humidity|forecast|windy|climate)\b/i.test(prompt)) {
+      return "I couldn't verify the current weather right now.";
+    }
     return "I couldn't verify the latest realtime information right now.";
   }
 
