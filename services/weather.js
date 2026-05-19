@@ -86,6 +86,12 @@ async function resolveLocationKey(locationName, apiKey) {
   const resolved = {
     key: best.Key,
     name: `${best.LocalizedName}, ${best.AdministrativeArea?.LocalizedName || ""}, ${best.Country?.LocalizedName || ""}`.replace(/,\s*,/g, ",").trim().replace(/,\s*$/, "")
+  const first = Array.isArray(data) ? data[0] : null;
+  if (!first?.Key) throw new Error("invalid location");
+
+  const resolved = {
+    key: first.Key,
+    name: `${first.LocalizedName}, ${first.AdministrativeArea?.LocalizedName || ""}, ${first.Country?.LocalizedName || ""}`.replace(/,\s*,/g, ",").trim().replace(/,\s*$/, "")
   };
   setCache(locationCache, cacheKey, resolved, LOCATION_TTL_MS);
   return resolved;
