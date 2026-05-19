@@ -1138,25 +1138,68 @@ function hasActualScoreData(text) {
   return /\d+\/\d+|\d+\s*(?:run[s]?|wkt[s]?|wicket[s]?)|\bover[s]?\s*:\s*\d+|\b\d+\s*\/\s*\d+\s*\(|\b[A-Z]{2,}\s+\d+\/\d+/i.test(text);
 }
 
-async function performWebSearch(query, config, deep = false) {
-  const geminiKey = (config.geminiKey || process.env.GEMINI_API_KEY || "").trim();
 
-  // 1. Gemini grounding — real-time Google Search via Gemini, no Chromium needed
-  if (geminiGroundedSearch && geminiKey) {
+/**
+ * Returns true ONLY for queries that require live/current information.
+ * Casual chat, coding help, explanations, greetings must return false
+ * so they never trigger expensive Gemini grounding calls.
+ */
+function isRealtimeQuery(query) {
+  const q = query.toLowerCase();
+  // Hard casual overrides — these never need live data
+  if (/^(hi|hello|hey|sup|yo|ok|okay|sure|thanks|thank you|bye|lol|haha|good morning|good night|how are you|what's up|whats up|love you|miss you)\b/.test(q)) return false;
+  if (q.split(' ').length <= 2 && !/\d/.test(q)) return false; // very short with no numbers = casual
+  // Strong live-data signals
+  return /\b(live|today|tonight|right now|this week|current|latest|breaking|just now|happening|trending|score[s]?|result[s]?|match|ipl|cricket|football|soccer|nba|nfl|f1|prix|price[s]?|crypto|bitcoin|btc|eth|stock|nifty|sensex|share price|weather|temp(erature)?|forecast|news|election|who won|what happened|did .* win|update[s]?)\b/i.test(q);
+}
+
+async function performWebSearch(query, config, deep = false) {
+  const isSports  = /\b(?:live\s+)?(?:ipl|cricket|football|soccer|nba|nfl|f1|formula)\s*(?:score[s]?|result[s]?|match|live|update[s]?|standing[s]?)\b|\b(?:score[s]?|result[s]?)\s+(?:of|for|in)\s+(?:ipl|cricket|football|soccer)\b|\bipl\s+score|\bcricket\s+score|\blive\s+score[s]?\b/i.test(query);
+  const isWeather = /\bweather\b|\btemperature\b|\btemp\b|\bforecast\b/i.test(query);
+
+  // ── 0. Weather → AccuWeather (city-aware, no quota cost) ──────────────────
+  if (isWeather && playwrightWeather) {
     try {
-      console.log(`[search] Gemini grounding: "${query}"`);
+      console.log(`[search] Weather → AccuWeather: "${query}"`);
+      const r = await playwrightWeather(query);
+      if (r && r.length > 60) { console.log('[search] AccuWeather OK'); return r; }
+      console.warn('[search] AccuWeather empty — falling through');
+    } catch (e) { console.warn('[search] AccuWeather error:', e.message); }
+  }
+
+  // ── 1. Sports scores → getLiveScore (Cricbuzz → ESPN, real score patterns only) ──
+  if (isSports && playwrightLiveScore) {
+    try {
+      console.log(`[search] Sports → getLiveScore (Cricbuzz): "${query}"`);
+      const score = await playwrightLiveScore(query);
+      if (score && hasActualScoreData(score)) {
+        console.log('[search] getLiveScore OK — real score data found');
+        return score;
+      }
+      console.warn('[search] getLiveScore: no real score pattern — returning empty');
+    } catch (e) { console.warn('[search] getLiveScore error:', e.message); }
+    // Sports score with no real data → honest empty reply, skip Serper snippets
+    return '';
+  }
+
+  // ── 2. Gemini grounding (ONLY for realtime queries, with cache + cooldown) ──
+  //    Gemini is rate-limited; never call it for casual chat or coding questions.
+  const geminiKey = (config.geminiKey || process.env.GEMINI_API_KEY || '').trim();
+  if (geminiGroundedSearch && geminiKey && isRealtimeQuery(query)) {
+    try {
+      console.log(`[search] Gemini grounding (realtime): "${query}"`);
       const result = await geminiGroundedSearch(query, geminiKey);
       if (result && result.trim().length > 30) {
         console.log(`[search] Gemini grounding OK — ${result.length} chars`);
         return result;
       }
-      console.warn("[search] Gemini grounding returned nothing — falling through");
-    } catch (e) {
-      console.warn(`[search] Gemini grounding failed: ${e.message}`);
-    }
+      console.warn('[search] Gemini grounding empty — falling through to Serper');
+    } catch (e) { console.warn('[search] Gemini grounding error:', e.message); }
+  } else if (!isRealtimeQuery(query)) {
+    console.log(`[search] Skipping Gemini — not a realtime query: "${query.slice(0, 50)}"`);
   }
 
-  // 2. Serper — API-based Google search fallback
+  // ── 3. Serper — API-based Google search (general fallback) ────────────────
   if (serperSearch && (config.serperKey || process.env.SERPER_API_KEY)) {
     try {
       const result = await serperSearch(query, config);
@@ -1164,30 +1207,23 @@ async function performWebSearch(query, config, deep = false) {
         console.log(`[search] Serper OK — intent=${result.intent}`);
         return result.summary;
       }
-    } catch (e) {
-      console.warn(`[search] Serper error: ${e.message}`);
-    }
+    } catch (e) { console.warn('[search] Serper error:', e.message); }
   }
 
-  // 3. Tavily — last resort
+  // ── 4. Tavily — last resort ───────────────────────────────────────────────
   if (config.searchApiKey) {
     try {
-      const depth = deep ? "advanced" : "basic";
-      console.log(`[search] Tavily last resort: "${query}"`);
-      const response = await fetch("https://api.tavily.com/search", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ api_key: config.searchApiKey, query, search_depth: depth, max_results: deep ? 6 : 3 })
+      console.log('[search] Tavily last resort');
+      const response = await fetch('https://api.tavily.com/search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ api_key: config.searchApiKey, query, search_depth: deep ? 'advanced' : 'basic', max_results: deep ? 6 : 3 }),
       });
       if (response.ok) {
         const data = await response.json();
-        if (data.results?.length > 0) {
-          return data.results.map((r) => `${r.title}: ${r.content}`).join("\n\n");
-        }
+        if (data.results?.length > 0) return data.results.map(r => `${r.title}: ${r.content}`).join('\n\n');
       }
-    } catch (e) {
-      console.warn(`[search] Tavily failed: ${e.message}`);
-    }
+    } catch (e) { console.warn('[search] Tavily error:', e.message); }
   }
 
   return "";
