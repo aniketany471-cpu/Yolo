@@ -1291,23 +1291,6 @@ async function performRealtimeGrounding(query, config) {
   console.log("[grounding] realtime detected");
   const rtc = resolveRealtimeContext(query);
   const finalQuery = rtc.rewrittenQuery || query;
-  const isWeatherQuery = /\b(weather|temperature|temp|hot|cold|rain|humidity|forecast|windy|climate|today'?s weather|tomorrow weather)\b/i.test(finalQuery);
-  if (isWeatherQuery) {
-    console.log("[weather] detected query");
-    const weather = await performWeatherGrounding(finalQuery, config, geminiKey);
-    if (weather) {
-      return {
-        query_type: "weather",
-        subject: weather.location,
-        answer: `${weather.location}: ${weather.temperature_c}°C, ${weather.condition}. Feels like ${weather.feels_like_c}°C, humidity ${weather.humidity}%, wind ${weather.wind_kph} kph. Forecast: ${weather.forecast}.`,
-        confidence: 0.9,
-        sources: [weather.source],
-        timestamp: weather.timestamp,
-        verified: true
-      };
-    }
-    return null;
-  }
   const ai = new GoogleGenAI({ apiKey: geminiKey });
   const models = ["gemini-2.5-flash", "gemini-1.5-flash"];
   const delays = [1500, 3000, 5000];
@@ -1353,84 +1336,6 @@ async function performRealtimeGrounding(query, config) {
     }
   }
   console.log("[grounding] final failure after retries");
-  return null;
-}
-async function performWeatherGrounding(query, config, geminiKey) {
-  const extractJson = (txt) => {
-    try { return JSON.parse(txt); } catch {}
-    const s = txt.indexOf("{"), e = txt.lastIndexOf("}");
-    if (s >= 0 && e > s) { try { return JSON.parse(txt.slice(s, e + 1)); } catch {} }
-    return null;
-  };
-  const normalize = (d) => ({
-    location: String(d.location || "").trim(),
-    temperature_c: Number(d.temperature_c),
-    feels_like_c: Number(d.feels_like_c),
-    condition: String(d.condition || "").trim(),
-    humidity: Number(d.humidity),
-    wind_kph: Number(d.wind_kph),
-    forecast: String(d.forecast || "").trim(),
-    timestamp: String(d.timestamp || "").trim(),
-    source: String(d.source || "").trim().toLowerCase()
-  });
-  const valid = (w, expectedSource) =>
-    !!w.location &&
-    Number.isFinite(w.temperature_c) &&
-    Number.isFinite(w.feels_like_c) &&
-    !!w.condition &&
-    Number.isFinite(w.humidity) &&
-    Number.isFinite(w.wind_kph) &&
-    !!w.forecast &&
-    /^\d{4}-\d{2}-\d{2}T/.test(w.timestamp) &&
-    w.source === expectedSource;
-  const ai = new GoogleGenAI({ apiKey: geminiKey });
-  const weatherPrompt = (provider, expectedSource) => `Return ONLY valid minified JSON. Do not use markdown. Do not use prose. Do not explain. Use schema exactly: {"location":"","temperature_c":0,"feels_like_c":0,"condition":"","humidity":0,"wind_kph":0,"forecast":"","timestamp":"","source":"${expectedSource}"}. Pull data ONLY from ${provider}. If unavailable, return {"location":"","temperature_c":null,"feels_like_c":null,"condition":"","humidity":null,"wind_kph":null,"forecast":"","timestamp":"","source":"${expectedSource}"}. Timezone Asia/Kolkata. Query: ${query}.`;
-  try {
-    console.log("[weather] provider=google");
-    const googleResp = await Promise.race([
-      ai.models.generateContent({ model: "gemini-2.5-flash", contents: [{ role: "user", parts: [{ text: weatherPrompt("Google Weather", "google") }] }], config: { temperature: 0.1 } }),
-      new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 20000))
-    ]);
-    const rawGoogle = (googleResp?.text || "").trim();
-    console.log(`[weather] raw provider response len=${rawGoogle.length} provider=google`);
-    const parsedGoogle = extractJson(rawGoogle);
-    if (!parsedGoogle) {
-      console.log("[weather] rejected hallucinated response provider=google");
-    } else {
-      console.log("[weather] parsed json success provider=google");
-    }
-    const g = normalize(parsedGoogle || {});
-    if (valid(g, "google")) {
-      console.log("[weather] validation success");
-      console.log("[weather] verified provider=google");
-      console.log("[weather] final verified response");
-      return g;
-    }
-    console.log("[weather] rejected hallucinated response provider=google");
-  } catch {}
-  try {
-    console.log("[weather] fallback=accuweather");
-    const accuResp = await Promise.race([
-      ai.models.generateContent({ model: "gemini-1.5-flash", contents: [{ role: "user", parts: [{ text: weatherPrompt("AccuWeather", "accuweather") }] }], config: { temperature: 0.1 } }),
-      new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 20000))
-    ]);
-    const rawAccu = (accuResp?.text || "").trim();
-    console.log(`[weather] raw provider response len=${rawAccu.length} provider=accuweather`);
-    const parsedAccu = extractJson(rawAccu);
-    if (!parsedAccu) {
-      console.log("[weather] rejected hallucinated response provider=accuweather");
-    } else {
-      console.log("[weather] parsed json success provider=accuweather");
-    }
-    const a = normalize(parsedAccu || {});
-    if (valid(a, "accuweather")) {
-      console.log("[weather] validation success");
-      console.log("[weather] verified provider=accuweather");
-      console.log("[weather] final verified response");
-      return a;
-    }
-    console.log("[weather] rejected hallucinated response provider=accuweather");
-  } catch {}
   return null;
 }
 function cleanAIResponse(text, config) {
@@ -1869,9 +1774,6 @@ User Message: ${prompt}`;
   // ── Realtime query + search failed: bypass AI entirely — prevent training-data hallucination ──
   if (realtimeSearchFailed) {
     console.log("[AI bypass] Returning realtime verification failure message");
-    if (/\b(weather|temperature|temp|hot|cold|rain|humidity|forecast|windy|climate)\b/i.test(prompt)) {
-      return "I couldn't verify the current weather right now.";
-    }
     return "I couldn't verify the latest realtime information right now.";
   }
 
