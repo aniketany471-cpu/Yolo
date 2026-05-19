@@ -1286,12 +1286,42 @@ async function performWebSearch(query, config, deep = false) {
   return "";
 }
 async function performRealtimeGrounding(query, config) {
+  const now = Date.now();
+  if (!globalThis.__geminiGroundingState) {
+    globalThis.__geminiGroundingState = {
+      cooldownUntil: 0,
+      inFlight: new Map(),
+      cache: new Map()
+    };
+  }
+  const gs = globalThis.__geminiGroundingState;
   const geminiKey = (config.geminiKey || process.env.GEMINI_API_KEY || "").trim();
   if (!geminiKey) return null;
   if (!isRealtimeQuery(query)) return null;
   console.log("[grounding] realtime detected");
+  if (gs.cooldownUntil > now) {
+    console.log("[grounding] cooldown active");
+    return null;
+  }
   const rtc = resolveRealtimeContext(query);
   const finalQuery = rtc.rewrittenQuery || query;
+  const realtimeStrict = /\b(live|score|scores|result|results|who won|today|yesterday|latest|current|breaking|news|trending|update|match|ipl|cricket|football|nba|nfl|weather|temperature|forecast|price|stock|crypto|bitcoin)\b/i.test(finalQuery);
+  if (!realtimeStrict) return null;
+  const qLower = finalQuery.toLowerCase();
+  const isSportsType = /\b(ipl|cricket|football|soccer|nba|nfl|live score|match|result)\b/.test(qLower);
+  const isNewsType = /\b(news|breaking|headline|trending|update)\b/.test(qLower);
+  const cacheTtl = isSportsType ? 30000 : isNewsType ? 60000 : 45000;
+  const cacheKey = `rt:${qLower}`;
+  const cached = gs.cache.get(cacheKey);
+  if (cached && cached.expiresAt > now) {
+    console.log("[grounding] cache hit");
+    return cached.value;
+  }
+  if (gs.inFlight.has(cacheKey)) {
+    console.log("[grounding] duplicate request prevented");
+    return await gs.inFlight.get(cacheKey);
+  }
+  const run = (async () => {
   const isWeatherQuery = /\b(weather|temperature|temp|hot|cold|rain|humidity|forecast|windy|climate|today'?s weather|tomorrow weather)\b/i.test(finalQuery);
   if (isWeatherQuery) {
     console.log("[weather] detected query");
@@ -1311,7 +1341,6 @@ async function performRealtimeGrounding(query, config) {
   }
   const ai = new GoogleGenAI({ apiKey: geminiKey });
   const models = ["gemini-2.5-flash", "gemini-1.5-flash"];
-  const delays = [1500, 3000, 5000];
   const prompt = `Return ONLY valid minified JSON. Do not use markdown. Do not use explanations. Do not use conversational text. Do not speculate. Do not guess. Schema: {"query_type":"","subject":"","answer":"","confidence":0.0,"sources":[],"timestamp":"","verified":true}. Query: ${finalQuery}`;
   const extractJson = (txt) => {
     try { return JSON.parse(txt); } catch {}
@@ -1319,42 +1348,51 @@ async function performRealtimeGrounding(query, config) {
     if (s >= 0 && e > s) { try { return JSON.parse(txt.slice(s, e + 1)); } catch {} }
     return null;
   };
-  for (let m = 0; m < models.length; m++) {
-    const model = models[m];
-    if (m > 0) console.log("[grounding] fallback model");
-    for (let a = 1; a <= 3; a++) {
-      try {
-        console.log(`[grounding] retry ${a}/3`);
-        const response = await Promise.race([
-          ai.models.generateContent({ model, contents: [{ role: "user", parts: [{ text: prompt }] }], config: { temperature: 0.1 } }),
-          new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 20000))
-        ]);
-        const raw = (response?.text || "").trim();
-        const data = extractJson(raw);
-        if (!data) throw new Error("invalid json");
-        const qtype = String(data.query_type || "").toLowerCase();
-        console.log(`[grounding] query_type=${qtype || "unknown"}`);
-        const answerOk = String(data.answer || "").trim().length > 0;
-        const confOk = Number(data.confidence || 0) >= 0.5;
-        const verifiedOk = data.verified === true;
-        const sourcesOk = Array.isArray(data.sources) && data.sources.length > 0;
-        const sports = /sports|ipl|cricket|football|match|score/.test(qtype + " " + finalQuery.toLowerCase());
-        const weather = /weather|forecast|temperature/.test(qtype + " " + finalQuery.toLowerCase());
-        const news = /news|breaking|headline/.test(qtype + " " + finalQuery.toLowerCase());
-        const sportsOk = !sports || (/\b(vs|defeated|beat|won|draw)\b/i.test(String(data.answer || "")) && /\d{4}|\bjan|\bfeb|\bmar|\bapr|\bmay|\bjun|\bjul|\baug|\bsep|\boct|\bnov|\bdec/i.test(String(data.answer || "")));
-        const weatherOk = !weather || /\d+\s*°|c|f|humid|rain|cloud|sun|wind/i.test(String(data.answer || ""));
-        const newsOk = !news || (String(data.answer || "").length > 15 && String(data.timestamp || "").length > 0);
-        if (!(answerOk && confOk && verifiedOk && sourcesOk && sportsOk && weatherOk && newsOk)) throw new Error("validation failed");
-        console.log("[grounding] validation success");
-        console.log("[grounding] final verified response");
-        return data;
-      } catch (e) {
-        if (a < 3) await new Promise(r => setTimeout(r, delays[a - 1]));
+  const runOnce = async (model, label) => {
+    console.log(`[grounding] ${label} attempt`);
+    const response = await Promise.race([
+      ai.models.generateContent({ model, contents: [{ role: "user", parts: [{ text: prompt }] }], config: { temperature: 0.1 } }),
+      new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 20000))
+    ]);
+    const raw = (response?.text || "").trim();
+    const data = extractJson(raw);
+    if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error("invalid json");
+    const answerOk = String(data.answer || "").trim().length > 0;
+    const confOk = Number(data.confidence || 0) >= 0.5;
+    const verifiedOk = data.verified === true;
+    const sourcesOk = Array.isArray(data.sources) && data.sources.length > 0;
+    if (!(answerOk && confOk && verifiedOk && sourcesOk)) throw new Error("validation failed");
+    return data;
+  };
+  try {
+    const data = await runOnce(models[0], "primary");
+    gs.cache.set(cacheKey, { value: data, expiresAt: Date.now() + cacheTtl });
+    return data;
+  } catch (e1) {
+    const m1 = (e1?.message || "").toLowerCase();
+    if (m1.includes("429") || m1.includes("quota") || m1.includes("resource_exhausted")) {
+      gs.cooldownUntil = Date.now() + 60000;
+      console.log("[gemini-search] quota cooldown started");
+      return null;
+    }
+    await new Promise(r => setTimeout(r, 4000));
+    try {
+      const data = await runOnce(models[1], "fallback");
+      gs.cache.set(cacheKey, { value: data, expiresAt: Date.now() + cacheTtl });
+      return data;
+    } catch (e2) {
+      const m2 = (e2?.message || "").toLowerCase();
+      if (m2.includes("429") || m2.includes("quota") || m2.includes("resource_exhausted")) {
+        gs.cooldownUntil = Date.now() + 60000;
+        console.log("[gemini-search] quota cooldown started");
       }
+      console.log("[grounding] final failure");
+      return null;
     }
   }
-  console.log("[grounding] final failure after retries");
-  return null;
+  })();
+  gs.inFlight.set(cacheKey, run);
+  try { return await run; } finally { gs.inFlight.delete(cacheKey); }
 }
 async function performWeatherGrounding(query, config, geminiKey) {
   try {
