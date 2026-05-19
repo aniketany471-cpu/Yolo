@@ -25,6 +25,29 @@ function extractLocation(query) {
     .trim();
   return stripped || "";
 }
+function parseLocationParts(locationName) {
+  const tokens = locationName.toLowerCase().split(/\s+/).filter(Boolean);
+  if (tokens.length <= 1) return { locality: locationName.trim(), region: "" };
+  const region = tokens.slice(1).join(" ");
+  return { locality: tokens[0], region };
+}
+function norm(s) {
+  return String(s || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+}
+function scoreCandidate(locality, region, candidate) {
+  const city = norm(candidate?.LocalizedName || "");
+  const admin = norm(candidate?.AdministrativeArea?.LocalizedName || "");
+  const country = norm(candidate?.Country?.LocalizedName || "");
+  const fullRegion = norm(`${admin} ${country}`);
+  const localityN = norm(locality);
+  const regionN = norm(region);
+  const localityMatch = city.includes(localityN) || localityN.includes(city);
+  const regionMatch = !regionN || fullRegion.includes(regionN) || regionN.includes(admin);
+  let score = 0;
+  if (localityMatch) score += 70;
+  if (regionMatch) score += 30;
+  return score;
+}
 
 async function resolveLocationKey(locationName, apiKey) {
   const cacheKey = locationName.toLowerCase();
@@ -35,12 +58,34 @@ async function resolveLocationKey(locationName, apiKey) {
   }
 
   console.log("[weather] resolving location");
+  const { locality, region } = parseLocationParts(locationName);
+  console.log(`[weather] parsed_locality=${locality}`);
+  console.log(`[weather] parsed_region=${region || "none"}`);
   const url = `https://dataservice.accuweather.com/locations/v1/cities/search?apikey=${encodeURIComponent(apiKey)}&q=${encodeURIComponent(locationName)}`;
   console.log("[weather] location_search_url_execution=true");
   const resp = await fetch(url);
   console.log(`[weather] location_search_status=${resp.status}`);
   if (!resp.ok) throw new Error(`location_search_http_${resp.status}`);
   const data = await resp.json();
+  const candidates = Array.isArray(data) ? data : [];
+  if (candidates.length === 0) throw new Error("invalid_location");
+  let best = null;
+  let bestScore = -1;
+  for (const c of candidates.slice(0, 8)) {
+    const s = scoreCandidate(locality, region, c);
+    console.log(`[weather] candidate_city=${c?.LocalizedName || ""}`);
+    console.log(`[weather] candidate_region=${c?.AdministrativeArea?.LocalizedName || ""}`);
+    console.log(`[weather] location_match_score=${s}`);
+    if (s > bestScore) {
+      bestScore = s;
+      best = c;
+    }
+  }
+  if (!best?.Key || bestScore < 60) throw new Error("invalid_location");
+
+  const resolved = {
+    key: best.Key,
+    name: `${best.LocalizedName}, ${best.AdministrativeArea?.LocalizedName || ""}, ${best.Country?.LocalizedName || ""}`.replace(/,\s*,/g, ",").trim().replace(/,\s*$/, "")
   const first = Array.isArray(data) ? data[0] : null;
   if (!first?.Key) throw new Error("invalid location");
 
