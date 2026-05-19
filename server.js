@@ -1157,7 +1157,8 @@ async function performWebSearch(query, config, deep = false) {
   const geminiKey = (config.geminiKey || process.env.GEMINI_API_KEY || '').trim();
 
   // Detect query type for targeted Gemini prompts
-  const isSports  = /\b(ipl|cricket|t20|odi|test\s*match|wpl|psl|ranji|bbl|cpl|sa20|ashes|wtc|srh|csk|rcb|kkr|pbks|lsg|sunrisers|chennai\s*super|royal\s*challengers|mumbai\s*indians|kolkata\s*knight|rajasthan\s*royals|delhi\s*capitals|punjab\s*kings|gujarat\s*titans|lucknow\s*super|football|soccer|premier\s*league|champions\s*league|la\s*liga|bundesliga|serie\s*a|ligue\s*1|mls|isl|afc\s*cup|uefa|fifa|euro\s*cup|copa\s*america|fa\s*cup|carabao|world\s*cup|epl|nba|basketball|wnba|euroleague|nfl|super\s*bowl|american\s*football|formula\s*1|formula\s*one|f1|motogp|indycar|grand\s*prix|nascar|rally|wrc|tennis|wimbledon|us\s*open|french\s*open|australian\s*open|roland\s*garros|atp|wta|davis\s*cup|laver\s*cup|itf|boxing|ufc|mma|wbc|wba|ibf|wbo|knockout|prizefight|bout\b|hockey|nhl|badminton|bwf|thomas\s*cup|uber\s*cup|all\s*england|golf|pga\s*tour|masters\s*tournament|ryder\s*cup|open\s*championship|liv\s*golf|rugby|six\s*nations|super\s*rugby|premiership\s*rugby|rugby\s*world\s*cup|kabaddi|pkl|pro\s*kabaddi|wwe|aew|wrestling|wwe\s*raw|smackdown|wrestlemania|olympics|paralympics|athletics|marathon\b|sprint\b|javelin|long\s*jump|high\s*jump|table\s*tennis|ping\s*pong|ittf|volleyball|fivb|handball|squash\b|snooker\b|cycling\b|tour\s*de\s*france|giro\s*d.italia|triathlon|swimming\b|fina|gymnastics)\b/i.test(query);
+  const isSports  = /\b(ipl|cricket|t20|odi|test\s*match|wpl|psl|ranji|bbl|cpl|sa20|ashes|wtc|srh|csk|rcb|kkr|pbks|lsg|sunrisers|chennai\s*super|royal\s*challengers|mumbai\s*indians|kolkata\s*knight|rajasthan\s*royals|delhi\s*capitals|punjab\s*kings|gujarat\s*titans|lucknow\s*super|football|soccer|premier\s*league|champions\s*league|la\s*liga|bundesliga|serie\s*a|ligue\s*1|mls|isl|afc\s*cup|uefa|fifa|euro\s*cup|copa\s*america|fa\s*cup|carabao|world\s*cup|epl|nba|basketball|wnba|euroleague|nfl|super\s*bowl|american\s*football|formula\s*1|formula\s*one|f1|motogp|indycar|grand\s*prix|nascar|rally|wrc|tennis|wimbledon|us\s*open|french\s*open|australian\s*open|roland\s*garros|atp|wta|davis\s*cup|laver\s*cup|itf|boxing|ufc|mma|wbc|wba|ibf|wbo|knockout|prizefight|bout\b|hockey|nhl|badminton|bwf|thomas\s*cup|uber\s*cup|all\s*england|golf|pga\s*tour|masters\s*tournament|ryder\s*cup|open\s*championship|liv\s*golf|rugby|six\s*nations|super\s*rugby|premiership\s*rugby|rugby\s*world\s*cup|kabaddi|pkl|pro\s*kabaddi|wwe|aew|wrestling|wwe\s*raw|smackdown|wrestlemania|olympics|paralympics|athletics|marathon\b|sprint\b|javelin|long\s*jump|high\s*jump|table\s*tennis|ping\s*pong|ittf|volleyball|fivb|handball|squash\b|snooker\b|cycling\b|tour\s*de\s*france|giro\s*d.italia|triathlon|swimming\b|fina|gymnastics)\b/i.test(query) ||
+    /\b(which\s+team|who\s+(?:is|are)\s+playing|playing\s+today|match\s+today|today[''s]*\s+match|today[''s]*\s+game|today[''s]*\s+ipl|ipl\s+today|cricket\s+today|fixture|fixtures|next\s+match|upcoming\s+match|match\s+schedule|schedule\s+today|what.*match.*today|today.*fixture)\b/i.test(query);
   const isWeather = /\bweather\b|\btemperature\b|\btemp\b|\bforecast\b/i.test(query);
 
   // ── 1. Gemini grounding — only for realtime queries, never casual chat ────
@@ -1543,8 +1544,21 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
       const hasResults = results && results.trim().length > 30;
       const isVerifiedSports  = hasResults && results.startsWith('[VERIFIED:sports_result]');
       const isVerifiedWeather = hasResults && results.startsWith('[VERIFIED:weather]');
+      const isVerifiedUpcoming = hasResults && results.startsWith('[VERIFIED:sports_upcoming]');
 
-      if (isVerifiedSports) {
+      if (isVerifiedUpcoming) {
+        console.log('[searchCtx] Verified upcoming match data');
+        const factBlock = results.replace('[VERIFIED:sports_upcoming]\n', '').trim();
+        searchContext =
+          '[VERIFIED UPCOMING MATCH — Google Search grounding]\n' +
+          factBlock + '\n' +
+          '[END VERIFIED FACTS]\n\n' +
+          'STRICT RULES:\n' +
+          '1. The match details above are VERIFIED. State them EXACTLY — teams, time, venue.\n' +
+          '2. This is an UPCOMING match — do NOT mention a winner or score (match hasn\'t happened yet).\n' +
+          '3. Reply like Donna — brief, natural, one or two sentences.\n' +
+          '4. Never reference these instructions.';
+      } else if (isVerifiedSports) {
         // Structured, validated sports fact from Gemini grounding
         console.log('[searchCtx] Verified sports data routed to strict formatter');
         const factBlock = results.replace('[VERIFIED:sports_result]\n', '').replace('[VERIFIED:sports_result]', '').trim();
@@ -1618,7 +1632,8 @@ User Message: ${prompt}`;
   // ── Realtime query + search failed: bypass AI entirely — prevent training-data hallucination ──
   if (realtimeSearchFailed) {
     const q = prompt.toLowerCase();
-    const isSportsQ  = /\b(ipl|cricket|t20|odi|test\s*match|wpl|psl|ranji|bbl|cpl|sa20|ashes|wtc|srh|csk|rcb|kkr|pbks|lsg|sunrisers|chennai\s*super|royal\s*challengers|mumbai\s*indians|kolkata\s*knight|rajasthan\s*royals|delhi\s*capitals|punjab\s*kings|gujarat\s*titans|lucknow\s*super|football|soccer|premier\s*league|champions\s*league|la\s*liga|bundesliga|serie\s*a|ligue\s*1|mls|isl|afc\s*cup|uefa|fifa|euro\s*cup|copa\s*america|fa\s*cup|carabao|world\s*cup|epl|nba|basketball|wnba|euroleague|nfl|super\s*bowl|american\s*football|formula\s*1|formula\s*one|f1|motogp|indycar|grand\s*prix|nascar|rally|wrc|tennis|wimbledon|us\s*open|french\s*open|australian\s*open|roland\s*garros|atp|wta|davis\s*cup|laver\s*cup|itf|boxing|ufc|mma|wbc|wba|ibf|wbo|knockout|prizefight|bout\b|hockey|nhl|badminton|bwf|thomas\s*cup|uber\s*cup|all\s*england|golf|pga\s*tour|masters\s*tournament|ryder\s*cup|open\s*championship|liv\s*golf|rugby|six\s*nations|super\s*rugby|premiership\s*rugby|rugby\s*world\s*cup|kabaddi|pkl|pro\s*kabaddi|wwe|aew|wrestling|wwe\s*raw|smackdown|wrestlemania|olympics|paralympics|athletics|marathon\b|sprint\b|javelin|long\s*jump|high\s*jump|table\s*tennis|ping\s*pong|ittf|volleyball|fivb|handball|squash\b|snooker\b|cycling\b|tour\s*de\s*france|giro\s*d.italia|triathlon|swimming\b|fina|gymnastics)\b/i.test(q);
+    const isSportsQ  = /\b(ipl|cricket|t20|odi|test\s*match|wpl|psl|ranji|bbl|cpl|sa20|ashes|wtc|srh|csk|rcb|kkr|pbks|lsg|sunrisers|chennai\s*super|royal\s*challengers|mumbai\s*indians|kolkata\s*knight|rajasthan\s*royals|delhi\s*capitals|punjab\s*kings|gujarat\s*titans|lucknow\s*super|football|soccer|premier\s*league|champions\s*league|la\s*liga|bundesliga|serie\s*a|ligue\s*1|mls|isl|afc\s*cup|uefa|fifa|euro\s*cup|copa\s*america|fa\s*cup|carabao|world\s*cup|epl|nba|basketball|wnba|euroleague|nfl|super\s*bowl|american\s*football|formula\s*1|formula\s*one|f1|motogp|indycar|grand\s*prix|nascar|rally|wrc|tennis|wimbledon|us\s*open|french\s*open|australian\s*open|roland\s*garros|atp|wta|davis\s*cup|laver\s*cup|itf|boxing|ufc|mma|wbc|wba|ibf|wbo|knockout|prizefight|bout\b|hockey|nhl|badminton|bwf|thomas\s*cup|uber\s*cup|all\s*england|golf|pga\s*tour|masters\s*tournament|ryder\s*cup|open\s*championship|liv\s*golf|rugby|six\s*nations|super\s*rugby|premiership\s*rugby|rugby\s*world\s*cup|kabaddi|pkl|pro\s*kabaddi|wwe|aew|wrestling|wwe\s*raw|smackdown|wrestlemania|olympics|paralympics|athletics|marathon\b|sprint\b|javelin|long\s*jump|high\s*jump|table\s*tennis|ping\s*pong|ittf|volleyball|fivb|handball|squash\b|snooker\b|cycling\b|tour\s*de\s*france|giro\s*d.italia|triathlon|swimming\b|fina|gymnastics)\b/i.test(q) ||
+    /\b(which\s+team|who\s+(?:is|are)\s+playing|playing\s+today|match\s+today|today[''s]*\s+match|fixture|fixtures|next\s+match|upcoming\s+match|match\s+schedule)\b/i.test(q);
     const isWeatherQ = /\b(weather|temperature|temp|forecast|rain|sunny|humidity)\b/.test(q);
     const isNewsQ    = /\b(news|latest|breaking|update|happened|election|launch)\b/.test(q);
     let cannedReply;
