@@ -52,24 +52,25 @@ function buildPrompt(query, type) {
 
   if (type === 'sports') {
     return (
-      today + ' Use this date when searching.\n\n' +
-      'Find the CURRENT or most recent result for: ' + query + '\n\n' +
-      'Search for matches from TODAY or yesterday ONLY. Do NOT use results from previous seasons or years.\n\n' +
-      'Return ONLY a valid JSON object — no markdown, no extra text, nothing else:\n' +
+      today + ' Use this exact date when searching.\n\n' +
+      'Search for information about: ' + query + '\n\n' +
+      'This may be asking about a PAST result OR an UPCOMING match. Check both.\n' +
+      'Only search TODAY and yesterday. Do NOT use results from previous seasons or years.\n\n' +
+      'Return ONLY a valid JSON object — no markdown, no extra text:\n' +
       '{\n' +
-      '  "match_date": "YYYY-MM-DD or today/yesterday",\n' +
+      '  "match_date": "YYYY-MM-DD",\n' +
       '  "teams": ["Team A", "Team B"],\n' +
-      '  "winner": "Team A",\n' +
-      '  "score": "Team A 187/4 (20 ovs) beat Team B 183/6 (20 ovs)",\n' +
+      '  "winner": "Team A or empty string if upcoming/live",\n' +
+      '  "score": "scorecard or empty string if upcoming",\n' +
       '  "status": "Result",\n' +
-      '  "venue": "optional stadium name",\n' +
-      '  "key_event": "optional one-line highlight"\n' +
+      '  "match_time": "7:30 PM IST or empty if completed",\n' +
+      '  "venue": "stadium name",\n' +
+      '  "key_event": "one-line highlight or empty"\n' +
       '}\n\n' +
-      'Rules:\n' +
-      '- status must be exactly one of: "Live", "Result", "Innings Break", "No match"\n' +
-      '- If no match found or played today/yesterday: {"status":"No match","teams":[],"winner":"","score":""}\n' +
-      '- winner must be the exact team name, never empty for a completed match\n' +
-      '- score must include actual run totals, never a description'
+      'status must be EXACTLY one of: "Live" | "Result" | "Innings Break" | "Upcoming" | "No match"\n' +
+      'For UPCOMING matches: winner and score must be empty strings, match_time must be set.\n' +
+      'For COMPLETED matches: winner must be the exact winning team name, score must have run totals.\n' +
+      'If truly no match today or yesterday: {"status":"No match","teams":[],"winner":"","score":""}'
     );
   }
 
@@ -127,6 +128,19 @@ function parseGroundedFact(text, type) {
       // Return null — let Serper cross-check before trusting Gemini's 'No match'
       console.warn('[gemini-search] Sports: Gemini returned No match — handing off to Serper');
       return null;
+    }
+    // Upcoming match — no winner/score yet
+    if (status === 'Upcoming') {
+      if (!teams || !teams.length) { console.warn('[gemini-search] Upcoming: no teams — returning null'); return null; }
+      const lines = [
+        '[VERIFIED:sports_upcoming]',
+        'Date: ' + (match_date || 'Today'),
+        'Match: ' + (Array.isArray(teams) ? teams.join(' vs ') : teams),
+        'Status: Upcoming',
+      ];
+      if (data.match_time) lines.push('Time: ' + data.match_time);
+      if (venue) lines.push('Venue: ' + venue);
+      return lines.join('\n');
     }
     if (!winner || !score) {
       console.warn('[gemini-search] Sports JSON: missing winner or score — returning null');
