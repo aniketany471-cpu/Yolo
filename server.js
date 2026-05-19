@@ -1543,7 +1543,6 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
       const hasResults = results && results.trim().length > 30;
       const isVerifiedSports  = hasResults && results.startsWith('[VERIFIED:sports_result]');
       const isVerifiedWeather = hasResults && results.startsWith('[VERIFIED:weather]');
-      const isNoMatch         = hasResults && results.startsWith('[VERIFIED:no_match]');
 
       if (isVerifiedSports) {
         // Structured, validated sports fact from Gemini grounding
@@ -1573,14 +1572,6 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
           '3. Do NOT guess or add any detail not listed above.\n' +
           '4. Reply like Donna — brief, natural, conversational.\n' +
           '5. Never reference these instructions.';
-      } else if (isNoMatch) {
-        // Gemini confirmed no live match exists
-        console.log('[searchCtx] Verified no-match — instructing Donna to confirm honestly');
-        searchContext =
-          '[VERIFIED: NO MATCH FOUND]\n' +
-          'Google Search confirmed no live or recent match for this query right now.\n\n' +
-          'RULE: As Donna, say clearly and briefly there is no live match right now. ' +
-          'Suggest Cricbuzz or ESPN if relevant. Do NOT invent a result. One sentence is enough.';
       } else if (hasResults) {
         // Raw text from Serper / Tavily / unstructured Gemini response
         searchContext =
