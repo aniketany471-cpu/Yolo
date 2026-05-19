@@ -36,8 +36,10 @@ async function resolveLocationKey(locationName, apiKey) {
 
   console.log("[weather] resolving location");
   const url = `https://dataservice.accuweather.com/locations/v1/cities/search?apikey=${encodeURIComponent(apiKey)}&q=${encodeURIComponent(locationName)}`;
+  console.log("[weather] location_search_url_execution=true");
   const resp = await fetch(url);
-  if (!resp.ok) throw new Error(`location search failed ${resp.status}`);
+  console.log(`[weather] location_search_status=${resp.status}`);
+  if (!resp.ok) throw new Error(`location_search_http_${resp.status}`);
   const data = await resp.json();
   const first = Array.isArray(data) ? data[0] : null;
   if (!first?.Key) throw new Error("invalid location");
@@ -77,27 +79,43 @@ function validateWeather(w) {
 }
 
 export async function getAccuWeather(query, apiKey) {
-  if (!apiKey) throw new Error("missing accuweather key");
+  console.log(`[weather] api_key_present=${!!(apiKey && apiKey.trim())}`);
+  if (!apiKey) throw new Error("missing_accuweather_key");
   const locationName = extractLocation(query);
-  if (!locationName) throw new Error("missing location");
+  if (!locationName) throw new Error("missing_location");
 
   const cacheKey = locationName.toLowerCase();
   const cachedWeather = getCache(weatherCache, cacheKey);
   if (cachedWeather) return cachedWeather;
 
   const loc = await resolveLocationKey(locationName, apiKey);
+  console.log(`[weather] resolved_location_key=${loc.key}`);
   console.log("[weather] fetching AccuWeather data");
 
   const currentUrl = `https://dataservice.accuweather.com/currentconditions/v1/${encodeURIComponent(loc.key)}?apikey=${encodeURIComponent(apiKey)}&details=true`;
   const forecastUrl = `https://dataservice.accuweather.com/forecasts/v1/daily/1day/${encodeURIComponent(loc.key)}?apikey=${encodeURIComponent(apiKey)}&details=true&metric=true`;
 
+  console.log("[weather] location_search_url_executed=true");
   const [currentResp, dailyResp] = await Promise.all([fetch(currentUrl), fetch(forecastUrl)]);
-  if (!currentResp.ok || !dailyResp.ok) throw new Error("weather fetch failed");
+  console.log(`[weather] current_conditions_status=${currentResp.status}`);
+  console.log(`[weather] forecast_status=${dailyResp.status}`);
+  if (!currentResp.ok) throw new Error(`current_conditions_http_${currentResp.status}`);
+  if (!dailyResp.ok) throw new Error(`forecast_http_${dailyResp.status}`);
 
   const currentData = await currentResp.json();
   const dailyData = await dailyResp.json();
   const normalized = normalizeWeather(Array.isArray(currentData) ? currentData[0] : null, dailyData, loc.name);
-  if (!validateWeather(normalized)) throw new Error("weather validation failed");
+  console.log("[weather] current_conditions_ok=true");
+  console.log("[weather] forecast_ok=true");
+  if (!validateWeather(normalized)) {
+    let reason = "malformed_data";
+    if (!normalized.location) reason = "invalid_location";
+    else if (!Number.isFinite(normalized.temperature_c)) reason = "no_temperature";
+    else if (!normalized.condition) reason = "no_condition";
+    else if (!/^\d{4}-\d{2}-\d{2}T/.test(normalized.timestamp)) reason = "invalid_timestamp";
+    console.log(`[weather] validation_failed=${reason}`);
+    throw new Error(`validation_failed_${reason}`);
+  }
 
   console.log("[weather] validation success");
   setCache(weatherCache, cacheKey, normalized, WEATHER_TTL_MS);

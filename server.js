@@ -1406,7 +1406,9 @@ async function performWeatherGrounding(query, config, geminiKey) {
     const weather = await getAccuWeather(query, apiKey);
     console.log("[weather] final verified response");
     return weather;
-  } catch (e) {}
+  } catch (e) {
+    console.log(`[weather] returning_null_reason=${e?.message || "unknown_error"}`);
+  }
   return null;
 }
 function cleanAIResponse(text, config) {
