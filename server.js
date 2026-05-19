@@ -1154,20 +1154,87 @@ function isRealtimeQuery(query) {
   return /\b(live|today|tonight|right now|this week|current|latest|breaking|just now|happening|trending|score[s]?|result[s]?|match|winner|champion|ipl|cricket|t20|odi|football|soccer|nba|nfl|f1|grand\s*prix|motogp|tennis|wimbledon|us\s*open|french\s*open|australian\s*open|atp|wta|boxing|ufc|mma|knockout|hockey|nhl|badminton|bwf|golf|pga|masters|rugby|six\s*nations|kabaddi|pkl|wwe|olympics|athletics|prix|price[s]?|crypto|bitcoin|btc|eth|stock|nifty|sensex|share\s*price|weather|temp(erature)?|forecast|news|election|who\s*won|what\s*happened|did\s*.{0,20}\s*win|update[s]?)\b/i.test(q);
 }
 
+function getKolkataNowParts() {
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  });
+  const parts = fmt.formatToParts(new Date());
+  return {
+    y: Number(parts.find((p) => p.type === "year")?.value || 0),
+    m: Number(parts.find((p) => p.type === "month")?.value || 1),
+    d: Number(parts.find((p) => p.type === "day")?.value || 1)
+  };
+}
+function addDaysYmd(y, m, d, deltaDays) {
+  const dt = new Date(Date.UTC(y, m - 1, d + deltaDays));
+  return { y: dt.getUTCFullYear(), m: dt.getUTCMonth() + 1, d: dt.getUTCDate() };
+}
+function formatYmd(obj) {
+  return `${obj.y}-${String(obj.m).padStart(2, "0")}-${String(obj.d).padStart(2, "0")}`;
+}
+function formatLongDate(obj) {
+  const dt = new Date(Date.UTC(obj.y, obj.m - 1, obj.d));
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone: "UTC",
+    day: "2-digit",
+    month: "long",
+    year: "numeric"
+  }).format(dt);
+}
+function resolveRealtimeContext(query) {
+  const q = (query || "").toLowerCase();
+  const base = getKolkataNowParts();
+  const detected = [];
+  let resolved = null;
+  if (/\byesterday\b|\blast night\b/.test(q)) {
+    detected.push("yesterday");
+    resolved = addDaysYmd(base.y, base.m, base.d, -1);
+  } else if (/\btomorrow\b|\btonight\b/.test(q)) {
+    detected.push("tomorrow");
+    resolved = addDaysYmd(base.y, base.m, base.d, 1);
+  } else if (/\btoday\b|\bnow\b|\bcurrently\b|\bcurrent\b|\blatest\b|\bthis morning\b|\brecent\b/.test(q)) {
+    detected.push("today");
+    resolved = base;
+  }
+  if (/\bthis week\b/.test(q)) detected.push("this week");
+  if (detected.length === 0) return { rewrittenQuery: query, resolvedDate: null, detected };
+  const ref = resolved || base;
+  const longDate = formatLongDate(ref);
+  let rewritten = query
+    .replace(/\byesterday\b|\blast night\b/ig, `on ${longDate}`)
+    .replace(/\btoday\b|\bthis morning\b/ig, `on ${longDate}`)
+    .replace(/\btomorrow\b|\btonight\b/ig, `on ${longDate}`)
+    .replace(/\bnow\b|\bcurrently\b|\bcurrent\b|\blatest\b|\brecent\b/ig, `as of ${longDate}`);
+  if (/\b(ipl|cricket|match|score|news|weather|stock|price|live)\b/i.test(rewritten)) {
+    rewritten += ` [timezone: Asia/Kolkata] [reference_date: ${longDate} (${formatYmd(ref)})] [year: ${base.y}]`;
+  }
+  return { rewrittenQuery: rewritten, resolvedDate: formatYmd(ref), detected };
+}
+
 async function performWebSearch(query, config, deep = false) {
+  const rtc = resolveRealtimeContext(query);
+  const searchQuery = rtc.rewrittenQuery || query;
+  if (rtc.detected.length > 0) {
+    console.log(`[time] detected: ${rtc.detected.join(", ")}`);
+    if (rtc.resolvedDate) console.log(`[time] resolved date: ${rtc.resolvedDate}`);
+    console.log(`[time] rewritten query: "${searchQuery.slice(0, 140)}"`);
+  }
   const geminiKey = (config.geminiKey || process.env.GEMINI_API_KEY || '').trim();
 
   // Detect query type for targeted Gemini prompts
-  const isSports  = /\b(ipl|cricket|t20|odi|test\s*match|wpl|psl|ranji|bbl|cpl|sa20|ashes|wtc|srh|csk|rcb|kkr|pbks|lsg|sunrisers|chennai\s*super|royal\s*challengers|mumbai\s*indians|kolkata\s*knight|rajasthan\s*royals|delhi\s*capitals|punjab\s*kings|gujarat\s*titans|lucknow\s*super|football|soccer|premier\s*league|champions\s*league|la\s*liga|bundesliga|serie\s*a|ligue\s*1|mls|isl|afc\s*cup|uefa|fifa|euro\s*cup|copa\s*america|fa\s*cup|carabao|world\s*cup|epl|nba|basketball|wnba|euroleague|nfl|super\s*bowl|american\s*football|formula\s*1|formula\s*one|f1|motogp|indycar|grand\s*prix|nascar|rally|wrc|tennis|wimbledon|us\s*open|french\s*open|australian\s*open|roland\s*garros|atp|wta|davis\s*cup|laver\s*cup|itf|boxing|ufc|mma|wbc|wba|ibf|wbo|knockout|prizefight|bout\b|hockey|nhl|badminton|bwf|thomas\s*cup|uber\s*cup|all\s*england|golf|pga\s*tour|masters\s*tournament|ryder\s*cup|open\s*championship|liv\s*golf|rugby|six\s*nations|super\s*rugby|premiership\s*rugby|rugby\s*world\s*cup|kabaddi|pkl|pro\s*kabaddi|wwe|aew|wrestling|wwe\s*raw|smackdown|wrestlemania|olympics|paralympics|athletics|marathon\b|sprint\b|javelin|long\s*jump|high\s*jump|table\s*tennis|ping\s*pong|ittf|volleyball|fivb|handball|squash\b|snooker\b|cycling\b|tour\s*de\s*france|giro\s*d.italia|triathlon|swimming\b|fina|gymnastics)\b/i.test(query) ||
+  const isSports  = /\b(ipl|cricket|t20|odi|test\s*match|wpl|psl|ranji|bbl|cpl|sa20|ashes|wtc|srh|csk|rcb|kkr|pbks|lsg|sunrisers|chennai\s*super|royal\s*challengers|mumbai\s*indians|kolkata\s*knight|rajasthan\s*royals|delhi\s*capitals|punjab\s*kings|gujarat\s*titans|lucknow\s*super|football|soccer|premier\s*league|champions\s*league|la\s*liga|bundesliga|serie\s*a|ligue\s*1|mls|isl|afc\s*cup|uefa|fifa|euro\s*cup|copa\s*america|fa\s*cup|carabao|world\s*cup|epl|nba|basketball|wnba|euroleague|nfl|super\s*bowl|american\s*football|formula\s*1|formula\s*one|f1|motogp|indycar|grand\s*prix|nascar|rally|wrc|tennis|wimbledon|us\s*open|french\s*open|australian\s*open|roland\s*garros|atp|wta|davis\s*cup|laver\s*cup|itf|boxing|ufc|mma|wbc|wba|ibf|wbo|knockout|prizefight|bout\b|hockey|nhl|badminton|bwf|thomas\s*cup|uber\s*cup|all\s*england|golf|pga\s*tour|masters\s*tournament|ryder\s*cup|open\s*championship|liv\s*golf|rugby|six\s*nations|super\s*rugby|premiership\s*rugby|rugby\s*world\s*cup|kabaddi|pkl|pro\s*kabaddi|wwe|aew|wrestling|wwe\s*raw|smackdown|wrestlemania|olympics|paralympics|athletics|marathon\b|sprint\b|javelin|long\s*jump|high\s*jump|table\s*tennis|ping\s*pong|ittf|volleyball|fivb|handball|squash\b|snooker\b|cycling\b|tour\s*de\s*france|giro\s*d.italia|triathlon|swimming\b|fina|gymnastics)\b/i.test(searchQuery) ||
     /\b(which\s+team|who\s+(?:is|are)\s+playing|playing\s+today|match\s+today|today[''s]*\s+match|today[''s]*\s+game|today[''s]*\s+ipl|ipl\s+today|cricket\s+today|fixture|fixtures|next\s+match|upcoming\s+match|match\s+schedule|schedule\s+today|what.*match.*today|today.*fixture)\b/i.test(query);
-  const isWeather = /\bweather\b|\btemperature\b|\btemp\b|\bforecast\b/i.test(query);
+  const isWeather = /\bweather\b|\btemperature\b|\btemp\b|\bforecast\b/i.test(searchQuery);
 
   // ── 1. Gemini grounding — only for realtime queries, never casual chat ────
-  if (geminiGroundedSearch && geminiKey && isRealtimeQuery(query)) {
+  if (geminiGroundedSearch && geminiKey && isRealtimeQuery(searchQuery)) {
     const type = isSports ? 'sports' : isWeather ? 'weather' : 'general';
     try {
-      console.log(`[search] Gemini grounding (type=${type}): "${query.slice(0, 70)}"`);
-      const result = await geminiGroundedSearch(query, geminiKey, type);
+      console.log(`[search] Gemini grounding (type=${type}): "${searchQuery.slice(0, 70)}"`);
+      const result = await geminiGroundedSearch(searchQuery, geminiKey, type);
       if (result && result.trim().length > 30) {
         // For sports: verify actual score pattern exists so we don't pass a "no match" summary
         if (isSports && !hasActualScoreData(result)) {
@@ -1185,14 +1252,14 @@ async function performWebSearch(query, config, deep = false) {
     } catch (e) {
       console.warn('[search] Gemini grounding error:', e.message);
     }
-  } else if (!isRealtimeQuery(query)) {
-    console.log(`[search] Not realtime — skipping Gemini: "${query.slice(0, 50)}"`);
+  } else if (!isRealtimeQuery(searchQuery)) {
+    console.log(`[search] Not realtime — skipping Gemini: "${searchQuery.slice(0, 50)}"`);
   }
 
   // ── 2. Serper — API-based Google search ───────────────────────────────────
   if (serperSearch && (config.serperKey || process.env.SERPER_API_KEY)) {
     try {
-      const result = await serperSearch(query, config);
+      const result = await serperSearch(searchQuery, config);
       if (result?.summary) {
         console.log(`[search] Serper OK — intent=${result.intent}`);
         return result.summary;
@@ -1206,7 +1273,7 @@ async function performWebSearch(query, config, deep = false) {
       const response = await fetch('https://api.tavily.com/search', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ api_key: config.searchApiKey, query, search_depth: deep ? 'advanced' : 'basic', max_results: deep ? 6 : 3 }),
+        body: JSON.stringify({ api_key: config.searchApiKey, query: searchQuery, search_depth: deep ? 'advanced' : 'basic', max_results: deep ? 6 : 3 }),
       });
       if (response.ok) {
         const data = await response.json();
