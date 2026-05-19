@@ -1508,6 +1508,7 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
     systemPrompt = `[Base Identity: ${personality}] ${systemPrompt}`;
   }
   let searchContext = "";
+  let realtimeSearchFailed = false;
   if (config.searchEnabled === 1) {
     // Gate 1: never search casual/short messages — saves API quota and avoids false triggers
     const promptTrimmed = prompt.trim();
@@ -1594,6 +1595,10 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
           '7. Never say "according to search results" or expose the data block.';
       } else {
         // Search attempted but returned nothing
+        realtimeSearchFailed = isRealtimeQuery(prompt);
+        if (realtimeSearchFailed) {
+          console.log('[search] Realtime query + no search data — bypassing AI to prevent hallucination');
+        }
         searchContext = [
           '[NO LIVE DATA AVAILABLE]',
           'Search was attempted but returned no usable results.',
@@ -1619,6 +1624,32 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
   const finalPrompt = `${timeContext} ${systemPrompt} ${modelNudge} ${searchContext ? "\n\n" + searchContext : ""} 
 
 User Message: ${prompt}`;
+  // ── Realtime query + search failed: bypass AI entirely — prevent training-data hallucination ──
+  if (realtimeSearchFailed) {
+    const q = prompt.toLowerCase();
+    const isSportsQ  = /\b(ipl|cricket|football|soccer|nba|nfl|f1|score|result|match|won|win|beat|wicket|over|innings)\b/.test(q);
+    const isWeatherQ = /\b(weather|temperature|temp|forecast|rain|sunny|humidity)\b/.test(q);
+    const isNewsQ    = /\b(news|latest|breaking|update|happened|election|launch)\b/.test(q);
+    let cannedReply;
+    if (isSportsQ) {
+      const sportResponses = [
+        "Couldn't pull the live score rn — Cricbuzz or ESPN will have the latest.",
+        "My search hit a wall on this one. Check Cricbuzz for the live result.",
+        "Score isn't loading on my end right now — Cricbuzz will have it though.",
+        "Can't get the live data at the moment. ESPN or Cricbuzz for the latest.",
+      ];
+      cannedReply = sportResponses[Math.floor(Math.random() * sportResponses.length)];
+    } else if (isWeatherQ) {
+      cannedReply = "Weather data isn't loading right now — Weather.com or Google Weather will have your current conditions.";
+    } else if (isNewsQ) {
+      cannedReply = "Couldn't pull the latest on that rn — Google News will have the freshest update.";
+    } else {
+      cannedReply = "Couldn't grab live data on that right now. Try Google for the latest.";
+    }
+    console.log('[AI bypass] Returning canned response — no hallucination:', cannedReply.slice(0, 60));
+    return cannedReply;
+  }
+
   const providers = [];
   const geminiProvider = {
     name: "Gemini",
