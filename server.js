@@ -3252,13 +3252,13 @@ async function startServer() {
               try {
                 const geminiKey = (config.geminiKey || process.env.GEMINI_API_KEY || "").trim();
                 const vision = await analyzeTelegramImageWithGemini(client2, visionSourceMessage, geminiKey);
-                if (vision) {
-                  console.log("[vision] DeepSeek formatting started");
-                  promptForDeepSeek = buildVisionPrompt(text, vision);
-                }
+                if (!vision) throw new Error("VISION_TEMPORARILY_BUSY");
+                console.log("[vision] DeepSeek formatting started");
+                promptForDeepSeek = buildVisionPrompt(text, vision);
               } catch (visionErr) {
                 console.warn("[vision] Gemini Vision failure:", visionErr.message || visionErr);
-                promptForDeepSeek = text || "User uploaded an image. Please ask them to resend or add context if image analysis failed.";
+                await status.finish("I couldn't analyze the image right now — the vision service is temporarily busy. Try again in a moment.");
+                return;
               }
             }
             aiRes = await getAIResponse(
