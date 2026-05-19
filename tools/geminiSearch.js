@@ -123,7 +123,9 @@ function parseGroundedFact(text, type) {
     console.log('[gemini-search] Sports JSON: status=' + status + ' winner=' + (winner || 'none') + ' score=' + (score ? score.slice(0,40) : 'none'));
 
     if (status === 'No match' || (!teams || !teams.length)) {
-      return '[VERIFIED:no_match] No live or recent match found.';
+      // Return null — let Serper cross-check before trusting Gemini's 'No match'
+      console.warn('[gemini-search] Sports: Gemini returned No match — handing off to Serper');
+      return null;
     }
     if (!winner || !score) {
       console.warn('[gemini-search] Sports JSON: missing winner or score — returning null');
