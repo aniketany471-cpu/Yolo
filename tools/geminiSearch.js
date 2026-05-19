@@ -11,7 +11,7 @@
  * DeepSeek gets exact field labels — never guesses missing fields.
  */
 
-import { GoogleGenAI } from '@google/genai';
+import { requestGemini } from '../services/geminiManager.js';
 
 const SEARCH_MODEL_SPORTS  = 'gemini-2.0-flash';     // reliable grounding for live results
 const SEARCH_MODEL_GENERAL = 'gemini-2.5-flash-lite'; // quota-saving for weather/general
@@ -213,13 +213,15 @@ export async function geminiGroundedSearch(query, apiKey, type = 'general') {
   lastCallAt = Date.now();
   try {
     console.log('[gemini-search] Grounding (' + (type === 'sports' ? SEARCH_MODEL_SPORTS : SEARCH_MODEL_GENERAL) + ', type=' + type + '): "' + query.slice(0, 80) + '"');
-    const ai = new GoogleGenAI({ apiKey: cleanKey });
-
-    const response = await ai.models.generateContent({
+    const response = await requestGemini({
+      source: 'realtime_grounding',
+      requestId: `search:${type}:${query.slice(0, 30)}`,
+      apiKey: cleanKey,
       model: type === 'sports' ? SEARCH_MODEL_SPORTS : SEARCH_MODEL_GENERAL,
       contents: [{ role: 'user', parts: [{ text: buildPrompt(query, type) }] }],
       tools: [{ googleSearch: {} }],
       config: { temperature: 0 },
+      attemptType: 'primary',
     });
 
     const text = (response.text || '').trim();
