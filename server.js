@@ -1154,52 +1154,40 @@ function isRealtimeQuery(query) {
 }
 
 async function performWebSearch(query, config, deep = false) {
-  const isSports  = /\b(?:live\s+)?(?:ipl|cricket|football|soccer|nba|nfl|f1|formula)\s*(?:score[s]?|result[s]?|match|live|update[s]?|standing[s]?)\b|\b(?:score[s]?|result[s]?)\s+(?:of|for|in)\s+(?:ipl|cricket|football|soccer)\b|\bipl\s+score|\bcricket\s+score|\blive\s+score[s]?\b/i.test(query);
+  const geminiKey = (config.geminiKey || process.env.GEMINI_API_KEY || '').trim();
+
+  // Detect query type for targeted Gemini prompts
+  const isSports  = /\b(?:live\s+)?(?:ipl|cricket|football|soccer|nba|nfl|f1|kabaddi|wpl|psl|ranji)\s*(?:score[s]?|result[s]?|match|live|update[s]?|standing[s]?)\b|\bipl\s+score|\bcricket\s+score|\blive\s+score[s]?\b/i.test(query);
   const isWeather = /\bweather\b|\btemperature\b|\btemp\b|\bforecast\b/i.test(query);
 
-  // ── 0. Weather → AccuWeather (city-aware, no quota cost) ──────────────────
-  if (isWeather && playwrightWeather) {
-    try {
-      console.log(`[search] Weather → AccuWeather: "${query}"`);
-      const r = await playwrightWeather(query);
-      if (r && r.length > 60) { console.log('[search] AccuWeather OK'); return r; }
-      console.warn('[search] AccuWeather empty — falling through');
-    } catch (e) { console.warn('[search] AccuWeather error:', e.message); }
-  }
-
-  // ── 1. Sports scores → getLiveScore (Cricbuzz → ESPN, real score patterns only) ──
-  if (isSports && playwrightLiveScore) {
-    try {
-      console.log(`[search] Sports → getLiveScore (Cricbuzz): "${query}"`);
-      const score = await playwrightLiveScore(query);
-      if (score && hasActualScoreData(score)) {
-        console.log('[search] getLiveScore OK — real score data found');
-        return score;
-      }
-      console.warn('[search] getLiveScore: no real score pattern — returning empty');
-    } catch (e) { console.warn('[search] getLiveScore error:', e.message); }
-    // Sports score with no real data → honest empty reply, skip Serper snippets
-    return '';
-  }
-
-  // ── 2. Gemini grounding (ONLY for realtime queries, with cache + cooldown) ──
-  //    Gemini is rate-limited; never call it for casual chat or coding questions.
-  const geminiKey = (config.geminiKey || process.env.GEMINI_API_KEY || '').trim();
+  // ── 1. Gemini grounding — only for realtime queries, never casual chat ────
   if (geminiGroundedSearch && geminiKey && isRealtimeQuery(query)) {
+    const type = isSports ? 'sports' : isWeather ? 'weather' : 'general';
     try {
-      console.log(`[search] Gemini grounding (realtime): "${query}"`);
-      const result = await geminiGroundedSearch(query, geminiKey);
+      console.log(`[search] Gemini grounding (type=${type}): "${query.slice(0, 70)}"`);
+      const result = await geminiGroundedSearch(query, geminiKey, type);
       if (result && result.trim().length > 30) {
+        // For sports: verify actual score pattern exists so we don't pass a "no match" summary
+        if (isSports && !hasActualScoreData(result)) {
+          // Gemini said no live match — still return it so Donna can relay that honestly
+          if (result.toLowerCase().includes('no live') || result.toLowerCase().includes('no match') || result.toLowerCase().includes('not live')) {
+            console.log('[search] Gemini: no live match right now — returning as-is');
+            return result;
+          }
+          console.warn('[search] Gemini sports result has no score pattern — returning as-is for AI to assess');
+        }
         console.log(`[search] Gemini grounding OK — ${result.length} chars`);
         return result;
       }
-      console.warn('[search] Gemini grounding empty — falling through to Serper');
-    } catch (e) { console.warn('[search] Gemini grounding error:', e.message); }
+      console.warn('[search] Gemini returned nothing — falling through to Serper');
+    } catch (e) {
+      console.warn('[search] Gemini grounding error:', e.message);
+    }
   } else if (!isRealtimeQuery(query)) {
-    console.log(`[search] Skipping Gemini — not a realtime query: "${query.slice(0, 50)}"`);
+    console.log(`[search] Not realtime — skipping Gemini: "${query.slice(0, 50)}"`);
   }
 
-  // ── 3. Serper — API-based Google search (general fallback) ────────────────
+  // ── 2. Serper — API-based Google search ───────────────────────────────────
   if (serperSearch && (config.serperKey || process.env.SERPER_API_KEY)) {
     try {
       const result = await serperSearch(query, config);
@@ -1210,10 +1198,9 @@ async function performWebSearch(query, config, deep = false) {
     } catch (e) { console.warn('[search] Serper error:', e.message); }
   }
 
-  // ── 4. Tavily — last resort ───────────────────────────────────────────────
+  // ── 3. Tavily — last resort ────────────────────────────────────────────────
   if (config.searchApiKey) {
     try {
-      console.log('[search] Tavily last resort');
       const response = await fetch('https://api.tavily.com/search', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
