@@ -14,6 +14,7 @@ import sharp from "sharp";
 import fs from "fs-extra";
 import yts from "yt-search";
 import youtubedl from "youtube-dl-exec";
+import { analyzeTelegramImageWithGemini, buildVisionPrompt } from "./services/vision.js";
 // Image service — loaded dynamically so a missing/broken module never crashes the bot
 let ziGenerateImage = null;
 try {
@@ -3054,8 +3055,11 @@ async function startServer() {
       return;
     }
     const text = (message.message || "").trim();
-    if (!text) return;
-    if (text.startsWith("/") || text.startsWith(".")) return;
+    const hasPhoto = !!message.media?.photo;
+    const hasImageDoc = !!(message.media?.document?.mimeType || "").startsWith("image/");
+    const hasImage = hasPhoto || hasImageDoc;
+    if (!text && !hasImage) return;
+    if (text && (text.startsWith("/") || text.startsWith("."))) return;
     const senderId = message.senderId?.toString();
     const chatIdStr = message.chatId?.toString();
     const isPrivate = message.isPrivate;
@@ -3217,16 +3221,48 @@ async function startServer() {
           }
         }
         // Show smarter status: search-aware message if live data is needed
-        const searchStatus = (config.searchEnabled === 1 && needsSearch)
+        const searchStatus = (config.searchEnabled === 1 && needsSearch && text)
           ? needsSearch(text).needs
           : false;
         await status.update(searchStatus ? HS.search() : HS.think());
+        let visionSourceMessage = message;
+        let hasVisionImage = hasImage;
+        if (!hasVisionImage && message.replyTo?.replyToMsgId) {
+          try {
+            const target = message.inputChat || message.chatId;
+            const replied = await client2.getMessages(target, { ids: [message.replyTo.replyToMsgId] });
+            const rmsg = replied?.[0];
+            const rHasPhoto = !!rmsg?.media?.photo;
+            const rHasImageDoc = !!(rmsg?.media?.document?.mimeType || "").startsWith("image/");
+            if (rHasPhoto || rHasImageDoc) {
+              visionSourceMessage = rmsg;
+              hasVisionImage = true;
+              console.log("[vision] image detected from replied message");
+            }
+          } catch (e) {
+            console.warn("[vision] failed to inspect replied media:", e.message || e);
+          }
+        }
         // Retry up to 3 times silently — never show an error to the user mid-retry
         let aiRes = null;
         for (let attempt = 1; attempt <= 3; attempt++) {
           try {
+            let promptForDeepSeek = text;
+            if (hasVisionImage) {
+              try {
+                const geminiKey = (config.geminiKey || process.env.GEMINI_API_KEY || "").trim();
+                const vision = await analyzeTelegramImageWithGemini(client2, visionSourceMessage, geminiKey);
+                if (!vision) throw new Error("VISION_TEMPORARILY_BUSY");
+                console.log("[vision] DeepSeek formatting started");
+                promptForDeepSeek = buildVisionPrompt(text, vision);
+              } catch (visionErr) {
+                console.warn("[vision] Gemini Vision failure:", visionErr.message || visionErr);
+                await status.finish("I couldn't analyze the image right now — the vision service is temporarily busy. Try again in a moment.");
+                return;
+              }
+            }
             aiRes = await getAIResponse(
-              text,
+              promptForDeepSeek,
               config,
               chatIdStr,
               senderId,
