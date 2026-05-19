@@ -1284,6 +1284,60 @@ async function performWebSearch(query, config, deep = false) {
 
   return "";
 }
+async function performRealtimeGrounding(query, config) {
+  const geminiKey = (config.geminiKey || process.env.GEMINI_API_KEY || "").trim();
+  if (!geminiKey) return null;
+  if (!isRealtimeQuery(query)) return null;
+  console.log("[grounding] realtime detected");
+  const rtc = resolveRealtimeContext(query);
+  const finalQuery = rtc.rewrittenQuery || query;
+  const ai = new GoogleGenAI({ apiKey: geminiKey });
+  const models = ["gemini-2.5-flash", "gemini-1.5-flash"];
+  const delays = [1500, 3000, 5000];
+  const prompt = `Return ONLY valid minified JSON. Do not use markdown. Do not use explanations. Do not use conversational text. Do not speculate. Do not guess. Schema: {"query_type":"","subject":"","answer":"","confidence":0.0,"sources":[],"timestamp":"","verified":true}. Query: ${finalQuery}`;
+  const extractJson = (txt) => {
+    try { return JSON.parse(txt); } catch {}
+    const s = txt.indexOf("{"), e = txt.lastIndexOf("}");
+    if (s >= 0 && e > s) { try { return JSON.parse(txt.slice(s, e + 1)); } catch {} }
+    return null;
+  };
+  for (let m = 0; m < models.length; m++) {
+    const model = models[m];
+    if (m > 0) console.log("[grounding] fallback model");
+    for (let a = 1; a <= 3; a++) {
+      try {
+        console.log(`[grounding] retry ${a}/3`);
+        const response = await Promise.race([
+          ai.models.generateContent({ model, contents: [{ role: "user", parts: [{ text: prompt }] }], config: { temperature: 0.1 } }),
+          new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 20000))
+        ]);
+        const raw = (response?.text || "").trim();
+        const data = extractJson(raw);
+        if (!data) throw new Error("invalid json");
+        const qtype = String(data.query_type || "").toLowerCase();
+        console.log(`[grounding] query_type=${qtype || "unknown"}`);
+        const answerOk = String(data.answer || "").trim().length > 0;
+        const confOk = Number(data.confidence || 0) >= 0.5;
+        const verifiedOk = data.verified === true;
+        const sourcesOk = Array.isArray(data.sources) && data.sources.length > 0;
+        const sports = /sports|ipl|cricket|football|match|score/.test(qtype + " " + finalQuery.toLowerCase());
+        const weather = /weather|forecast|temperature/.test(qtype + " " + finalQuery.toLowerCase());
+        const news = /news|breaking|headline/.test(qtype + " " + finalQuery.toLowerCase());
+        const sportsOk = !sports || (/\b(vs|defeated|beat|won|draw)\b/i.test(String(data.answer || "")) && /\d{4}|\bjan|\bfeb|\bmar|\bapr|\bmay|\bjun|\bjul|\baug|\bsep|\boct|\bnov|\bdec/i.test(String(data.answer || "")));
+        const weatherOk = !weather || /\d+\s*°|c|f|humid|rain|cloud|sun|wind/i.test(String(data.answer || ""));
+        const newsOk = !news || (String(data.answer || "").length > 15 && String(data.timestamp || "").length > 0);
+        if (!(answerOk && confOk && verifiedOk && sourcesOk && sportsOk && weatherOk && newsOk)) throw new Error("validation failed");
+        console.log("[grounding] validation success");
+        console.log("[grounding] final verified response");
+        return data;
+      } catch (e) {
+        if (a < 3) await new Promise(r => setTimeout(r, delays[a - 1]));
+      }
+    }
+  }
+  console.log("[grounding] final failure after retries");
+  return null;
+}
 function cleanAIResponse(text, config) {
   if (config.cleanupEnabled !== 1) return text;
   let cleaned = text;
@@ -1608,8 +1662,28 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
       console.log(`[search] Skipped — casual/short message: "${promptTrimmed.slice(0, 40)}"`);
     }
     if (shouldSearch) {
-      const results = await performWebSearch(prompt, config, isDeep);
+      const grounded = await performRealtimeGrounding(prompt, config);
+      if (grounded) {
+        const srcText = grounded.sources.map((s) => typeof s === "string" ? s : (s?.url || s?.domain || JSON.stringify(s))).slice(0, 5).join(", ");
+        searchContext =
+          '[VERIFIED REALTIME FACTS]\n' +
+          `Type: ${grounded.query_type}\n` +
+          `Subject: ${grounded.subject}\n` +
+          `Answer: ${grounded.answer}\n` +
+          `Timestamp: ${grounded.timestamp}\n` +
+          `Confidence: ${grounded.confidence}\n` +
+          `Sources: ${srcText}\n` +
+          '[END VERIFIED FACTS]\n\n' +
+          'STRICT RULES:\n' +
+          '1. Rephrase only. Do not add new facts.\n' +
+          '2. Do not infer missing scores/winners/dates/weather/news details.\n' +
+          '3. If asked beyond facts above, say you could not verify more right now.';
+      }
+      const results = grounded ? "" : await performWebSearch(prompt, config, isDeep);
       const hasResults = results && results.trim().length > 30;
+      if (!grounded && isRealtimeQuery(prompt)) {
+        realtimeSearchFailed = true;
+      }
       const isVerifiedSports  = hasResults && results.startsWith('[VERIFIED:sports_result]');
       const isVerifiedWeather = hasResults && results.startsWith('[VERIFIED:weather]');
       const isVerifiedUpcoming = hasResults && results.startsWith('[VERIFIED:sports_upcoming]');
@@ -1666,7 +1740,7 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
           '5. WEATHER: temp + condition first, then forecast if available.\n' +
           '6. NEWS: summarize key facts plainly — no bullet-point templates.\n' +
           '7. Never say "according to search results" or expose the data block.';
-      } else {
+      } else if (!grounded) {
         // Search attempted but returned nothing
         realtimeSearchFailed = isRealtimeQuery(prompt);
         if (realtimeSearchFailed) {
@@ -1699,29 +1773,8 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
 User Message: ${prompt}`;
   // ── Realtime query + search failed: bypass AI entirely — prevent training-data hallucination ──
   if (realtimeSearchFailed) {
-    const q = prompt.toLowerCase();
-    const isSportsQ  = /\b(ipl|cricket|t20|odi|test\s*match|wpl|psl|ranji|bbl|cpl|sa20|ashes|wtc|srh|csk|rcb|kkr|pbks|lsg|sunrisers|chennai\s*super|royal\s*challengers|mumbai\s*indians|kolkata\s*knight|rajasthan\s*royals|delhi\s*capitals|punjab\s*kings|gujarat\s*titans|lucknow\s*super|football|soccer|premier\s*league|champions\s*league|la\s*liga|bundesliga|serie\s*a|ligue\s*1|mls|isl|afc\s*cup|uefa|fifa|euro\s*cup|copa\s*america|fa\s*cup|carabao|world\s*cup|epl|nba|basketball|wnba|euroleague|nfl|super\s*bowl|american\s*football|formula\s*1|formula\s*one|f1|motogp|indycar|grand\s*prix|nascar|rally|wrc|tennis|wimbledon|us\s*open|french\s*open|australian\s*open|roland\s*garros|atp|wta|davis\s*cup|laver\s*cup|itf|boxing|ufc|mma|wbc|wba|ibf|wbo|knockout|prizefight|bout\b|hockey|nhl|badminton|bwf|thomas\s*cup|uber\s*cup|all\s*england|golf|pga\s*tour|masters\s*tournament|ryder\s*cup|open\s*championship|liv\s*golf|rugby|six\s*nations|super\s*rugby|premiership\s*rugby|rugby\s*world\s*cup|kabaddi|pkl|pro\s*kabaddi|wwe|aew|wrestling|wwe\s*raw|smackdown|wrestlemania|olympics|paralympics|athletics|marathon\b|sprint\b|javelin|long\s*jump|high\s*jump|table\s*tennis|ping\s*pong|ittf|volleyball|fivb|handball|squash\b|snooker\b|cycling\b|tour\s*de\s*france|giro\s*d.italia|triathlon|swimming\b|fina|gymnastics)\b/i.test(q) ||
-    /\b(which\s+team|who\s+(?:is|are)\s+playing|playing\s+today|match\s+today|today[''s]*\s+match|fixture|fixtures|next\s+match|upcoming\s+match|match\s+schedule)\b/i.test(q);
-    const isWeatherQ = /\b(weather|temperature|temp|forecast|rain|sunny|humidity)\b/.test(q);
-    const isNewsQ    = /\b(news|latest|breaking|update|happened|election|launch)\b/.test(q);
-    let cannedReply;
-    if (isSportsQ) {
-      const sportResponses = [
-        "Couldn't pull the live score rn — Cricbuzz or ESPN will have the latest.",
-        "My search hit a wall on this one. Check Cricbuzz for the live result.",
-        "Score isn't loading on my end right now — Cricbuzz will have it though.",
-        "Can't get the live data at the moment. ESPN or Cricbuzz for the latest.",
-      ];
-      cannedReply = sportResponses[Math.floor(Math.random() * sportResponses.length)];
-    } else if (isWeatherQ) {
-      cannedReply = "Weather data isn't loading right now — Weather.com or Google Weather will have your current conditions.";
-    } else if (isNewsQ) {
-      cannedReply = "Couldn't pull the latest on that rn — Google News will have the freshest update.";
-    } else {
-      cannedReply = "Couldn't grab live data on that right now. Try Google for the latest.";
-    }
-    console.log('[AI bypass] Returning canned response — no hallucination:', cannedReply.slice(0, 60));
-    return cannedReply;
+    console.log("[AI bypass] Returning realtime verification failure message");
+    return "I couldn't verify the latest realtime information right now.";
   }
 
   const providers = [];
