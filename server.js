@@ -1157,7 +1157,7 @@ async function performWebSearch(query, config, deep = false) {
   const geminiKey = (config.geminiKey || process.env.GEMINI_API_KEY || '').trim();
 
   // Detect query type for targeted Gemini prompts
-  const isSports  = /\b(?:live\s+)?(?:ipl|cricket|football|soccer|nba|nfl|f1|kabaddi|wpl|psl|ranji)\s*(?:score[s]?|result[s]?|match|live|update[s]?|standing[s]?)\b|\bipl\s+score|\bcricket\s+score|\blive\s+score[s]?\b/i.test(query);
+  const isSports  = /\b(ipl|cricket|football|soccer|nba|nfl|f1|kabaddi|wpl|psl|ranji|premier\s*league|champions\s*league|la\s*liga|bundesliga|serie\s*a|srh|csk|rcb|mi\b|kkr|rr\b|dc\b|pbks|gt\b|lsg|sunrisers|chennai\s*super|royal\s*challengers|mumbai\s*indians|kolkata|rajasthan\s*royals|delhi\s*capitals|punjab|gujarat\s*titans|lucknow)\b/i.test(query);
   const isWeather = /\bweather\b|\btemperature\b|\btemp\b|\bforecast\b/i.test(query);
 
   // ── 1. Gemini grounding — only for realtime queries, never casual chat ────
