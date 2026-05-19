@@ -14,6 +14,8 @@ import sharp from "sharp";
 import fs from "fs-extra";
 import yts from "yt-search";
 import youtubedl from "youtube-dl-exec";
+import { analyzeTelegramImageWithGemini, buildVisionPrompt } from "./services/vision.js";
+import { getAccuWeather } from "./services/weather.js";
 // Image service — loaded dynamically so a missing/broken module never crashes the bot
 let ziGenerateImage = null;
 try {
@@ -1153,20 +1155,87 @@ function isRealtimeQuery(query) {
   return /\b(live|today|tonight|right now|this week|current|latest|breaking|just now|happening|trending|score[s]?|result[s]?|match|winner|champion|ipl|cricket|t20|odi|football|soccer|nba|nfl|f1|grand\s*prix|motogp|tennis|wimbledon|us\s*open|french\s*open|australian\s*open|atp|wta|boxing|ufc|mma|knockout|hockey|nhl|badminton|bwf|golf|pga|masters|rugby|six\s*nations|kabaddi|pkl|wwe|olympics|athletics|prix|price[s]?|crypto|bitcoin|btc|eth|stock|nifty|sensex|share\s*price|weather|temp(erature)?|forecast|news|election|who\s*won|what\s*happened|did\s*.{0,20}\s*win|update[s]?)\b/i.test(q);
 }
 
+function getKolkataNowParts() {
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  });
+  const parts = fmt.formatToParts(new Date());
+  return {
+    y: Number(parts.find((p) => p.type === "year")?.value || 0),
+    m: Number(parts.find((p) => p.type === "month")?.value || 1),
+    d: Number(parts.find((p) => p.type === "day")?.value || 1)
+  };
+}
+function addDaysYmd(y, m, d, deltaDays) {
+  const dt = new Date(Date.UTC(y, m - 1, d + deltaDays));
+  return { y: dt.getUTCFullYear(), m: dt.getUTCMonth() + 1, d: dt.getUTCDate() };
+}
+function formatYmd(obj) {
+  return `${obj.y}-${String(obj.m).padStart(2, "0")}-${String(obj.d).padStart(2, "0")}`;
+}
+function formatLongDate(obj) {
+  const dt = new Date(Date.UTC(obj.y, obj.m - 1, obj.d));
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone: "UTC",
+    day: "2-digit",
+    month: "long",
+    year: "numeric"
+  }).format(dt);
+}
+function resolveRealtimeContext(query) {
+  const q = (query || "").toLowerCase();
+  const base = getKolkataNowParts();
+  const detected = [];
+  let resolved = null;
+  if (/\byesterday\b|\blast night\b/.test(q)) {
+    detected.push("yesterday");
+    resolved = addDaysYmd(base.y, base.m, base.d, -1);
+  } else if (/\btomorrow\b|\btonight\b/.test(q)) {
+    detected.push("tomorrow");
+    resolved = addDaysYmd(base.y, base.m, base.d, 1);
+  } else if (/\btoday\b|\bnow\b|\bcurrently\b|\bcurrent\b|\blatest\b|\bthis morning\b|\brecent\b/.test(q)) {
+    detected.push("today");
+    resolved = base;
+  }
+  if (/\bthis week\b/.test(q)) detected.push("this week");
+  if (detected.length === 0) return { rewrittenQuery: query, resolvedDate: null, detected };
+  const ref = resolved || base;
+  const longDate = formatLongDate(ref);
+  let rewritten = query
+    .replace(/\byesterday\b|\blast night\b/ig, `on ${longDate}`)
+    .replace(/\btoday\b|\bthis morning\b/ig, `on ${longDate}`)
+    .replace(/\btomorrow\b|\btonight\b/ig, `on ${longDate}`)
+    .replace(/\bnow\b|\bcurrently\b|\bcurrent\b|\blatest\b|\brecent\b/ig, `as of ${longDate}`);
+  if (/\b(ipl|cricket|match|score|news|weather|stock|price|live)\b/i.test(rewritten)) {
+    rewritten += ` [timezone: Asia/Kolkata] [reference_date: ${longDate} (${formatYmd(ref)})] [year: ${base.y}]`;
+  }
+  return { rewrittenQuery: rewritten, resolvedDate: formatYmd(ref), detected };
+}
+
 async function performWebSearch(query, config, deep = false) {
+  const rtc = resolveRealtimeContext(query);
+  const searchQuery = rtc.rewrittenQuery || query;
+  if (rtc.detected.length > 0) {
+    console.log(`[time] detected: ${rtc.detected.join(", ")}`);
+    if (rtc.resolvedDate) console.log(`[time] resolved date: ${rtc.resolvedDate}`);
+    console.log(`[time] rewritten query: "${searchQuery.slice(0, 140)}"`);
+  }
   const geminiKey = (config.geminiKey || process.env.GEMINI_API_KEY || '').trim();
 
   // Detect query type for targeted Gemini prompts
-  const isSports  = /\b(ipl|cricket|t20|odi|test\s*match|wpl|psl|ranji|bbl|cpl|sa20|ashes|wtc|srh|csk|rcb|kkr|pbks|lsg|sunrisers|chennai\s*super|royal\s*challengers|mumbai\s*indians|kolkata\s*knight|rajasthan\s*royals|delhi\s*capitals|punjab\s*kings|gujarat\s*titans|lucknow\s*super|football|soccer|premier\s*league|champions\s*league|la\s*liga|bundesliga|serie\s*a|ligue\s*1|mls|isl|afc\s*cup|uefa|fifa|euro\s*cup|copa\s*america|fa\s*cup|carabao|world\s*cup|epl|nba|basketball|wnba|euroleague|nfl|super\s*bowl|american\s*football|formula\s*1|formula\s*one|f1|motogp|indycar|grand\s*prix|nascar|rally|wrc|tennis|wimbledon|us\s*open|french\s*open|australian\s*open|roland\s*garros|atp|wta|davis\s*cup|laver\s*cup|itf|boxing|ufc|mma|wbc|wba|ibf|wbo|knockout|prizefight|bout\b|hockey|nhl|badminton|bwf|thomas\s*cup|uber\s*cup|all\s*england|golf|pga\s*tour|masters\s*tournament|ryder\s*cup|open\s*championship|liv\s*golf|rugby|six\s*nations|super\s*rugby|premiership\s*rugby|rugby\s*world\s*cup|kabaddi|pkl|pro\s*kabaddi|wwe|aew|wrestling|wwe\s*raw|smackdown|wrestlemania|olympics|paralympics|athletics|marathon\b|sprint\b|javelin|long\s*jump|high\s*jump|table\s*tennis|ping\s*pong|ittf|volleyball|fivb|handball|squash\b|snooker\b|cycling\b|tour\s*de\s*france|giro\s*d.italia|triathlon|swimming\b|fina|gymnastics)\b/i.test(query) ||
+  const isSports  = /\b(ipl|cricket|t20|odi|test\s*match|wpl|psl|ranji|bbl|cpl|sa20|ashes|wtc|srh|csk|rcb|kkr|pbks|lsg|sunrisers|chennai\s*super|royal\s*challengers|mumbai\s*indians|kolkata\s*knight|rajasthan\s*royals|delhi\s*capitals|punjab\s*kings|gujarat\s*titans|lucknow\s*super|football|soccer|premier\s*league|champions\s*league|la\s*liga|bundesliga|serie\s*a|ligue\s*1|mls|isl|afc\s*cup|uefa|fifa|euro\s*cup|copa\s*america|fa\s*cup|carabao|world\s*cup|epl|nba|basketball|wnba|euroleague|nfl|super\s*bowl|american\s*football|formula\s*1|formula\s*one|f1|motogp|indycar|grand\s*prix|nascar|rally|wrc|tennis|wimbledon|us\s*open|french\s*open|australian\s*open|roland\s*garros|atp|wta|davis\s*cup|laver\s*cup|itf|boxing|ufc|mma|wbc|wba|ibf|wbo|knockout|prizefight|bout\b|hockey|nhl|badminton|bwf|thomas\s*cup|uber\s*cup|all\s*england|golf|pga\s*tour|masters\s*tournament|ryder\s*cup|open\s*championship|liv\s*golf|rugby|six\s*nations|super\s*rugby|premiership\s*rugby|rugby\s*world\s*cup|kabaddi|pkl|pro\s*kabaddi|wwe|aew|wrestling|wwe\s*raw|smackdown|wrestlemania|olympics|paralympics|athletics|marathon\b|sprint\b|javelin|long\s*jump|high\s*jump|table\s*tennis|ping\s*pong|ittf|volleyball|fivb|handball|squash\b|snooker\b|cycling\b|tour\s*de\s*france|giro\s*d.italia|triathlon|swimming\b|fina|gymnastics)\b/i.test(searchQuery) ||
     /\b(which\s+team|who\s+(?:is|are)\s+playing|playing\s+today|match\s+today|today[''s]*\s+match|today[''s]*\s+game|today[''s]*\s+ipl|ipl\s+today|cricket\s+today|fixture|fixtures|next\s+match|upcoming\s+match|match\s+schedule|schedule\s+today|what.*match.*today|today.*fixture)\b/i.test(query);
-  const isWeather = /\bweather\b|\btemperature\b|\btemp\b|\bforecast\b/i.test(query);
+  const isWeather = /\bweather\b|\btemperature\b|\btemp\b|\bforecast\b/i.test(searchQuery);
 
   // ── 1. Gemini grounding — only for realtime queries, never casual chat ────
-  if (geminiGroundedSearch && geminiKey && isRealtimeQuery(query)) {
+  if (geminiGroundedSearch && geminiKey && isRealtimeQuery(searchQuery)) {
     const type = isSports ? 'sports' : isWeather ? 'weather' : 'general';
     try {
-      console.log(`[search] Gemini grounding (type=${type}): "${query.slice(0, 70)}"`);
-      const result = await geminiGroundedSearch(query, geminiKey, type);
+      console.log(`[search] Gemini grounding (type=${type}): "${searchQuery.slice(0, 70)}"`);
+      const result = await geminiGroundedSearch(searchQuery, geminiKey, type);
       if (result && result.trim().length > 30) {
         // For sports: verify actual score pattern exists so we don't pass a "no match" summary
         if (isSports && !hasActualScoreData(result)) {
@@ -1184,14 +1253,14 @@ async function performWebSearch(query, config, deep = false) {
     } catch (e) {
       console.warn('[search] Gemini grounding error:', e.message);
     }
-  } else if (!isRealtimeQuery(query)) {
-    console.log(`[search] Not realtime — skipping Gemini: "${query.slice(0, 50)}"`);
+  } else if (!isRealtimeQuery(searchQuery)) {
+    console.log(`[search] Not realtime — skipping Gemini: "${searchQuery.slice(0, 50)}"`);
   }
 
   // ── 2. Serper — API-based Google search ───────────────────────────────────
   if (serperSearch && (config.serperKey || process.env.SERPER_API_KEY)) {
     try {
-      const result = await serperSearch(query, config);
+      const result = await serperSearch(searchQuery, config);
       if (result?.summary) {
         console.log(`[search] Serper OK — intent=${result.intent}`);
         return result.summary;
@@ -1205,7 +1274,7 @@ async function performWebSearch(query, config, deep = false) {
       const response = await fetch('https://api.tavily.com/search', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ api_key: config.searchApiKey, query, search_depth: deep ? 'advanced' : 'basic', max_results: deep ? 6 : 3 }),
+        body: JSON.stringify({ api_key: config.searchApiKey, query: searchQuery, search_depth: deep ? 'advanced' : 'basic', max_results: deep ? 6 : 3 }),
       });
       if (response.ok) {
         const data = await response.json();
@@ -1215,6 +1284,87 @@ async function performWebSearch(query, config, deep = false) {
   }
 
   return "";
+}
+async function performRealtimeGrounding(query, config) {
+  const geminiKey = (config.geminiKey || process.env.GEMINI_API_KEY || "").trim();
+  if (!geminiKey) return null;
+  if (!isRealtimeQuery(query)) return null;
+  console.log("[grounding] realtime detected");
+  const rtc = resolveRealtimeContext(query);
+  const finalQuery = rtc.rewrittenQuery || query;
+  const isWeatherQuery = /\b(weather|temperature|temp|hot|cold|rain|humidity|forecast|windy|climate|today'?s weather|tomorrow weather)\b/i.test(finalQuery);
+  if (isWeatherQuery) {
+    console.log("[weather] detected query");
+    const weather = await performWeatherGrounding(finalQuery, config, geminiKey);
+    if (weather) {
+      return {
+        query_type: "weather",
+        subject: weather.location,
+        answer: `${weather.location}: ${weather.temperature_c}°C, ${weather.condition}. Feels like ${weather.feels_like_c}°C, humidity ${weather.humidity}%, wind ${weather.wind_kph} kph. Forecast: ${weather.forecast}.`,
+        confidence: 0.9,
+        sources: [weather.source],
+        timestamp: weather.timestamp,
+        verified: true
+      };
+    }
+    return null;
+  }
+  const ai = new GoogleGenAI({ apiKey: geminiKey });
+  const models = ["gemini-2.5-flash", "gemini-1.5-flash"];
+  const delays = [1500, 3000, 5000];
+  const prompt = `Return ONLY valid minified JSON. Do not use markdown. Do not use explanations. Do not use conversational text. Do not speculate. Do not guess. Schema: {"query_type":"","subject":"","answer":"","confidence":0.0,"sources":[],"timestamp":"","verified":true}. Query: ${finalQuery}`;
+  const extractJson = (txt) => {
+    try { return JSON.parse(txt); } catch {}
+    const s = txt.indexOf("{"), e = txt.lastIndexOf("}");
+    if (s >= 0 && e > s) { try { return JSON.parse(txt.slice(s, e + 1)); } catch {} }
+    return null;
+  };
+  for (let m = 0; m < models.length; m++) {
+    const model = models[m];
+    if (m > 0) console.log("[grounding] fallback model");
+    for (let a = 1; a <= 3; a++) {
+      try {
+        console.log(`[grounding] retry ${a}/3`);
+        const response = await Promise.race([
+          ai.models.generateContent({ model, contents: [{ role: "user", parts: [{ text: prompt }] }], config: { temperature: 0.1 } }),
+          new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 20000))
+        ]);
+        const raw = (response?.text || "").trim();
+        const data = extractJson(raw);
+        if (!data) throw new Error("invalid json");
+        const qtype = String(data.query_type || "").toLowerCase();
+        console.log(`[grounding] query_type=${qtype || "unknown"}`);
+        const answerOk = String(data.answer || "").trim().length > 0;
+        const confOk = Number(data.confidence || 0) >= 0.5;
+        const verifiedOk = data.verified === true;
+        const sourcesOk = Array.isArray(data.sources) && data.sources.length > 0;
+        const sports = /sports|ipl|cricket|football|match|score/.test(qtype + " " + finalQuery.toLowerCase());
+        const weather = /weather|forecast|temperature/.test(qtype + " " + finalQuery.toLowerCase());
+        const news = /news|breaking|headline/.test(qtype + " " + finalQuery.toLowerCase());
+        const sportsOk = !sports || (/\b(vs|defeated|beat|won|draw)\b/i.test(String(data.answer || "")) && /\d{4}|\bjan|\bfeb|\bmar|\bapr|\bmay|\bjun|\bjul|\baug|\bsep|\boct|\bnov|\bdec/i.test(String(data.answer || "")));
+        const weatherOk = !weather || /\d+\s*°|c|f|humid|rain|cloud|sun|wind/i.test(String(data.answer || ""));
+        const newsOk = !news || (String(data.answer || "").length > 15 && String(data.timestamp || "").length > 0);
+        if (!(answerOk && confOk && verifiedOk && sourcesOk && sportsOk && weatherOk && newsOk)) throw new Error("validation failed");
+        console.log("[grounding] validation success");
+        console.log("[grounding] final verified response");
+        return data;
+      } catch (e) {
+        if (a < 3) await new Promise(r => setTimeout(r, delays[a - 1]));
+      }
+    }
+  }
+  console.log("[grounding] final failure after retries");
+  return null;
+}
+async function performWeatherGrounding(query, config, geminiKey) {
+  try {
+    console.log("[weather] provider=accuweather");
+    const apiKey = (process.env.ACCUWEATHER_API_KEY || "").trim();
+    const weather = await getAccuWeather(query, apiKey);
+    console.log("[weather] final verified response");
+    return weather;
+  } catch (e) {}
+  return null;
 }
 function cleanAIResponse(text, config) {
   if (config.cleanupEnabled !== 1) return text;
@@ -1540,8 +1690,28 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
       console.log(`[search] Skipped — casual/short message: "${promptTrimmed.slice(0, 40)}"`);
     }
     if (shouldSearch) {
-      const results = await performWebSearch(prompt, config, isDeep);
+      const grounded = await performRealtimeGrounding(prompt, config);
+      if (grounded) {
+        const srcText = grounded.sources.map((s) => typeof s === "string" ? s : (s?.url || s?.domain || JSON.stringify(s))).slice(0, 5).join(", ");
+        searchContext =
+          '[VERIFIED REALTIME FACTS]\n' +
+          `Type: ${grounded.query_type}\n` +
+          `Subject: ${grounded.subject}\n` +
+          `Answer: ${grounded.answer}\n` +
+          `Timestamp: ${grounded.timestamp}\n` +
+          `Confidence: ${grounded.confidence}\n` +
+          `Sources: ${srcText}\n` +
+          '[END VERIFIED FACTS]\n\n' +
+          'STRICT RULES:\n' +
+          '1. Rephrase only. Do not add new facts.\n' +
+          '2. Do not infer missing scores/winners/dates/weather/news details.\n' +
+          '3. If asked beyond facts above, say you could not verify more right now.';
+      }
+      const results = grounded ? "" : await performWebSearch(prompt, config, isDeep);
       const hasResults = results && results.trim().length > 30;
+      if (!grounded && isRealtimeQuery(prompt)) {
+        realtimeSearchFailed = true;
+      }
       const isVerifiedSports  = hasResults && results.startsWith('[VERIFIED:sports_result]');
       const isVerifiedWeather = hasResults && results.startsWith('[VERIFIED:weather]');
       const isVerifiedUpcoming = hasResults && results.startsWith('[VERIFIED:sports_upcoming]');
@@ -1598,7 +1768,7 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
           '5. WEATHER: temp + condition first, then forecast if available.\n' +
           '6. NEWS: summarize key facts plainly — no bullet-point templates.\n' +
           '7. Never say "according to search results" or expose the data block.';
-      } else {
+      } else if (!grounded) {
         // Search attempted but returned nothing
         realtimeSearchFailed = isRealtimeQuery(prompt);
         if (realtimeSearchFailed) {
@@ -1631,29 +1801,11 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
 User Message: ${prompt}`;
   // ── Realtime query + search failed: bypass AI entirely — prevent training-data hallucination ──
   if (realtimeSearchFailed) {
-    const q = prompt.toLowerCase();
-    const isSportsQ  = /\b(ipl|cricket|t20|odi|test\s*match|wpl|psl|ranji|bbl|cpl|sa20|ashes|wtc|srh|csk|rcb|kkr|pbks|lsg|sunrisers|chennai\s*super|royal\s*challengers|mumbai\s*indians|kolkata\s*knight|rajasthan\s*royals|delhi\s*capitals|punjab\s*kings|gujarat\s*titans|lucknow\s*super|football|soccer|premier\s*league|champions\s*league|la\s*liga|bundesliga|serie\s*a|ligue\s*1|mls|isl|afc\s*cup|uefa|fifa|euro\s*cup|copa\s*america|fa\s*cup|carabao|world\s*cup|epl|nba|basketball|wnba|euroleague|nfl|super\s*bowl|american\s*football|formula\s*1|formula\s*one|f1|motogp|indycar|grand\s*prix|nascar|rally|wrc|tennis|wimbledon|us\s*open|french\s*open|australian\s*open|roland\s*garros|atp|wta|davis\s*cup|laver\s*cup|itf|boxing|ufc|mma|wbc|wba|ibf|wbo|knockout|prizefight|bout\b|hockey|nhl|badminton|bwf|thomas\s*cup|uber\s*cup|all\s*england|golf|pga\s*tour|masters\s*tournament|ryder\s*cup|open\s*championship|liv\s*golf|rugby|six\s*nations|super\s*rugby|premiership\s*rugby|rugby\s*world\s*cup|kabaddi|pkl|pro\s*kabaddi|wwe|aew|wrestling|wwe\s*raw|smackdown|wrestlemania|olympics|paralympics|athletics|marathon\b|sprint\b|javelin|long\s*jump|high\s*jump|table\s*tennis|ping\s*pong|ittf|volleyball|fivb|handball|squash\b|snooker\b|cycling\b|tour\s*de\s*france|giro\s*d.italia|triathlon|swimming\b|fina|gymnastics)\b/i.test(q) ||
-    /\b(which\s+team|who\s+(?:is|are)\s+playing|playing\s+today|match\s+today|today[''s]*\s+match|fixture|fixtures|next\s+match|upcoming\s+match|match\s+schedule)\b/i.test(q);
-    const isWeatherQ = /\b(weather|temperature|temp|forecast|rain|sunny|humidity)\b/.test(q);
-    const isNewsQ    = /\b(news|latest|breaking|update|happened|election|launch)\b/.test(q);
-    let cannedReply;
-    if (isSportsQ) {
-      const sportResponses = [
-        "Couldn't pull the live score rn — Cricbuzz or ESPN will have the latest.",
-        "My search hit a wall on this one. Check Cricbuzz for the live result.",
-        "Score isn't loading on my end right now — Cricbuzz will have it though.",
-        "Can't get the live data at the moment. ESPN or Cricbuzz for the latest.",
-      ];
-      cannedReply = sportResponses[Math.floor(Math.random() * sportResponses.length)];
-    } else if (isWeatherQ) {
-      cannedReply = "Weather data isn't loading right now — Weather.com or Google Weather will have your current conditions.";
-    } else if (isNewsQ) {
-      cannedReply = "Couldn't pull the latest on that rn — Google News will have the freshest update.";
-    } else {
-      cannedReply = "Couldn't grab live data on that right now. Try Google for the latest.";
+    console.log("[AI bypass] Returning realtime verification failure message");
+    if (/\b(weather|temperature|temp|hot|cold|rain|humidity|forecast|windy|climate)\b/i.test(prompt)) {
+      return "I couldn't verify the current weather right now.";
     }
-    console.log('[AI bypass] Returning canned response — no hallucination:', cannedReply.slice(0, 60));
-    return cannedReply;
+    return "I couldn't verify the latest realtime information right now.";
   }
 
   const providers = [];
@@ -3054,8 +3206,11 @@ async function startServer() {
       return;
     }
     const text = (message.message || "").trim();
-    if (!text) return;
-    if (text.startsWith("/") || text.startsWith(".")) return;
+    const hasPhoto = !!message.media?.photo;
+    const hasImageDoc = !!(message.media?.document?.mimeType || "").startsWith("image/");
+    const hasImage = hasPhoto || hasImageDoc;
+    if (!text && !hasImage) return;
+    if (text && (text.startsWith("/") || text.startsWith("."))) return;
     const senderId = message.senderId?.toString();
     const chatIdStr = message.chatId?.toString();
     const isPrivate = message.isPrivate;
@@ -3217,16 +3372,48 @@ async function startServer() {
           }
         }
         // Show smarter status: search-aware message if live data is needed
-        const searchStatus = (config.searchEnabled === 1 && needsSearch)
+        const searchStatus = (config.searchEnabled === 1 && needsSearch && text)
           ? needsSearch(text).needs
           : false;
         await status.update(searchStatus ? HS.search() : HS.think());
+        let visionSourceMessage = message;
+        let hasVisionImage = hasImage;
+        if (!hasVisionImage && message.replyTo?.replyToMsgId) {
+          try {
+            const target = message.inputChat || message.chatId;
+            const replied = await client2.getMessages(target, { ids: [message.replyTo.replyToMsgId] });
+            const rmsg = replied?.[0];
+            const rHasPhoto = !!rmsg?.media?.photo;
+            const rHasImageDoc = !!(rmsg?.media?.document?.mimeType || "").startsWith("image/");
+            if (rHasPhoto || rHasImageDoc) {
+              visionSourceMessage = rmsg;
+              hasVisionImage = true;
+              console.log("[vision] image detected from replied message");
+            }
+          } catch (e) {
+            console.warn("[vision] failed to inspect replied media:", e.message || e);
+          }
+        }
         // Retry up to 3 times silently — never show an error to the user mid-retry
         let aiRes = null;
         for (let attempt = 1; attempt <= 3; attempt++) {
           try {
+            let promptForDeepSeek = text;
+            if (hasVisionImage) {
+              try {
+                const geminiKey = (config.geminiKey || process.env.GEMINI_API_KEY || "").trim();
+                const vision = await analyzeTelegramImageWithGemini(client2, visionSourceMessage, geminiKey);
+                if (!vision) throw new Error("VISION_TEMPORARILY_BUSY");
+                console.log("[vision] DeepSeek formatting started");
+                promptForDeepSeek = buildVisionPrompt(text, vision);
+              } catch (visionErr) {
+                console.warn("[vision] Gemini Vision failure:", visionErr.message || visionErr);
+                await status.finish("I couldn't analyze the image right now — the vision service is temporarily busy. Try again in a moment.");
+                return;
+              }
+            }
             aiRes = await getAIResponse(
-              text,
+              promptForDeepSeek,
               config,
               chatIdStr,
               senderId,
