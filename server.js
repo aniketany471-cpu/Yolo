@@ -1229,6 +1229,10 @@ async function performWebSearch(query, config, deep = false) {
   const isSports  = /\b(ipl|cricket|t20|odi|test\s*match|wpl|psl|ranji|bbl|cpl|sa20|ashes|wtc|srh|csk|rcb|kkr|pbks|lsg|sunrisers|chennai\s*super|royal\s*challengers|mumbai\s*indians|kolkata\s*knight|rajasthan\s*royals|delhi\s*capitals|punjab\s*kings|gujarat\s*titans|lucknow\s*super|football|soccer|premier\s*league|champions\s*league|la\s*liga|bundesliga|serie\s*a|ligue\s*1|mls|isl|afc\s*cup|uefa|fifa|euro\s*cup|copa\s*america|fa\s*cup|carabao|world\s*cup|epl|nba|basketball|wnba|euroleague|nfl|super\s*bowl|american\s*football|formula\s*1|formula\s*one|f1|motogp|indycar|grand\s*prix|nascar|rally|wrc|tennis|wimbledon|us\s*open|french\s*open|australian\s*open|roland\s*garros|atp|wta|davis\s*cup|laver\s*cup|itf|boxing|ufc|mma|wbc|wba|ibf|wbo|knockout|prizefight|bout\b|hockey|nhl|badminton|bwf|thomas\s*cup|uber\s*cup|all\s*england|golf|pga\s*tour|masters\s*tournament|ryder\s*cup|open\s*championship|liv\s*golf|rugby|six\s*nations|super\s*rugby|premiership\s*rugby|rugby\s*world\s*cup|kabaddi|pkl|pro\s*kabaddi|wwe|aew|wrestling|wwe\s*raw|smackdown|wrestlemania|olympics|paralympics|athletics|marathon\b|sprint\b|javelin|long\s*jump|high\s*jump|table\s*tennis|ping\s*pong|ittf|volleyball|fivb|handball|squash\b|snooker\b|cycling\b|tour\s*de\s*france|giro\s*d.italia|triathlon|swimming\b|fina|gymnastics)\b/i.test(searchQuery) ||
     /\b(which\s+team|who\s+(?:is|are)\s+playing|playing\s+today|match\s+today|today[''s]*\s+match|today[''s]*\s+game|today[''s]*\s+ipl|ipl\s+today|cricket\s+today|fixture|fixtures|next\s+match|upcoming\s+match|match\s+schedule|schedule\s+today|what.*match.*today|today.*fixture)\b/i.test(query);
   const isWeather = /\bweather\b|\btemperature\b|\btemp\b|\bforecast\b/i.test(searchQuery);
+  if (isWeather) {
+    console.log("[search] Weather query detected — skipping Gemini grounding path");
+    return "";
+  }
 
   // ── 1. Gemini grounding — only for realtime queries, never casual chat ────
   if (geminiGroundedSearch && geminiKey && isRealtimeQuery(searchQuery)) {
@@ -1327,6 +1331,7 @@ async function performRealtimeGrounding(query, config) {
     console.log("[weather] detected query");
     const weather = await performWeatherGrounding(finalQuery, config, geminiKey);
     if (weather) {
+      console.log("[weather] returning verified weather response");
       return {
         query_type: "weather",
         subject: weather.location,
