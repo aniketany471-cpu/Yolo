@@ -13,7 +13,8 @@
 
 import { GoogleGenAI } from '@google/genai';
 
-const SEARCH_MODEL = 'gemini-2.5-flash-lite';
+const SEARCH_MODEL_SPORTS  = 'gemini-2.0-flash';     // reliable grounding for live results
+const SEARCH_MODEL_GENERAL = 'gemini-2.5-flash-lite'; // quota-saving for weather/general
 
 // ── Cache ─────────────────────────────────────────────────────────────────────
 const CACHE_TTL_MS = 60_000;
@@ -197,11 +198,11 @@ export async function geminiGroundedSearch(query, apiKey, type = 'general') {
 
   lastCallAt = Date.now();
   try {
-    console.log('[gemini-search] Grounding (' + SEARCH_MODEL + ', type=' + type + '): "' + query.slice(0, 80) + '"');
+    console.log('[gemini-search] Grounding (' + (type === 'sports' ? SEARCH_MODEL_SPORTS : SEARCH_MODEL_GENERAL) + ', type=' + type + '): "' + query.slice(0, 80) + '"');
     const ai = new GoogleGenAI({ apiKey: cleanKey });
 
     const response = await ai.models.generateContent({
-      model: SEARCH_MODEL,
+      model: type === 'sports' ? SEARCH_MODEL_SPORTS : SEARCH_MODEL_GENERAL,
       contents: [{ role: 'user', parts: [{ text: buildPrompt(query, type) }] }],
       tools: [{ googleSearch: {} }],
       config: { temperature: 0 },
