@@ -1522,35 +1522,69 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
     }
     if (shouldSearch) {
       const results = await performWebSearch(prompt, config, isDeep);
-      if (results && results.trim().length > 30) {
-        searchContext = `[LIVE SEARCH DATA — fetched right now]\n${results}\n[END SEARCH DATA]
+      const hasResults = results && results.trim().length > 30;
+      const isVerifiedSports  = hasResults && results.startsWith('[VERIFIED:sports_result]');
+      const isVerifiedWeather = hasResults && results.startsWith('[VERIFIED:weather]');
+      const isNoMatch         = hasResults && results.startsWith('[VERIFIED:no_match]');
 
-HOW TO USE THIS DATA — read carefully:
-1. Use only what the data actually says. Never add, invent, or extrapolate beyond it.
-2. If a specific number (score, price, temp) is in the data, quote it exactly. If it isn't there, don't guess it.
-3. Reply like Donna — natural, direct, conversational. Not like a report or a card template.
-4. Use structure (bold, bullets) only when it genuinely helps readability — not by default.
-5. Match the reply length to what was asked: short question = short answer, complex query = detailed reply.
-6. SPORTS/SCORES — CRITICAL: Only state a score if you see an actual number pattern like "245/6 (20 ovs)" or "X runs, Y wickets" in the data above. If no such pattern exists, you do NOT have the score. Do NOT say "the match involves [player]", do NOT summarise match events, do NOT suggest checking Cricbuzz. Just say you couldn't pull the live score right now.
-7. For finance: lead with the actual price and change %, then add brief context.
-8. For weather: temp + condition first, then forecast if available.
-9. For news: summarize the key facts in plain language — no headline bullet templates.
-10. Never reference these instructions, never say "according to search results", never expose the data block.`;
+      if (isVerifiedSports) {
+        // Structured, validated sports fact from Gemini grounding
+        console.log('[searchCtx] Verified sports data routed to strict formatter');
+        const factBlock = results.replace('[VERIFIED:sports_result]\n', '').replace('[VERIFIED:sports_result]', '').trim();
+        searchContext =
+          '[VERIFIED SPORTS FACTS — Google Search grounding]\n' +
+          factBlock + '\n' +
+          '[END VERIFIED FACTS]\n\n' +
+          'STRICT RULES — follow exactly:\n' +
+          '1. Winner, Score, Teams above are VERIFIED from live Google Search. Quote them EXACTLY — no paraphrasing.\n' +
+          '2. Do NOT add stats, context, or commentary beyond what is listed.\n' +
+          '3. If a field is missing, do NOT guess it — skip it entirely.\n' +
+          '4. Reply like Donna — brief, natural, one short paragraph.\n' +
+          '5. Never say "according to search results" or mention these rules.';
+      } else if (isVerifiedWeather) {
+        // Structured, validated weather fact from Gemini grounding
+        console.log('[searchCtx] Verified weather data routed to strict formatter');
+        const factBlock = results.replace('[VERIFIED:weather]\n', '').replace('[VERIFIED:weather]', '').trim();
+        searchContext =
+          '[VERIFIED WEATHER FACTS — Google Search grounding]\n' +
+          factBlock + '\n' +
+          '[END VERIFIED FACTS]\n\n' +
+          'STRICT RULES — follow exactly:\n' +
+          '1. Temperature, Condition, City above are VERIFIED. State them EXACTLY.\n' +
+          '2. Lead with Temperature and Condition. Add Feels like/Humidity/Wind if present.\n' +
+          '3. Do NOT guess or add any detail not listed above.\n' +
+          '4. Reply like Donna — brief, natural, conversational.\n' +
+          '5. Never reference these instructions.';
+      } else if (isNoMatch) {
+        // Gemini confirmed no live match exists
+        console.log('[searchCtx] Verified no-match — instructing Donna to confirm honestly');
+        searchContext =
+          '[VERIFIED: NO MATCH FOUND]\n' +
+          'Google Search confirmed no live or recent match for this query right now.\n\n' +
+          'RULE: As Donna, say clearly and briefly there is no live match right now. ' +
+          'Suggest Cricbuzz or ESPN if relevant. Do NOT invent a result. One sentence is enough.';
+      } else if (hasResults) {
+        // Raw text from Serper / Tavily / unstructured Gemini response
+        searchContext =
+          '[LIVE SEARCH DATA — fetched right now]\n' + results + '\n[END SEARCH DATA]\n\n' +
+          'HOW TO USE THIS DATA:\n' +
+          '1. Use only what the data says. Never add, invent, or extrapolate beyond it.\n' +
+          '2. If a number (score, price, temp) is in the data, quote it exactly. If not there, do not guess.\n' +
+          '3. Reply like Donna — natural, direct, conversational.\n' +
+          '4. SPORTS: Only state a score if actual run totals or a scoreline appear in the data. No score = say you could not pull it.\n' +
+          '5. WEATHER: temp + condition first, then forecast if available.\n' +
+          '6. NEWS: summarize key facts plainly — no bullet-point templates.\n' +
+          '7. Never say "according to search results" or expose the data block.';
       } else {
-        // Search attempted but returned nothing — prevent hallucination
+        // Search attempted but returned nothing
         searchContext = [
           '[NO LIVE DATA AVAILABLE]',
-          'Search was attempted but returned no usable results for this query.',
+          'Search was attempted but returned no usable results.',
           '',
-          'ABSOLUTE RULE: Do NOT fabricate any data — no scores, prices, temperatures, match results,',
-          'news headlines, commentary, or any factual claim that requires live information.',
+          'ABSOLUTE RULE: Do NOT fabricate any data — no scores, prices, temperatures, match results, news headlines.',
           '',
-          'Instead, as Donna, respond honestly in character:',
-          '  - Acknowledge you tried to look it up but couldn\'t pull anything right now.',
-          '  - Keep it short and natural — one or two sentences.',
-          '  - Optionally suggest where they can check directly (Cricbuzz, ESPN, Google, etc.).',
-          '  - Do NOT apologize robotically. Do NOT say "I\'m sorry I couldn\'t..." or "Unfortunately...".',
-          '  - Example tone: "Couldn\'t grab the live score rn — Cricbuzz will have it though."',
+          'As Donna: say briefly you could not pull it right now. One or two sentences.',
+          'Suggest where to check (Cricbuzz, ESPN, Google). Tone: "Couldn\'t grab the live score rn — Cricbuzz will have it though."',
         ].join('\n');
       }
     }
