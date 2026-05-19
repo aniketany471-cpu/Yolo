@@ -51,21 +51,33 @@ function isQuotaError(e) {
 }
 
 // ── Per-type prompts ─────────────────────────────────────────────────────────
+function todayStr() {
+  const d = new Date();
+  return d.toLocaleDateString('en-GB', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+}
+
 function buildPrompt(query, type) {
+  const today = `Today's date is ${todayStr()}.`;
+
   if (type === 'sports') {
     return (
-      `Find the CURRENT LIVE score for: ${query}\n\n` +
-      `You MUST include (if a match is live or recently finished):\n` +
-      `- Teams playing (e.g. KKR vs RCB)\n` +
+      `${today} Search using this exact date context.\n\n` +
+      `Find the CURRENT LIVE or most recent score for: ${query}\n\n` +
+      `You MUST include:\n` +
+      `- Teams playing (e.g. CSK vs SRH)\n` +
       `- Current score in format: TEAM X/Y (Z ovs) — for cricket\n` +
-      `- Match status: Live / Innings Break / Result\n` +
+      `- Match status: Live / Innings Break / Result / Completed\n` +
+      `- Venue if available\n` +
       `- Recent wickets or key events if available\n\n` +
-      `If NO match is live right now, say exactly: "No live match at this time."\n` +
-      `Do NOT add commentary, opinions, or links. State only the facts.`
+      `IMPORTANT: Search for matches happening TODAY (${todayStr()}) or yesterday. ` +
+      `Do NOT report results from previous seasons or years.\n` +
+      `If NO match is live or recently played, say: "No live match at this time."\n` +
+      `State only facts. No commentary, no links.`
     );
   }
   if (type === 'weather') {
     return (
+      `${today}\n\n` +
       `Find the CURRENT weather for: ${query}\n\n` +
       `You MUST include:\n` +
       `- City name and region\n` +
@@ -81,10 +93,11 @@ function buildPrompt(query, type) {
   }
   // General realtime
   return (
+    `${today} Use this date for context when searching.\n\n` +
     `Search for current, accurate information about: ${query}\n\n` +
-    `Return only factual information. Be concise and specific.\n` +
+    `Return only factual information from TODAY or the most recent available date.\n` +
     `Include exact numbers, scores, prices, temperatures, dates where available.\n` +
-    `Do NOT add commentary, opinions, or conversational text.\n` +
+    `Do NOT report outdated information from previous years unless the query is historical.\n` +
     `Do NOT say "I found" or "According to" — just state the facts directly.`
   );
 }
