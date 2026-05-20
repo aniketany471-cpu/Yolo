@@ -16,6 +16,7 @@ import yts from "yt-search";
 import youtubedl from "youtube-dl-exec";
 import { analyzeTelegramImageWithGemini, buildVisionPrompt } from "./services/vision.js";
 import { requestGemini, beginGeminiRequestScope } from "./services/geminiManager.js";
+import { getGeminiPrimaryKey } from "./services/geminiKeyManager.js";
 import { getAccuWeather } from "./services/weather.js";
 // Image service — loaded dynamically so a missing/broken module never crashes the bot
 let ziGenerateImage = null;
@@ -1227,7 +1228,7 @@ async function performWebSearch(query, config, deep = false) {
     if (rtc.resolvedDate) console.log(`[time] resolved date: ${rtc.resolvedDate}`);
     console.log(`[time] rewritten query: "${searchQuery.slice(0, 140)}"`);
   }
-  const geminiKey = (config.geminiKey || process.env.GEMINI_API_KEY || '').trim();
+  const geminiKey = (config.geminiKey || getGeminiPrimaryKey() || '').trim();
 
   // Detect query type for targeted Gemini prompts
   const isSports  = /\b(ipl|cricket|t20|odi|test\s*match|wpl|psl|ranji|bbl|cpl|sa20|ashes|wtc|srh|csk|rcb|kkr|pbks|lsg|sunrisers|chennai\s*super|royal\s*challengers|mumbai\s*indians|kolkata\s*knight|rajasthan\s*royals|delhi\s*capitals|punjab\s*kings|gujarat\s*titans|lucknow\s*super|football|soccer|premier\s*league|champions\s*league|la\s*liga|bundesliga|serie\s*a|ligue\s*1|mls|isl|afc\s*cup|uefa|fifa|euro\s*cup|copa\s*america|fa\s*cup|carabao|world\s*cup|epl|nba|basketball|wnba|euroleague|nfl|super\s*bowl|american\s*football|formula\s*1|formula\s*one|f1|motogp|indycar|grand\s*prix|nascar|rally|wrc|tennis|wimbledon|us\s*open|french\s*open|australian\s*open|roland\s*garros|atp|wta|davis\s*cup|laver\s*cup|itf|boxing|ufc|mma|wbc|wba|ibf|wbo|knockout|prizefight|bout\b|hockey|nhl|badminton|bwf|thomas\s*cup|uber\s*cup|all\s*england|golf|pga\s*tour|masters\s*tournament|ryder\s*cup|open\s*championship|liv\s*golf|rugby|six\s*nations|super\s*rugby|premiership\s*rugby|rugby\s*world\s*cup|kabaddi|pkl|pro\s*kabaddi|wwe|aew|wrestling|wwe\s*raw|smackdown|wrestlemania|olympics|paralympics|athletics|marathon\b|sprint\b|javelin|long\s*jump|high\s*jump|table\s*tennis|ping\s*pong|ittf|volleyball|fivb|handball|squash\b|snooker\b|cycling\b|tour\s*de\s*france|giro\s*d.italia|triathlon|swimming\b|fina|gymnastics)\b/i.test(searchQuery) ||
@@ -1303,7 +1304,7 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
     };
   }
   const gs = globalThis.__geminiGroundingState;
-  const geminiKey = (config.geminiKey || process.env.GEMINI_API_KEY || "").trim();
+  const geminiKey = (config.geminiKey || getGeminiPrimaryKey() || "").trim();
   if (!geminiKey) return null;
   if (!isRealtimeQuery(query)) return null;
   console.log("[grounding] realtime detected");
@@ -1506,7 +1507,7 @@ async function generateImage(prompt, apiKey, model = "flux") {
 }
 async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = false, forceDeep = false, senderUsername = null, requestId = "chat") {
   const userGeminiK = (config.geminiKey || "").trim();
-  const systemGeminiK = (process.env.GEMINI_API_KEY || "").trim();
+  const systemGeminiK = (getGeminiPrimaryKey() || "").trim();
   const groqK = (config.groqKey || "").trim();
   const openRouterK = (config.openRouterKey || "").trim();
   let context = [];
@@ -2826,7 +2827,7 @@ async function startServer() {
     if (!query) return res.status(400).json({ error: "query is required" });
     try {
       const cfg = db.prepare("SELECT geminiKey FROM config WHERE id = 1").get();
-      const geminiKey = (cfg?.geminiKey || process.env.GEMINI_API_KEY || "").trim();
+      const geminiKey = (cfg?.geminiKey || getGeminiPrimaryKey() || "").trim();
       if (geminiGroundedSearch && geminiKey) {
         const result = await geminiGroundedSearch(query, geminiKey);
         if (result) return res.json({ result, mode: "gemini-grounding" });
@@ -2864,7 +2865,7 @@ async function startServer() {
     console.log(`Server running on http://localhost:${PORT}`);
     console.log(`AI Configuration Check:`);
     console.log(
-      `- GEMINI_API_KEY: ${process.env.GEMINI_API_KEY ? "Present" : "MISSING"}`
+      `- GEMINI_API_KEY: ${(getGeminiPrimaryKey() || process.env.GEMINI_API_KEY) ? "Present" : "MISSING"}`
     );
   });
   let client = null;
@@ -3449,7 +3450,7 @@ async function startServer() {
             let promptForDeepSeek = text;
             if (hasVisionImage) {
               try {
-                const geminiKey = (config.geminiKey || process.env.GEMINI_API_KEY || "").trim();
+                const geminiKey = (config.geminiKey || getGeminiPrimaryKey() || "").trim();
                 const vision = await analyzeTelegramImageWithGemini(client2, visionSourceMessage, geminiKey, message.__requestId || `msg-${message.id}`);
                 if (!vision) throw new Error("VISION_TEMPORARILY_BUSY");
                 console.log("[vision] DeepSeek formatting started");

@@ -1,4 +1,5 @@
 import { GoogleGenAI } from "@google/genai";
+import { withGeminiKeyRotation } from "./geminiKeyManager.js";
 
 const REQUEST_TIMEOUT_MS = 20000;
 const perMessage = new Map();
@@ -13,8 +14,7 @@ export function beginGeminiRequestScope(requestId) {
 }
 
 export async function requestGemini({ source = "unknown", requestId = "global", apiKey, model, contents, config = {}, tools, attemptType = "primary" }) {
-  const cleanKey = (apiKey || "").trim();
-  if (!cleanKey) return null;
+  const overrideKey = (apiKey || "").trim();
   const state = getState(requestId);
   if (state.total >= 3 || (attemptType === "primary" && state.primary >= 2) || (attemptType === "fallback" && state.fallback >= 1)) {
     console.warn(`[gemini-manager] blocked requestId=${requestId} source=${source} type=${attemptType} total=${state.total}`);
@@ -25,13 +25,15 @@ export async function requestGemini({ source = "unknown", requestId = "global", 
   if (attemptType === "fallback") state.fallback += 1;
   console.log(`[gemini-manager] requestId=${requestId} source=${source} type=${attemptType} total=${state.total}`);
 
-  const ai = new GoogleGenAI({ apiKey: cleanKey });
   try {
-    const resp = await Promise.race([
-      ai.models.generateContent({ model, contents, config, ...(tools ? { tools } : {}) }),
-      new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), REQUEST_TIMEOUT_MS))
-    ]);
-    return resp;
+    return await withGeminiKeyRotation(async (key) => {
+      const ai = new GoogleGenAI({ apiKey: key });
+      const resp = await Promise.race([
+        ai.models.generateContent({ model, contents, config, ...(tools ? { tools } : {}) }),
+        new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), REQUEST_TIMEOUT_MS))
+      ]);
+      return resp;
+    }, { source, overrideKey });
   } catch (e) {
     console.warn(`[gemini-manager] requestId=${requestId} source=${source} error=${e?.message || e}`);
     throw e;
