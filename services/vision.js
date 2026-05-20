@@ -1,7 +1,6 @@
+import { requestGemini } from "./geminiManager.js";
+
 const RETRY_DELAYS_MS = [1500, 3000, 5000];
-const TIMEOUT_MS = 20000;
-const OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions";
-const DEFAULT_VISION_MODEL = "meta-llama/llama-3.2-11b-vision-instruct:free";
 
 function extractImageFromMessage(message) {
   if (!message) return null;
@@ -66,97 +65,111 @@ function normalizeAndValidate(parsed) {
   return { result, valid };
 }
 
-function buildVisionPayload(model, imageUrl, prompt) {
-  return {
-    model,
-    messages: [{
-      role: "user",
-      content: [
-        { type: "text", text: prompt },
-        { type: "image_url", image_url: { url: imageUrl } }
-      ]
-    }],
-    temperature: 0.1
-  };
+function buildVisionExtractionPrompt() {
+  return `Analyze this image and return ONLY valid raw JSON. Do not wrap in markdown. Do not explain. Do not use code blocks. Do not add extra text before or after JSON. Use exactly this schema: {"type":"","summary":"","visible_text":"","objects":[],"detected_context":"","confidence":0.0}. visible_text must include OCR text when present.`;
 }
 
-async function requestVision(model, imageUrl, openrouterApiKey) {
-  const prompt = `Analyze this image and return ONLY valid raw JSON. Do not wrap in markdown. Do not explain. Do not use code blocks. Do not add extra text before or after JSON. Use exactly this schema: {"type":"","summary":"","visible_text":"","objects":[],"detected_context":"","confidence":0.0}. visible_text must include OCR text when present.`;
-  if (typeof imageUrl !== "string" || !imageUrl.startsWith("data:image/")) throw new Error("invalid image url");
-
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);
-  try {
-    const response = await fetch(OPENROUTER_ENDPOINT, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${openrouterApiKey}`,
-        "Content-Type": "application/json",
-        ...(process.env.HTTP_REFERER ? { "HTTP-Referer": process.env.HTTP_REFERER } : {}),
-        ...(process.env.X_TITLE ? { "X-Title": process.env.X_TITLE } : {})
-      },
-      body: JSON.stringify(buildVisionPayload(model, imageUrl, prompt)),
-      signal: controller.signal
-    });
-
-    const data = await response.json().catch(() => null);
-    if (!response.ok) {
-      const errMsg = data?.error?.message || `openrouter_http_${response.status}`;
-      throw new Error(errMsg);
-    }
-    const text = data?.choices?.[0]?.message?.content;
-    if (typeof text !== "string") throw new Error("malformed response");
-    return { text };
-  } catch (error) {
-    if (error?.name === "AbortError") throw new Error("vision timeout");
-    throw error;
-  } finally {
-    clearTimeout(timeoutId);
+function extractTextFromGeminiResponse(resp) {
+  if (!resp) return "";
+  if (typeof resp?.text === "string" && resp.text.trim()) return resp.text;
+  if (typeof resp?.outputText === "string" && resp.outputText.trim()) return resp.outputText;
+  const candidate = resp?.candidates?.[0]?.content?.parts;
+  if (Array.isArray(candidate)) {
+    return candidate.map((p) => p?.text || "").join("\n").trim();
   }
+  return "";
 }
 
-async function runVisionPipeline(mimeType, base64Data) {
-  const configuredModel = (process.env.VISION_MODEL || DEFAULT_VISION_MODEL).trim() || DEFAULT_VISION_MODEL;
-  const models = [configuredModel];
-  const openrouterApiKey = (process.env.OPENROUTER_API_KEY || "").trim();
-  if (!openrouterApiKey) throw new Error("VISION_TEMPORARILY_BUSY");
+function isRetriableVisionError(error) {
+  const msg = (error?.message || String(error || "")).toLowerCase();
+  return msg.includes("429") || msg.includes("quota") || msg.includes("overload") || msg.includes("timeout") || msg.includes("temporary") || msg.includes("unavailable") || /\b5\d\d\b/.test(msg);
+}
 
-  const imageDataUrl = `data:${mimeType};base64,${base64Data}`;
+async function requestVisionWithGemini({ model, mimeType, base64Data, requestId, attemptType }) {
+  if (!base64Data || typeof base64Data !== "string") throw new Error("invalid image payload");
+  if (!mimeType || !mimeType.startsWith("image/")) throw new Error("unsupported media");
+
+  const contents = [
+    {
+      role: "user",
+      parts: [
+        { text: buildVisionExtractionPrompt() },
+        { inlineData: { mimeType, data: base64Data } }
+      ]
+    }
+  ];
+
+  const resp = await requestGemini({
+    source: "vision",
+    requestId,
+    model,
+    contents,
+    config: { temperature: 0.1 },
+    attemptType
+  });
+
+  if (!resp) throw new Error("quota exceeded");
+  const text = extractTextFromGeminiResponse(resp);
+  if (!text) throw new Error("malformed response");
+  return { text };
+}
+
+async function runVisionPipeline(mimeType, base64Data, requestId = "vision") {
+  const primaryModel = "gemini-2.5-flash";
+  const fallbackModel = "gemini-1.5-flash";
   let lastReason = "unknown";
 
-  console.log("[vision] using_openrouter=true");
-  console.log(`[vision] model=${configuredModel}`);
+  console.log("[vision] provider=gemini");
   console.log("[vision] image_analysis_started");
 
-  for (let modelIndex = 0; modelIndex < models.length; modelIndex++) {
-    const model = models[modelIndex];
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      try {
-        const resp = await requestVision(model, imageDataUrl, openrouterApiKey);
-        const raw = (resp?.text || "");
-        const cleaned = stripCodeFences(raw).trim();
-        if (!cleaned) throw new Error("empty response");
-        let parsed = safeJsonParse(cleaned);
-        if (!parsed) {
-          const extracted = extractFirstJsonObject(cleaned);
-          if (extracted) parsed = safeJsonParse(extracted);
-        }
-        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("parse failure");
+  const attempts = [
+    { model: primaryModel, index: 1, max: 2, attemptType: "primary" },
+    { model: primaryModel, index: 2, max: 2, attemptType: "primary" },
+    { model: fallbackModel, index: 1, max: 1, attemptType: "fallback" }
+  ];
 
-        const { result, valid } = normalizeAndValidate(parsed);
-        const responseValid = !!(valid && (result.visible_text || result.summary || result.detected_context));
-        console.log(`[vision] OCR_success=${!!result.visible_text}`);
-        console.log(`[vision] response_valid=${responseValid}`);
-        if (!responseValid) throw new Error("validation failure");
-        return result;
-      } catch (e) {
-        const msg = (e?.message || String(e)).toLowerCase();
-        lastReason = msg.slice(0, 120);
-        const retriable = msg.includes("503") || msg.includes("429") || msg.includes("quota") || msg.includes("rate limit") || msg.includes("timeout") || msg.includes("empty response") || msg.includes("parse failure") || msg.includes("validation failure") || msg.includes("malformed response") || msg.includes("network");
-        console.warn(`[vision] failure model=${model} attempt=${attempt}/3 retriable=${retriable}`);
-        if (!retriable) break;
-        if (attempt < 3) await sleep(RETRY_DELAYS_MS[attempt - 1] || 1500);
+  for (let i = 0; i < attempts.length; i++) {
+    const current = attempts[i];
+    try {
+      if (current.attemptType === "primary") {
+        console.log(`[vision] model=${current.model} attempt=${current.index}/${current.max}`);
+        if (current.index === 2) console.log("[vision] retrying_primary=true");
+      } else {
+        console.log(`[vision] switching_to_fallback=${current.model}`);
+        console.log(`[vision] fallback_attempt=${current.index}/${current.max}`);
       }
+
+      const resp = await requestVisionWithGemini({
+        model: current.model,
+        mimeType,
+        base64Data,
+        requestId,
+        attemptType: current.attemptType
+      });
+      const raw = (resp?.text || "");
+      const cleaned = stripCodeFences(raw).trim();
+      if (!cleaned) throw new Error("malformed response");
+      let parsed = safeJsonParse(cleaned);
+      if (!parsed) {
+        const extracted = extractFirstJsonObject(cleaned);
+        if (extracted) parsed = safeJsonParse(extracted);
+      }
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("malformed response");
+
+      const { result, valid } = normalizeAndValidate(parsed);
+      const responseValid = !!(valid && (result.visible_text || result.summary || result.detected_context));
+      console.log(`[vision] OCR_success=${!!result.visible_text}`);
+      console.log(`[vision] response_valid=${responseValid}`);
+      console.log(`[vision] total_requests_used=${i + 1}`);
+      if (!responseValid) throw new Error("ocr validation failure");
+      return result;
+    } catch (e) {
+      const msg = (e?.message || String(e)).toLowerCase();
+      lastReason = msg.slice(0, 120);
+      const retriable = isRetriableVisionError(e);
+      if (retriable) console.log("[vision] rotating_gemini_key");
+      if (!retriable) break;
+      if (i < attempts.length - 1) await sleep(RETRY_DELAYS_MS[i] || 1500);
     }
   }
 
@@ -170,11 +183,11 @@ export async function analyzeTelegramImageWithGemini(client, message, geminiApiK
 
   console.log(`[vision] image detected (${imageRef.source})`);
   const imageBuffer = await client.downloadMedia(imageRef.media, {});
-  if (!imageBuffer || !Buffer.isBuffer(imageBuffer) || imageBuffer.length === 0) throw new Error("VISION_TEMPORARILY_BUSY");
+  if (!imageBuffer || !Buffer.isBuffer(imageBuffer) || imageBuffer.length === 0) throw new Error("invalid image");
 
   const mimeType = imageRef.media?.document?.mimeType || "image/jpeg";
   const base64Data = imageBuffer.toString("base64");
-  return await runVisionPipeline(mimeType, base64Data);
+  return await runVisionPipeline(mimeType, base64Data, requestId);
 }
 
 export function buildVisionPrompt(userText, visionResult) {
