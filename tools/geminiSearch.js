@@ -193,8 +193,6 @@ function parseGroundedFact(text, type) {
  * @returns {Promise<string|null>}
  */
 export async function geminiGroundedSearch(query, apiKey, type = 'general') {
-  const cleanKey = (apiKey || '').trim();
-  if (!cleanKey || cleanKey.length < 5) return null;
 
   // Cache hit
   const cached = getCached(query, type);
@@ -216,7 +214,7 @@ export async function geminiGroundedSearch(query, apiKey, type = 'general') {
     const response = await requestGemini({
       source: 'realtime_grounding',
       requestId: `search:${type}:${query.slice(0, 30)}`,
-      apiKey: cleanKey,
+      apiKey: (apiKey || "").trim(),
       model: type === 'sports' ? SEARCH_MODEL_SPORTS : SEARCH_MODEL_GENERAL,
       contents: [{ role: 'user', parts: [{ text: buildPrompt(query, type) }] }],
       tools: [{ googleSearch: {} }],
