@@ -1,7 +1,7 @@
 const RETRY_DELAYS_MS = [1500, 3000, 5000];
 const TIMEOUT_MS = 20000;
 const OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions";
-const DEFAULT_QWEN_MODEL = "qwen/qwen-2.5-vl-7b-instruct:free";
+const DEFAULT_VISION_MODEL = "meta-llama/llama-3.2-11b-vision-instruct:free";
 
 function extractImageFromMessage(message) {
   if (!message) return null;
@@ -66,8 +66,24 @@ function normalizeAndValidate(parsed) {
   return { result, valid };
 }
 
-async function requestVision(model, imageDataUrl, openrouterApiKey) {
+function buildVisionPayload(model, imageUrl, prompt) {
+  return {
+    model,
+    messages: [{
+      role: "user",
+      content: [
+        { type: "text", text: prompt },
+        { type: "image_url", image_url: { url: imageUrl } }
+      ]
+    }],
+    temperature: 0.1
+  };
+}
+
+async function requestVision(model, imageUrl, openrouterApiKey) {
   const prompt = `Analyze this image and return ONLY valid raw JSON. Do not wrap in markdown. Do not explain. Do not use code blocks. Do not add extra text before or after JSON. Use exactly this schema: {"type":"","summary":"","visible_text":"","objects":[],"detected_context":"","confidence":0.0}. visible_text must include OCR text when present.`;
+  if (typeof imageUrl !== "string" || !imageUrl.startsWith("data:image/")) throw new Error("invalid image url");
+
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);
   try {
@@ -79,17 +95,7 @@ async function requestVision(model, imageDataUrl, openrouterApiKey) {
         ...(process.env.HTTP_REFERER ? { "HTTP-Referer": process.env.HTTP_REFERER } : {}),
         ...(process.env.X_TITLE ? { "X-Title": process.env.X_TITLE } : {})
       },
-      body: JSON.stringify({
-        model,
-        messages: [{
-          role: "user",
-          content: [
-            { type: "text", text: prompt },
-            { type: "image_url", image_url: { url: imageDataUrl } }
-          ]
-        }],
-        temperature: 0.1
-      }),
+      body: JSON.stringify(buildVisionPayload(model, imageUrl, prompt)),
       signal: controller.signal
     });
 
@@ -110,7 +116,7 @@ async function requestVision(model, imageDataUrl, openrouterApiKey) {
 }
 
 async function runVisionPipeline(mimeType, base64Data) {
-  const configuredModel = (process.env.QWEN_VISION_MODEL || DEFAULT_QWEN_MODEL).trim() || DEFAULT_QWEN_MODEL;
+  const configuredModel = (process.env.VISION_MODEL || DEFAULT_VISION_MODEL).trim() || DEFAULT_VISION_MODEL;
   const models = [configuredModel];
   const openrouterApiKey = (process.env.OPENROUTER_API_KEY || "").trim();
   if (!openrouterApiKey) throw new Error("VISION_TEMPORARILY_BUSY");
