@@ -1505,7 +1505,7 @@ async function generateImage(prompt, apiKey, model = "flux") {
     return null;
   }
 }
-async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = false, forceDeep = false, senderUsername = null, requestId = "chat") {
+async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = false, forceDeep = false, senderUsername = null, requestId = "chat", opts = {}) {
   const userGeminiK = (config.geminiKey || "").trim();
   const systemGeminiK = (getGeminiPrimaryKey() || "").trim();
   const groqK = (config.groqKey || "").trim();
@@ -1709,7 +1709,11 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
   }
   let searchContext = "";
   let realtimeSearchFailed = false;
-  if (config.searchEnabled === 1) {
+  const skipRealtimeVerification = !!opts?.skipRealtimeVerification;
+  if (skipRealtimeVerification) {
+    console.log("[vision] skipping_realtime_verification=true");
+  }
+  if (!skipRealtimeVerification && config.searchEnabled === 1) {
     // Gate 1: never search casual/short messages — saves API quota and avoids false triggers
     const promptTrimmed = prompt.trim();
     const isCasualMessage =
@@ -1820,7 +1824,7 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
       } else if (!grounded) {
         // Search attempted but returned nothing
         realtimeSearchFailed = isRealtimeQuery(prompt);
-        if (realtimeSearchFailed) {
+        if (!skipRealtimeVerification && realtimeSearchFailed) {
           console.log('[search] Realtime query + no search data — bypassing AI to prevent hallucination');
         }
         searchContext = [
@@ -3448,6 +3452,7 @@ async function startServer() {
         for (let attempt = 1; attempt <= 3; attempt++) {
           try {
             let promptForDeepSeek = text;
+            let visionOcrVerified = false;
             if (hasVisionImage) {
               try {
                 const geminiKey = (config.geminiKey || getGeminiPrimaryKey() || "").trim();
@@ -3455,6 +3460,7 @@ async function startServer() {
                 if (!vision) throw new Error("VISION_TEMPORARILY_BUSY");
                 console.log("[vision] DeepSeek formatting started");
                 promptForDeepSeek = buildVisionPrompt(text, vision);
+                visionOcrVerified = !!(vision?.visible_text && vision?.summary && vision?.detected_context);
               } catch (visionErr) {
                 console.warn("[vision] Gemini Vision failure:", visionErr.message || visionErr);
                 await status.finish("I couldn't analyze the image right now — the vision service is temporarily busy. Try again in a moment.");
@@ -3469,8 +3475,12 @@ async function startServer() {
               isNSFWActive,
               false,
               message.sender?.username || null,
-              message.__requestId || `msg-${message.id}`
+              message.__requestId || `msg-${message.id}`,
+              { skipRealtimeVerification: hasVisionImage && !!visionOcrVerified }
             );
+            if (hasVisionImage && !!visionOcrVerified && aiRes) {
+              console.log("[vision] OCR_response_sent=true");
+            }
             if (aiRes) break;
           } catch (retryErr) {
             console.error(`[AI-Auto] Attempt ${attempt} failed:`, retryErr.message || retryErr);
