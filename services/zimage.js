@@ -1,19 +1,41 @@
 /**
- * Zimage Turbo image generation service
- * Endpoint: POST https://zimageturbo.ai/api/generate
- * Auth:     Authorization: Bearer <ZIMAGE_API_KEY>
- * Response: { code: 200, data: { task_id: "...", images: ["<url>"] } }
+ * Image generation service
+ * Primary: OpenAI GPT-Image-1
+ * Fallback: Zimage Turbo
  */
 
-const GENERATE_URL = "https://zimageturbo.ai/api/generate";
-const PROVIDER_TIMEOUT_MS = 90_000;  // Zimage can take a while
+const OPENAI_GENERATE_URL = "https://api.openai.com/v1/images/generations";
+const ZIMAGE_GENERATE_URL = "https://zimageturbo.ai/api/generate";
+
+const PROVIDER_TIMEOUT_MS = 90_000;
 const DOWNLOAD_TIMEOUT_MS = 30_000;
+const OPENAI_MODEL = "gpt-image-1";
 
 function sanitizePrompt(prompt) {
-  return prompt
+  return String(prompt || "")
     .replace(/[<>{}|\\^`[\]]/g, "")
     .trim()
     .slice(0, 1000);
+}
+
+function pickOpenAISize(options = {}) {
+  const width = Number(options.width) || null;
+  const height = Number(options.height) || null;
+
+  // GPT-Image commonly supports square + portrait/landscape large presets.
+  if (width && height) {
+    if (width > height) return "1536x1024";
+    if (height > width) return "1024x1536";
+  }
+
+  if (options.aspect_ratio === "16:9" || options.aspect_ratio === "3:2" || options.aspect_ratio === "4:3") {
+    return "1536x1024";
+  }
+  if (options.aspect_ratio === "9:16" || options.aspect_ratio === "2:3" || options.aspect_ratio === "3:4") {
+    return "1024x1536";
+  }
+
+  return "1024x1024";
 }
 
 async function fetchWithTimeout(url, options, timeoutMs) {
@@ -32,7 +54,44 @@ async function downloadImageBuffer(url) {
   return Buffer.from(await res.arrayBuffer());
 }
 
-// ── Provider: Zimage Turbo ────────────────────────────────────────────────────
+async function openaiImage(prompt, options = {}) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error("OPENAI_API_KEY not set in environment");
+
+  const body = {
+    model: OPENAI_MODEL,
+    prompt: sanitizePrompt(prompt),
+    size: pickOpenAISize(options),
+    quality: "high",
+    n: 1,
+  };
+
+  const res = await fetchWithTimeout(
+    OPENAI_GENERATE_URL,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(body),
+    },
+    PROVIDER_TIMEOUT_MS
+  );
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const msg = data?.error?.message || `HTTP ${res.status}`;
+    throw new Error(`OpenAI image error: ${msg}`);
+  }
+
+  const imageB64 = data?.data?.[0]?.b64_json;
+  const imageUrl = data?.data?.[0]?.url;
+  if (imageB64) return Buffer.from(imageB64, "base64");
+  if (imageUrl) return downloadImageBuffer(imageUrl);
+
+  throw new Error("OpenAI returned no image content");
+}
 
 async function zimageTurbo(prompt, options = {}) {
   const apiKey = process.env.ZIMAGE_API_KEY;
@@ -48,7 +107,7 @@ async function zimageTurbo(prompt, options = {}) {
   };
 
   const res = await fetchWithTimeout(
-    GENERATE_URL,
+    ZIMAGE_GENERATE_URL,
     {
       method: "POST",
       headers: {
@@ -68,7 +127,6 @@ async function zimageTurbo(prompt, options = {}) {
     );
   }
 
-  // Response: { code: 200, data: { task_id: "...", images: ["<url>"] } }
   const imageUrl = data.data?.images?.[0];
   if (!imageUrl) {
     throw new Error(`Zimage returned no image URL. Response: ${JSON.stringify(data).slice(0, 300)}`);
@@ -77,81 +135,42 @@ async function zimageTurbo(prompt, options = {}) {
   return downloadImageBuffer(imageUrl);
 }
 
-// ── Provider: Bluesminds fallback ─────────────────────────────────────────────
-
-async function bluesmindsImage(prompt, apiKey) {
-  if (!apiKey) throw new Error("Bluesminds API key not provided");
-
-  const res = await fetchWithTimeout(
-    "https://api.bluesminds.com/v1/images/generations",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model: "flux",
-        prompt: sanitizePrompt(prompt),
-        n: 1,
-        size: "1024x1024",
-      }),
-    },
-    PROVIDER_TIMEOUT_MS
-  );
-
-  if (!res.ok) {
-    const errText = await res.text().catch(() => "");
-    throw new Error(`Bluesminds image ${res.status}: ${errText.slice(0, 200)}`);
-  }
-
-  const data = await res.json();
-  const imageUrl = data?.data?.[0]?.url;
-  if (!imageUrl) throw new Error("Bluesminds returned no image URL");
-  return downloadImageBuffer(imageUrl);
-}
-
-// ── Public API ────────────────────────────────────────────────────────────────
-
 /**
  * Generate an image for the given prompt.
- * Primary: Zimage Turbo (requires ZIMAGE_API_KEY env var)
- * Fallback: Bluesminds DALL-E
+ * Primary: OpenAI GPT-Image-1 (requires OPENAI_API_KEY env var)
+ * Fallback: Zimage Turbo (requires ZIMAGE_API_KEY env var)
  * Returns { buffer: Buffer, provider: string }
  */
 export async function generateImage(prompt, config = {}, options = {}) {
+  void config; // kept for API compatibility with current call sites
   const errors = [];
 
-  // 1. Zimage Turbo (primary)
-  if (process.env.ZIMAGE_API_KEY) {
-    try {
-      const buffer = await zimageTurbo(prompt, options);
-      console.log(`[img] Zimage Turbo succeeded`);
-      return { buffer, provider: "zimage-turbo" };
-    } catch (e) {
-      console.warn(`[img] Zimage Turbo failed: ${e.message}`);
-      errors.push(`zimage: ${e.message}`);
-    }
-  } else {
-    errors.push("zimage: ZIMAGE_API_KEY not set");
+  console.log("[img] provider=openai");
+  console.log(`[img] model=${OPENAI_MODEL}`);
+  console.log("[img] primary_generation_started=true");
+
+  try {
+    const buffer = await openaiImage(prompt, options);
+    console.log("[img] generation_success=true");
+    return { buffer, provider: "openai" };
+  } catch (e) {
+    console.warn(`[img] OpenAI primary failed: ${e.message}`);
+    errors.push(`openai: ${e.message}`);
   }
 
-  // 2. Bluesminds (fallback)
-  const bmKey = (config.bluesmindsApiKey || "").trim();
-  if (bmKey) {
-    try {
-      const buffer = await bluesmindsImage(prompt, bmKey);
-      console.log("[img] Bluesminds fallback succeeded");
-      return { buffer, provider: "bluesminds" };
-    } catch (e) {
-      console.warn(`[img] Bluesminds fallback failed: ${e.message}`);
-      errors.push(`bluesminds: ${e.message}`);
-    }
-  } else {
-    errors.push("bluesminds: no API key in config");
+  console.log("[img] switching_provider=zimage_turbo");
+  console.log("[img] fallback_generation_started=true");
+
+  try {
+    const buffer = await zimageTurbo(prompt, options);
+    console.log("[img] generation_success=true");
+    return { buffer, provider: "zimage-turbo" };
+  } catch (e) {
+    console.warn(`[img] Zimage fallback failed: ${e.message}`);
+    errors.push(`zimage: ${e.message}`);
   }
 
   throw new Error(
-    `All image providers failed:\n${errors.map((e, i) => `  ${i + 1}. ${e}`).join("\n")}`
+    `All image providers failed:\n${errors.map((err, i) => `  ${i + 1}. ${err}`).join("\n")}`
   );
 }
