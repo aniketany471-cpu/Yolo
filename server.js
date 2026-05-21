@@ -1192,11 +1192,17 @@ function isRealtimeQuery(query) {
   return /\b(live|today|tonight|right now|this week|current|latest|breaking|just now|happening|trending|score[s]?|result[s]?|match|winner|champion|ipl|cricket|t20|odi|football|soccer|nba|nfl|f1|grand\s*prix|motogp|tennis|wimbledon|us\s*open|french\s*open|australian\s*open|atp|wta|boxing|ufc|mma|knockout|hockey|nhl|badminton|bwf|golf|pga|masters|rugby|six\s*nations|kabaddi|pkl|wwe|olympics|athletics|prix|price[s]?|crypto|bitcoin|btc|eth|stock|nifty|sensex|share\s*price|weather|temp(erature)?|forecast|news|election|who\s*won|what\s*happened|did\s*.{0,20}\s*win|update[s]?)\b/i.test(q);
 }
 
+function detectVisionAnalysisIntent(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return false;
+  return /\b(what is this|what's this|whats this|explain this|solve this|read this|read text|ocr|extract text|analy[sz]e this|caption this|describe this)\b/i.test(raw);
+}
+
 function detectImageGenerationIntent(text) {
   const raw = String(text || "").trim();
   if (!raw) return false;
   const lower = raw.toLowerCase();
-  const explicitImagePattern = /\b(generate|create|make|draw|artwork|wallpaper|poster|render|illustration|anime style|cinematic scene|ultra realistic|image|photo|picture|pic|visualize|concept art)\b/i;
+  const explicitImagePattern = /\b(generate image|create image|make image|draw|render|wallpaper|poster|artwork|illustration|concept art|redraw|edit image|transform image)\b/i;
   const verbObjectPattern = /\b(generate|create|make|draw|design|paint|render|visualize|illustrate)\b[\s\S]{0,90}\b(image|photo|picture|pic|wallpaper|poster|artwork|illustration|portrait|scene|character)\b/i;
   const longVisualPrompt = raw.length >= 70 &&
     /\b(with|lighting|angle|background|composition|high detail|4k|8k|cinematic|realistic|photorealistic|ultra realistic|anime|render|depth of field)\b/i.test(lower);
@@ -3599,8 +3605,21 @@ async function startServer() {
           }
         }
 
-        const directImageIntent = detectImageGenerationIntent(text);
-        if (directImageIntent) {
+        const explicitGenerationRequest = detectImageGenerationIntent(text);
+        const visionAnalysisIntent = detectVisionAnalysisIntent(text);
+        const generationBlockedForAnalysis = hasVisionImage && !explicitGenerationRequest;
+        console.log(`[intent] image_present=${hasVisionImage}`);
+        console.log(`[intent] explicit_generation_request=${explicitGenerationRequest}`);
+        if (hasVisionImage && (visionAnalysisIntent || generationBlockedForAnalysis)) {
+          console.log("[intent] detected=vision_analysis");
+          if (generationBlockedForAnalysis) {
+            console.log("[intent] generation_blocked_for_analysis=true");
+          }
+        } else if (explicitGenerationRequest && !hasVisionImage) {
+          console.log("[intent] detected=image_generation");
+        }
+
+        if (explicitGenerationRequest && !hasVisionImage) {
           addLog(`[img] intent=image_generation prompt="${text.slice(0, 60)}"`, "info");
           console.log("[img] endpoint=/images/generations");
 
@@ -3749,7 +3768,7 @@ async function startServer() {
         if (aiRes && client2) {
           // ── Image generation routing ─────────────────────────────────────
           // Strip any [IMAGE_GENERATION] tags the AI hallucinated without the user asking
-          const userActuallyWantsImage = /\b(create|generate|make|draw|design|paint|render|visualize|imagine|sketch|depict|give me|send me)\b[\s\S]{0,80}\b(image|photo|pic|picture|wallpaper|artwork|illustration|anime|drawing|portrait|logo|banner|poster)\b/i.test(text);
+          const userActuallyWantsImage = detectImageGenerationIntent(text) && !hasVisionImage;
           if (!userActuallyWantsImage && /\[IMAGE_GENERATION\]/i.test(aiRes)) {
             addLog(`[img] AI hallucinated [IMAGE_GENERATION] tag — user did not request an image. Stripping tag.`, "warn");
             aiRes = aiRes.replace(/\[IMAGE_GENERATION\][\s\S]*?\[\/IMAGE_GENERATION\]/gi, '').trim();
