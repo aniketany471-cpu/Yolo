@@ -777,8 +777,12 @@ async function getGroqResponse(prompt, apiKey, model = "llama3-8b-8192", context
 async function getOfficialDeepSeekResponse(prompt, apiKey, model = "deepseek-chat", context = [], systemInstruction) {
   try {
     const cleanKey = apiKey?.trim();
-    if (!cleanKey || cleanKey === "undefined" || cleanKey === "null") return null;
-    const finalModel = ["deepseek-chat", "deepseek-reasoner"].includes(model) ? model : "deepseek-chat";
+    if (!cleanKey || cleanKey === "undefined" || cleanKey === "null") {
+      console.log("[text-ai] official_deepseek_error=missing_api_key");
+      return null;
+    }
+    const finalModel = "deepseek-chat";
+    console.log("[text-ai] official_deepseek_request_started=true");
     const messages = normalizeContextMessages(prompt, context, systemInstruction);
     const result = await fetchJsonWithRetry(
       "https://api.deepseek.com/chat/completions",
@@ -789,9 +793,15 @@ async function getOfficialDeepSeekResponse(prompt, apiKey, model = "deepseek-cha
       },
       { provider: "Official DeepSeek", model: finalModel, endpoint: "/chat/completions" }
     );
-    if (!result.ok) return null;
+    console.log(`[text-ai] official_deepseek_status=${result?.status ?? "unknown"}`);
+    if (!result.ok) {
+      console.log(`[text-ai] official_deepseek_error=${((result?.text || "request_failed").slice(0, 180)).replace(/\s+/g, " ")}`);
+      return null;
+    }
+    console.log("[text-ai] official_deepseek_success=true");
     return result.data?.choices?.[0]?.message?.content?.trim() || null;
   } catch (e) {
+    console.log(`[text-ai] official_deepseek_error=${(e?.message || String(e)).replace(/\s+/g, " ").slice(0, 180)}`);
     console.error("[Official DeepSeek] Fetch Error:", e?.message || e);
     return null;
   }
@@ -1960,11 +1970,7 @@ User Message: ${prompt}`;
     name: "Official DeepSeek",
     key: (process.env.DEEPSEEK_API_KEY || "").trim(),
     fn: async (p, k, ctx, inst) => {
-      for (const m of ["deepseek-chat", "deepseek-reasoner"]) {
-        const out = await getOfficialDeepSeekResponse(p, k, m, ctx, inst);
-        if (out && out.trim().length > 2) return out;
-      }
-      return null;
+      return getOfficialDeepSeekResponse(p, k, "deepseek-chat", ctx, inst);
     }
   };
   const grokProvider = {
@@ -2005,6 +2011,8 @@ User Message: ${prompt}`;
       try {
         if (p.name === "BluesMinds") {
           console.log("[text-ai] provider=blueminds");
+        } else if (p.name === "Official DeepSeek") {
+          console.log("[text-ai] trying_provider=official_deepseek");
         }
         const resRaw = await p.fn(
           prompt,
@@ -2013,7 +2021,6 @@ User Message: ${prompt}`;
           `${timeContext} ${systemPrompt} ${searchContext ? "\n\n" + searchContext : ""}`
         );
         if (resRaw && resRaw.trim().length > 2) {
-          if (p.name === "Official DeepSeek") console.log("[text-ai] official_deepseek_success=true");
           if (p.name === "Groq") {
             console.log("[text-ai] fallback_success=true");
           }
