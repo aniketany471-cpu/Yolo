@@ -1349,7 +1349,8 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
     }
     return null;
   }
-  const models = ["gemini-2.5-flash", "gemini-1.5-flash"];
+  const primaryModel = "gemini-2.5-flash";
+  const fallbackModel = "gemini-1.5-flash";
   const prompt = `Return ONLY valid minified JSON. Do not use markdown. Do not use explanations. Do not use conversational text. Do not speculate. Do not guess. Schema: {"query_type":"","subject":"","answer":"","confidence":0.0,"sources":[],"timestamp":"","verified":true}. Query: ${finalQuery}`;
   const extractJson = (txt) => {
     try { return JSON.parse(txt); } catch {}
@@ -1357,12 +1358,17 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
     if (s >= 0 && e > s) { try { return JSON.parse(txt.slice(s, e + 1)); } catch {} }
     return null;
   };
-  const runOnce = async (model, label) => {
-    console.log(`[grounding] ${label} attempt`);
-    const response = await Promise.race([
-      requestGemini({ source: "realtime_grounding", requestId, apiKey: geminiKey, model, contents: [{ role: "user", parts: [{ text: prompt }] }], config: { temperature: 0.1 }, attemptType: label === "fallback" ? "fallback" : "primary" }),
-      new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 20000))
-    ]);
+  const isRetriableGroundingError = (error) => {
+    const msg = (error?.message || String(error || "")).toLowerCase();
+    return msg.includes("429") || msg.includes("quota") || msg.includes("resource_exhausted") || msg.includes("rate limit") || msg.includes("too many requests") || msg.includes("overload") || msg.includes("timeout") || msg.includes("temporar") || msg.includes("unavailable") || /\b5\d\d\b/.test(msg);
+  };
+  const isQuotaLike = (error) => {
+    const msg = (error?.message || String(error || "")).toLowerCase();
+    return msg.includes("429") || msg.includes("quota") || msg.includes("resource_exhausted");
+  };
+  const runOnce = async (model, attemptType) => {
+    const response = await requestGemini({ source: "realtime_grounding", requestId, apiKey: geminiKey, model, contents: [{ role: "user", parts: [{ text: prompt }] }], config: { temperature: 0.1 }, attemptType });
+    if (!response) throw new Error("quota exhausted");
     const raw = (response?.text || "").trim();
     const data = extractJson(raw);
     if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error("invalid json");
@@ -1370,33 +1376,56 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
     const confOk = Number(data.confidence || 0) >= 0.5;
     const verifiedOk = data.verified === true;
     const sourcesOk = Array.isArray(data.sources) && data.sources.length > 0;
-    if (!(answerOk && confOk && verifiedOk && sourcesOk)) throw new Error("validation failed");
+    const validationPassed = !!(answerOk && confOk && verifiedOk && sourcesOk);
+    console.log(`[grounding] validation_passed=${validationPassed}`);
+    if (!validationPassed) throw new Error("validation failed");
     return data;
   };
+
+  let usedRequests = 0;
   try {
-    const data = await runOnce(models[0], "primary");
+    console.log(`[grounding] model=${primaryModel} attempt=1/2`);
+    usedRequests += 1;
+    const data = await runOnce(primaryModel, "primary");
     gs.cache.set(cacheKey, { value: data, expiresAt: Date.now() + cacheTtl });
+    console.log("[grounding] response_sent=true");
+    console.log(`[grounding] total_requests_used=${usedRequests}`);
     return data;
   } catch (e1) {
-    const m1 = (e1?.message || "").toLowerCase();
-    if (m1.includes("429") || m1.includes("quota") || m1.includes("resource_exhausted")) {
-      gs.cooldownUntil = Date.now() + 60000;
-      console.log("[gemini-search] quota cooldown started");
-      return null;
-    }
-    await new Promise(r => setTimeout(r, 4000));
+    if (!isRetriableGroundingError(e1)) return null;
+    console.log("[grounding] rotating_gemini_key");
+    console.log("[grounding] retrying_primary=true");
     try {
-      const data = await runOnce(models[1], "fallback");
+      console.log(`[grounding] model=${primaryModel} attempt=2/2`);
+      usedRequests += 1;
+      const data = await runOnce(primaryModel, "primary");
       gs.cache.set(cacheKey, { value: data, expiresAt: Date.now() + cacheTtl });
+      console.log("[grounding] response_sent=true");
+      console.log(`[grounding] total_requests_used=${usedRequests}`);
       return data;
     } catch (e2) {
-      const m2 = (e2?.message || "").toLowerCase();
-      if (m2.includes("429") || m2.includes("quota") || m2.includes("resource_exhausted")) {
-        gs.cooldownUntil = Date.now() + 60000;
-        console.log("[gemini-search] quota cooldown started");
+      if (!isRetriableGroundingError(e2)) return null;
+      console.log("[grounding] rotating_gemini_key");
+      console.log(`[grounding] switching_to_fallback=${fallbackModel}`);
+      try {
+        console.log("[grounding] fallback_attempt=1/1");
+        usedRequests += 1;
+        const data = await runOnce(fallbackModel, "fallback");
+        gs.cache.set(cacheKey, { value: data, expiresAt: Date.now() + cacheTtl });
+        console.log("[grounding] response_sent=true");
+        console.log(`[grounding] total_requests_used=${usedRequests}`);
+        return data;
+      } catch (e3) {
+        if (isRetriableGroundingError(e3)) console.log("[grounding] rotating_gemini_key");
+        if (isQuotaLike(e3)) {
+          gs.cooldownUntil = Date.now() + 60000;
+          console.log("[gemini-search] quota cooldown started");
+        }
+        console.log("[grounding] final failure");
+        console.log("[grounding] response_sent=false");
+        console.log(`[grounding] total_requests_used=${usedRequests}`);
+        return null;
       }
-      console.log("[grounding] final failure");
-      return null;
     }
   }
   })();
