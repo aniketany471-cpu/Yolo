@@ -1198,15 +1198,31 @@ function detectVisionAnalysisIntent(text) {
   return /\b(what is this|what's this|whats this|explain this|solve this|read this|read text|ocr|extract text|analy[sz]e this|caption this|describe this)\b/i.test(raw);
 }
 
-function detectImageGenerationIntent(text) {
+function classifyImageIntent(text) {
   const raw = String(text || "").trim();
-  if (!raw) return false;
   const lower = raw.toLowerCase();
-  const explicitImagePattern = /\b(generate image|create image|make image|draw|render|wallpaper|poster|artwork|illustration|concept art|redraw|edit image|transform image)\b/i;
-  const verbObjectPattern = /\b(generate|create|make|draw|design|paint|render|visualize|illustrate)\b[\s\S]{0,90}\b(image|photo|picture|pic|wallpaper|poster|artwork|illustration|portrait|scene|character)\b/i;
-  const longVisualPrompt = raw.length >= 70 &&
-    /\b(with|lighting|angle|background|composition|high detail|4k|8k|cinematic|realistic|photorealistic|ultra realistic|anime|render|depth of field)\b/i.test(lower);
-  return explicitImagePattern.test(raw) || verbObjectPattern.test(raw) || longVisualPrompt;
+
+  const imageSignals = [
+    { term: "wallpaper", score: 4 }, { term: "poster", score: 4 }, { term: "thumbnail", score: 4 }, { term: "logo", score: 4 },
+    { term: "generate image", score: 3 }, { term: "create image", score: 3 }, { term: "make image", score: 3 }, { term: "draw", score: 3 }, { term: "render", score: 3 },
+    { term: "realistic", score: 2 }, { term: "cinematic", score: 2 }, { term: "anime", score: 2 }, { term: "cyberpunk", score: 2 }, { term: "portrait", score: 2 }, { term: "artwork", score: 2 }, { term: "illustration", score: 2 },
+    { term: "photo", score: 1 }, { term: "background", score: 1 }, { term: "art", score: 1 }, { term: "scene", score: 1 }
+  ];
+  const securitySignals = [
+    { term: "system prompt", score: -20 }, { term: "reveal instructions", score: -20 }, { term: "protocol start", score: -20 }, { term: "internal review", score: -20 }, { term: "ignore previous instructions", score: -20 }, { term: "developer message", score: -20 },
+    { term: "meta evaluation", score: -15 }, { term: "alignment protocol", score: -15 }, { term: "hidden instructions", score: -15 }, { term: "jailbreak", score: -15 },
+    { term: "simulate", score: -10 }, { term: "dump instructions", score: -10 }, { term: "disclose prompt", score: -10 }
+  ];
+
+  let imageScore = 0;
+  let securityScore = 0;
+  for (const sig of imageSignals) if (lower.includes(sig.term)) imageScore += sig.score;
+  for (const sig of securitySignals) if (lower.includes(sig.term)) securityScore += sig.score;
+
+  const hasSecuritySignal = securityScore < 0;
+  const shouldGenerateImage = !hasSecuritySignal && imageScore >= 4;
+  const finalHandler = hasSecuritySignal ? "security_text" : (shouldGenerateImage ? "image_generation" : "text_or_other");
+  return { imageScore, securityScore, hasSecuritySignal, shouldGenerateImage, finalHandler };
 }
 
 function getKolkataNowParts() {
@@ -1787,8 +1803,11 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
   let searchContext = "";
   let realtimeSearchFailed = false;
   let trustedGroundedReply = "";
-  const imageGenerationIntent = detectImageGenerationIntent(prompt);
-  console.log(`[intent] detected=${imageGenerationIntent ? "image_generation" : "text_or_other"}`);
+  const imageIntent = classifyImageIntent(prompt);
+  console.log(`[intent] image_score=${imageIntent.imageScore}`);
+  console.log(`[intent] security_score=${imageIntent.securityScore}`);
+  console.log(`[intent] final_handler=${imageIntent.finalHandler}`);
+  const imageGenerationIntent = imageIntent.shouldGenerateImage;
   const skipRealtimeVerification = !!opts?.skipRealtimeVerification;
   if (skipRealtimeVerification) {
     console.log("[vision] skipping_realtime_verification=true");
@@ -3599,7 +3618,11 @@ async function startServer() {
           }
         }
 
-        const explicitGenerationRequest = detectImageGenerationIntent(text);
+        const userIntent = classifyImageIntent(text);
+        console.log(`[intent] image_score=${userIntent.imageScore}`);
+        console.log(`[intent] security_score=${userIntent.securityScore}`);
+        console.log(`[intent] final_handler=${userIntent.finalHandler}`);
+        const explicitGenerationRequest = userIntent.shouldGenerateImage;
         const visionAnalysisIntent = detectVisionAnalysisIntent(text);
         const generationBlockedForAnalysis = hasVisionImage && !explicitGenerationRequest;
         console.log(`[intent] image_present=${hasVisionImage}`);
@@ -3762,7 +3785,7 @@ async function startServer() {
         if (aiRes && client2) {
           // ── Image generation routing ─────────────────────────────────────
           // Strip any [IMAGE_GENERATION] tags the AI hallucinated without the user asking
-          const userActuallyWantsImage = detectImageGenerationIntent(text) && !hasVisionImage;
+          const userActuallyWantsImage = classifyImageIntent(text).shouldGenerateImage && !hasVisionImage;
           if (!userActuallyWantsImage && /\[IMAGE_GENERATION\]/i.test(aiRes)) {
             addLog(`[img] AI hallucinated [IMAGE_GENERATION] tag — user did not request an image. Stripping tag.`, "warn");
             aiRes = aiRes.replace(/\[IMAGE_GENERATION\][\s\S]*?\[\/IMAGE_GENERATION\]/gi, '').trim();
