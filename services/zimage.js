@@ -4,7 +4,6 @@
  * Fallback: Zimage Turbo
  */
 
-const OPENAI_GENERATE_URL = "https://api.openai.com/v1/images/generations";
 const ZIMAGE_GENERATE_URL = "https://zimageturbo.ai/api/generate";
 
 const PROVIDER_TIMEOUT_MS = 90_000;
@@ -55,8 +54,11 @@ async function downloadImageBuffer(url) {
 }
 
 async function openaiImage(prompt, options = {}) {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) throw new Error("OPENAI_API_KEY not set in environment");
+  const apiKey = process.env.BLUEMINDS_API_KEY;
+  if (!apiKey) throw new Error("BLUEMINDS_API_KEY not set in environment");
+  const baseUrl = (process.env.BLUEMINDS_BASE_URL || "").replace(/\/+$/, "");
+  if (!baseUrl) throw new Error("BLUEMINDS_BASE_URL not set in environment");
+  const imageGenerateUrl = `${baseUrl}/images/generations`;
 
   const body = {
     model: OPENAI_MODEL,
@@ -67,7 +69,7 @@ async function openaiImage(prompt, options = {}) {
   };
 
   const res = await fetchWithTimeout(
-    OPENAI_GENERATE_URL,
+    imageGenerateUrl,
     {
       method: "POST",
       headers: {
@@ -145,7 +147,12 @@ export async function generateImage(prompt, config = {}, options = {}) {
   void config; // kept for API compatibility with current call sites
   const errors = [];
 
-  console.log("[img] provider=openai");
+  const bmBaseUrl = (process.env.BLUEMINDS_BASE_URL || "").replace(/\/+$/, "");
+  console.log("[img] provider=blueminds");
+  console.log(`[img] base_url=${bmBaseUrl}`);
+  console.log("[img] endpoint=/images/generations");
+  console.log("[img] auth_source=BLUEMINDS_API_KEY");
+  console.log("[img] generation_started=true");
   console.log(`[img] model=${OPENAI_MODEL}`);
   console.log("[img] primary_generation_started=true");
 
