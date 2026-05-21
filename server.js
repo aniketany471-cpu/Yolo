@@ -3598,6 +3598,61 @@ async function startServer() {
             console.warn("[vision] failed to inspect replied media:", e.message || e);
           }
         }
+
+        const directImageIntent = detectImageGenerationIntent(text);
+        if (directImageIntent) {
+          addLog(`[img] intent=image_generation prompt="${text.slice(0, 60)}"`, "info");
+          console.log("[img] endpoint=/images/generations");
+
+          const IMAGE_LIMIT = 2;
+          const quotaRow = db.prepare(
+            "SELECT count FROM user_image_counts WHERE userId = ?"
+          ).get(senderId);
+          const usedCount = quotaRow?.count ?? 0;
+
+          if (usedCount >= IMAGE_LIMIT) {
+            const ownerInfo = (config.adminUsers || "").split(",").map(s => s.trim()).filter(Boolean)[0];
+            const ownerHint = ownerInfo ? ` Contact **${ownerInfo}** to get more.` : " Contact the bot owner to get more.";
+            await status.finish(
+              `🖼 You've used your **${IMAGE_LIMIT} free image generations**.\n\nYou've reached your limit.${ownerHint}`
+            );
+            addLog(`[img] Quota exceeded for ${senderId} (${usedCount}/${IMAGE_LIMIT})`, "warn");
+            return;
+          }
+
+          try {
+            await status.update(HS.image());
+            await new Promise((r) => setTimeout(r, 800));
+            await status.update(HS.imageRender());
+            if (!ziGenerateImage) throw new Error("Image service not loaded — check server logs");
+            const { buffer, provider } = await ziGenerateImage(text, config);
+            await status.update(HS.upload());
+            const caption = `🎨 **Generated Image**\n\`${text.slice(0, 120)}\`\n\n_${usedCount + 1}/${IMAGE_LIMIT} free generations used_`;
+            const tmpImgPath = path.join(tempDir, `img_${Date.now()}.jpg`);
+            await fs.writeFile(tmpImgPath, buffer);
+            try {
+              try { await client2.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch {}
+              await client2.sendFile(targetPeer, {
+                file: tmpImgPath,
+                caption,
+                parseMode: "markdown",
+                replyTo: message.id,
+                forceDocument: false
+              });
+              db.prepare(
+                "INSERT INTO user_image_counts (userId, count, resetAt) VALUES (?, 1, ?) ON CONFLICT(userId) DO UPDATE SET count = count + 1"
+              ).run(senderId, Date.now());
+              addLog(`[img] generation_success=true provider=${provider} (${usedCount + 1}/${IMAGE_LIMIT})`, "success");
+            } finally {
+              fs.remove(tmpImgPath).catch(() => {});
+            }
+          } catch (imgErr) {
+            console.error("[img] Image generation failed:", imgErr.message);
+            await status.finish(`❌ **Image generation failed:** ${imgErr.message.slice(0, 120)}`);
+          }
+          return;
+        }
+
         // Retry up to 3 times silently — never show an error to the user mid-retry
         let aiRes = null;
         for (let attempt = 1; attempt <= 3; attempt++) {
