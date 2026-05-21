@@ -1379,7 +1379,7 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
     const validationPassed = !!(answerOk && confOk && verifiedOk && sourcesOk);
     console.log(`[grounding] validation_passed=${validationPassed}`);
     if (!validationPassed) throw new Error("validation failed");
-    return data;
+    return { ...data, response_valid: true };
   };
 
   let usedRequests = 0;
@@ -1738,6 +1738,7 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
   }
   let searchContext = "";
   let realtimeSearchFailed = false;
+  let trustedGroundedReply = "";
   const skipRealtimeVerification = !!opts?.skipRealtimeVerification;
   if (skipRealtimeVerification) {
     console.log("[vision] skipping_realtime_verification=true");
@@ -1788,6 +1789,17 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
           '1. Rephrase only. Do not add new facts.\n' +
           '2. Do not infer missing scores/winners/dates/weather/news details.\n' +
           '3. If asked beyond facts above, say you could not verify more right now.';
+
+        const groundedAnswer = String(grounded.answer || "").trim();
+        const hasSearchResults = Array.isArray(grounded.sources) && grounded.sources.length > 0;
+        const responseValid = grounded.response_valid === true || grounded.verified === true;
+        const groundedResponseTrusted = hasSearchResults && responseValid && groundedAnswer.length > 0;
+        console.log(`[grounding] response_valid=${responseValid}`);
+        console.log(`[grounding] grounded_response_trusted=${groundedResponseTrusted}`);
+        if (groundedResponseTrusted) {
+          trustedGroundedReply = groundedAnswer;
+          realtimeSearchFailed = false;
+        }
       }
       const results = grounded ? "" : await performWebSearch(prompt, config, isDeep);
       const hasResults = results && results.trim().length > 30;
@@ -1881,6 +1893,11 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
   const finalPrompt = `${timeContext} ${systemPrompt} ${modelNudge} ${searchContext ? "\n\n" + searchContext : ""} 
 
 User Message: ${prompt}`;
+  if (trustedGroundedReply) {
+    console.log("[grounding] sending_grounded_reply=true");
+    return trustedGroundedReply;
+  }
+
   // ── Realtime query + search failed: bypass AI entirely — prevent training-data hallucination ──
   if (realtimeSearchFailed) {
     console.log("[AI bypass] Returning realtime verification failure message");
