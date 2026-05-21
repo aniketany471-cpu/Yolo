@@ -1994,25 +1994,26 @@ User Message: ${prompt}`;
       inst
     )
   };
-  if (config.aiProvider === "gemini") {
-    providers.push(geminiProvider, bluesmindsProvider, officialDeepSeekProvider, groqProvider, grokProvider, orProvider);
-  } else if (config.aiProvider === "groq") {
-    providers.push(groqProvider, bluesmindsProvider, officialDeepSeekProvider, geminiProvider, grokProvider, orProvider);
-  } else if (config.aiProvider === "bluesminds") {
-    providers.push(bluesmindsProvider, officialDeepSeekProvider, groqProvider, geminiProvider, grokProvider, orProvider);
-  } else if (config.aiProvider === "xai") {
-    providers.push(grokProvider, bluesmindsProvider, officialDeepSeekProvider, groqProvider, geminiProvider, orProvider);
-  } else {
-    providers.push(orProvider, bluesmindsProvider, officialDeepSeekProvider, groqProvider, geminiProvider, grokProvider);
-  }
+  // Runtime execution order (hard-enforced):
+  // 1) BluesMinds → 2) Official DeepSeek → 3) Groq → 4) Optional Gemini
+  // Additional providers are kept last as extra safety fallbacks.
+  providers.push(
+    bluesmindsProvider,
+    officialDeepSeekProvider,
+    groqProvider,
+    geminiProvider,
+    grokProvider,
+    orProvider
+  );
   let bmRetriableFailureDetected = false;
   for (const p of providers) {
+    if (p.name === "Official DeepSeek") {
+      console.log("[text-ai] trying_provider=official_deepseek");
+    }
     if (p.key && p.key !== "undefined" && p.key !== "null" && p.key.length > 5) {
       try {
         if (p.name === "BluesMinds") {
           console.log("[text-ai] provider=blueminds");
-        } else if (p.name === "Official DeepSeek") {
-          console.log("[text-ai] trying_provider=official_deepseek");
         }
         const resRaw = await p.fn(
           prompt,
@@ -2057,6 +2058,11 @@ User Message: ${prompt}`;
           console.log("[text-ai] switching_provider=groq");
         }
         console.error(`[AI] Exception in ${p.name}:`, err.message || err);
+      }
+    } else if (p.name === "Official DeepSeek") {
+      console.log("[text-ai] official_deepseek_error=missing_api_key");
+      if (bmRetriableFailureDetected) {
+        console.log("[text-ai] switching_provider=groq");
       }
     }
   }
