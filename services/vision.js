@@ -1,6 +1,13 @@
+import sharp from "sharp";
 import { requestGemini } from "./geminiManager.js";
 
 const RETRY_DELAYS_MS = [1500, 3000, 5000];
+const PRIMARY_MODEL = "gpt-5.5-2026-04-23";
+const GEMINI_PRIMARY_MODEL = "gemini-2.5-flash";
+const GEMINI_FALLBACK_MODEL = "gemini-1.5-flash-latest";
+const MAX_IMAGE_BYTES = 2_400_000;
+const MAX_IMAGE_DIMENSION = 1600;
+const MIN_MEANINGFUL_BYTES = 5_000;
 
 function extractImageFromMessage(message) {
   if (!message) return null;
@@ -66,7 +73,7 @@ function normalizeAndValidate(parsed) {
 }
 
 function buildVisionExtractionPrompt() {
-  return `Analyze this image and return ONLY valid raw JSON. Do not wrap in markdown. Do not explain. Do not use code blocks. Do not add extra text before or after JSON. Use exactly this schema: {"type":"","summary":"","visible_text":"","objects":[],"detected_context":"","confidence":0.0}. visible_text must include OCR text when present.`;
+  return `Analyze image. Return ONLY compact JSON schema: {"type":"","summary":"","visible_text":"","objects":[],"detected_context":"","confidence":0.0}. Include OCR text in visible_text.`;
 }
 
 function extractTextFromGeminiResponse(resp) {
@@ -74,10 +81,25 @@ function extractTextFromGeminiResponse(resp) {
   if (typeof resp?.text === "string" && resp.text.trim()) return resp.text;
   if (typeof resp?.outputText === "string" && resp.outputText.trim()) return resp.outputText;
   const candidate = resp?.candidates?.[0]?.content?.parts;
-  if (Array.isArray(candidate)) {
-    return candidate.map((p) => p?.text || "").join("\n").trim();
-  }
+  if (Array.isArray(candidate)) return candidate.map((p) => p?.text || "").join("\n").trim();
   return "";
+}
+
+function parseVisionText(rawText) {
+  const cleaned = stripCodeFences(rawText || "").trim();
+  if (!cleaned) throw new Error("malformed response");
+  let parsed = safeJsonParse(cleaned);
+  if (!parsed) {
+    const extracted = extractFirstJsonObject(cleaned);
+    if (extracted) parsed = safeJsonParse(extracted);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("malformed response");
+  const { result, valid } = normalizeAndValidate(parsed);
+  const responseValid = !!(valid && (result.visible_text || result.summary || result.detected_context));
+  console.log(`[vision] OCR_success=${!!result.visible_text}`);
+  console.log(`[vision] response_valid=${responseValid}`);
+  if (!responseValid) throw new Error("ocr validation failure");
+  return result;
 }
 
 function isRetriableVisionError(error) {
@@ -85,87 +107,91 @@ function isRetriableVisionError(error) {
   return msg.includes("429") || msg.includes("quota") || msg.includes("overload") || msg.includes("timeout") || msg.includes("temporary") || msg.includes("unavailable") || /\b5\d\d\b/.test(msg);
 }
 
+function shouldSkipPremiumVision({ mimeType, base64Data }) {
+  if (!mimeType?.startsWith("image/")) return true;
+  const bytes = Buffer.byteLength(base64Data || "", "base64");
+  if (bytes < MIN_MEANINGFUL_BYTES) return true;
+  if (mimeType.includes("webp") || mimeType.includes("gif")) return true;
+  return false;
+}
+
+async function optimizeImagePayload(imageBuffer, mimeType) {
+  let pipeline = sharp(imageBuffer, { failOn: "none" }).rotate();
+  const meta = await pipeline.metadata();
+  const tooWide = (meta.width || 0) > MAX_IMAGE_DIMENSION;
+  const tooTall = (meta.height || 0) > MAX_IMAGE_DIMENSION;
+  if (tooWide || tooTall) pipeline = pipeline.resize({ width: MAX_IMAGE_DIMENSION, height: MAX_IMAGE_DIMENSION, fit: "inside", withoutEnlargement: true });
+
+  let out = await pipeline.jpeg({ quality: 78, mozjpeg: true }).toBuffer();
+  if (out.length > MAX_IMAGE_BYTES) {
+    out = await sharp(out).jpeg({ quality: 60, mozjpeg: true }).toBuffer();
+  }
+  return { mimeType: "image/jpeg", base64Data: out.toString("base64") };
+}
+
 async function requestVisionWithGemini({ model, mimeType, base64Data, requestId, attemptType }) {
-  if (!base64Data || typeof base64Data !== "string") throw new Error("invalid image payload");
-  if (!mimeType || !mimeType.startsWith("image/")) throw new Error("unsupported media");
-
-  const contents = [
-    {
-      role: "user",
-      parts: [
-        { text: buildVisionExtractionPrompt() },
-        { inlineData: { mimeType, data: base64Data } }
-      ]
-    }
-  ];
-
   const resp = await requestGemini({
     source: "vision",
     requestId,
     model,
-    contents,
+    contents: [{ role: "user", parts: [{ text: buildVisionExtractionPrompt() }, { inlineData: { mimeType, data: base64Data } }] }],
     config: { temperature: 0.1 },
     attemptType
   });
 
   if (!resp) throw new Error("quota exceeded");
-  const text = extractTextFromGeminiResponse(resp);
-  if (!text) throw new Error("malformed response");
-  return { text };
+  return parseVisionText(extractTextFromGeminiResponse(resp));
+}
+
+async function requestVisionWithBluesMinds({ mimeType, base64Data }) {
+  const apiKey = process.env.BLUESMINDS_API_KEY || process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error("missing bluesminds/openai key");
+
+  const res = await fetch("https://api.bluesminds.com/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({
+      model: PRIMARY_MODEL,
+      max_tokens: 420,
+      temperature: 0,
+      messages: [{ role: "user", content: [{ type: "text", text: buildVisionExtractionPrompt() }, { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64Data}` } }] }]
+    })
+  });
+
+  if (!res.ok) throw new Error(`blueminds ${res.status}`);
+  const json = await res.json();
+  const text = json?.choices?.[0]?.message?.content || "";
+  return parseVisionText(typeof text === "string" ? text : JSON.stringify(text));
 }
 
 async function runVisionPipeline(mimeType, base64Data, requestId = "vision") {
-  const primaryModel = "gemini-2.5-flash";
-  const fallbackModel = "gemini-1.5-flash";
-  let lastReason = "unknown";
+  console.log("[vision] provider=blueminds");
+  console.log(`[vision] model=${PRIMARY_MODEL}`);
+  console.log("[vision] primary_vision_started=true");
+  console.log("[vision] image_analysis_started=true");
 
-  console.log("[vision] provider=gemini");
-  console.log("[vision] image_analysis_started");
+  try {
+    const result = await requestVisionWithBluesMinds({ mimeType, base64Data, requestId });
+    console.log("[vision] total_requests_used=1");
+    return result;
+  } catch (e) {
+    console.warn(`[vision] primary_failed=${(e?.message || "unknown").slice(0, 100)}`);
+  }
 
   const attempts = [
-    { model: primaryModel, index: 1, max: 2, attemptType: "primary" },
-    { model: primaryModel, index: 2, max: 2, attemptType: "primary" },
-    { model: fallbackModel, index: 1, max: 1, attemptType: "fallback" }
+    { model: GEMINI_PRIMARY_MODEL, index: 1, max: 2, attemptType: "primary", log: "gemini-2.5-flash" },
+    { model: GEMINI_PRIMARY_MODEL, index: 2, max: 2, attemptType: "primary", log: "gemini-2.5-flash" },
+    { model: GEMINI_FALLBACK_MODEL, index: 1, max: 1, attemptType: "fallback", log: "gemini-1.5-flash-latest" }
   ];
 
   for (let i = 0; i < attempts.length; i++) {
     const current = attempts[i];
     try {
-      if (current.attemptType === "primary") {
-        console.log(`[vision] model=${current.model} attempt=${current.index}/${current.max}`);
-        if (current.index === 2) console.log("[vision] retrying_primary=true");
-      } else {
-        console.log(`[vision] switching_to_fallback=${current.model}`);
-        console.log(`[vision] fallback_attempt=${current.index}/${current.max}`);
-      }
-
-      const resp = await requestVisionWithGemini({
-        model: current.model,
-        mimeType,
-        base64Data,
-        requestId,
-        attemptType: current.attemptType
-      });
-      const raw = (resp?.text || "");
-      const cleaned = stripCodeFences(raw).trim();
-      if (!cleaned) throw new Error("malformed response");
-      let parsed = safeJsonParse(cleaned);
-      if (!parsed) {
-        const extracted = extractFirstJsonObject(cleaned);
-        if (extracted) parsed = safeJsonParse(extracted);
-      }
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("malformed response");
-
-      const { result, valid } = normalizeAndValidate(parsed);
-      const responseValid = !!(valid && (result.visible_text || result.summary || result.detected_context));
-      console.log(`[vision] OCR_success=${!!result.visible_text}`);
-      console.log(`[vision] response_valid=${responseValid}`);
-      console.log(`[vision] total_requests_used=${i + 1}`);
-      if (!responseValid) throw new Error("ocr validation failure");
+      console.log(`[vision] switching_to_fallback=${current.log}`);
+      const result = await requestVisionWithGemini({ ...current, mimeType, base64Data, requestId });
+      console.log(`[vision] total_requests_used=${i + 2}`);
       return result;
     } catch (e) {
-      const msg = (e?.message || String(e)).toLowerCase();
-      lastReason = msg.slice(0, 120);
       const retriable = isRetriableVisionError(e);
       if (retriable) console.log("[vision] rotating_gemini_key");
       if (!retriable) break;
@@ -173,11 +199,11 @@ async function runVisionPipeline(mimeType, base64Data, requestId = "vision") {
     }
   }
 
-  console.warn(`[vision] final failure after retries reason=${lastReason}`);
+  console.log("[vision] switching_to_fallback=gpt-4o-mini");
   throw new Error("VISION_TEMPORARILY_BUSY");
 }
 
-export async function analyzeTelegramImageWithGemini(client, message, geminiApiKey, requestId = "vision") {
+export async function analyzeTelegramImageWithGemini(client, message, _geminiApiKey, requestId = "vision") {
   const imageRef = extractImageFromMessage(message);
   if (!imageRef) return null;
 
@@ -185,8 +211,15 @@ export async function analyzeTelegramImageWithGemini(client, message, geminiApiK
   const imageBuffer = await client.downloadMedia(imageRef.media, {});
   if (!imageBuffer || !Buffer.isBuffer(imageBuffer) || imageBuffer.length === 0) throw new Error("invalid image");
 
-  const mimeType = imageRef.media?.document?.mimeType || "image/jpeg";
-  const base64Data = imageBuffer.toString("base64");
+  let mimeType = imageRef.media?.document?.mimeType || "image/jpeg";
+  let base64Data = imageBuffer.toString("base64");
+
+  if (!shouldSkipPremiumVision({ mimeType, base64Data })) {
+    const optimized = await optimizeImagePayload(imageBuffer, mimeType);
+    mimeType = optimized.mimeType;
+    base64Data = optimized.base64Data;
+  }
+
   return await runVisionPipeline(mimeType, base64Data, requestId);
 }
 
