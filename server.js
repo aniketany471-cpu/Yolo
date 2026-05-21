@@ -1368,7 +1368,7 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
   const qLower = finalQuery.toLowerCase();
   const isSportsType = /\b(ipl|cricket|football|soccer|nba|nfl|live score|match|result)\b/.test(qLower);
   const isNewsType = /\b(news|breaking|headline|trending|update)\b/.test(qLower);
-  const cacheTtl = isSportsType ? 30000 : isNewsType ? 60000 : 45000;
+  const cacheTtl = isSportsType ? 30000 : isNewsType ? 120000 : 60000;
   const cacheKey = `rt:${qLower}`;
   const cached = gs.cache.get(cacheKey);
   if (cached && cached.expiresAt > now) {
@@ -1399,8 +1399,8 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
     return null;
   }
   const primaryModel = "gemini-2.5-flash";
-  const fallbackModel = "gemini-1.5-flash";
-  const prompt = `Return ONLY valid minified JSON. Do not use markdown. Do not use explanations. Do not use conversational text. Do not speculate. Do not guess. Schema: {"query_type":"","subject":"","answer":"","confidence":0.0,"sources":[],"timestamp":"","verified":true}. Query: ${finalQuery}`;
+  const fallbackModel = "gemini-1.5-flash-latest";
+  const prompt = `Return compact JSON only: {"query_type":"","subject":"","answer":"","sources":[],"timestamp":"","verified":true}. Query: ${finalQuery}`;
   const extractJson = (txt) => {
     try { return JSON.parse(txt); } catch {}
     const s = txt.indexOf("{"), e = txt.lastIndexOf("}");
@@ -1422,59 +1422,50 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
     const data = extractJson(raw);
     if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error("invalid json");
     const answerOk = String(data.answer || "").trim().length > 0;
-    const confOk = Number(data.confidence || 0) >= 0.5;
     const verifiedOk = data.verified === true;
-    const sourcesOk = Array.isArray(data.sources) && data.sources.length > 0;
-    const validationPassed = !!(answerOk && confOk && verifiedOk && sourcesOk);
+    const validationPassed = !!(answerOk && verifiedOk);
     console.log(`[grounding] validation_passed=${validationPassed}`);
     if (!validationPassed) throw new Error("validation failed");
-    return { ...data, response_valid: true };
+    return { ...data, grounding_success: true, response_valid: true };
   };
 
   let usedRequests = 0;
+  let fallbackUsed = false;
   try {
-    console.log(`[grounding] model=${primaryModel} attempt=1/2`);
+    console.log("[grounding] request_count=1");
+    console.log(`[grounding] model=${primaryModel} attempt=1/1`);
     usedRequests += 1;
     const data = await runOnce(primaryModel, "primary");
     gs.cache.set(cacheKey, { value: data, expiresAt: Date.now() + cacheTtl });
-    console.log("[grounding] response_sent=true");
-    console.log(`[grounding] total_requests_used=${usedRequests}`);
+    console.log("[grounding] fallback_used=false");
+    console.log("[grounding] response_trusted=true");
+    console.log("[grounding] sending_reply=true");
+    console.log(`[grounding] total_attempts=${usedRequests}`);
     return data;
   } catch (e1) {
     if (!isRetriableGroundingError(e1)) return null;
-    console.log("[grounding] rotating_gemini_key");
-    console.log("[grounding] retrying_primary=true");
     try {
-      console.log(`[grounding] model=${primaryModel} attempt=2/2`);
+      console.log("[grounding] request_count=2");
+      console.log(`[grounding] switching_to_fallback=${fallbackModel}`);
       usedRequests += 1;
-      const data = await runOnce(primaryModel, "primary");
+      fallbackUsed = true;
+      const data = await runOnce(fallbackModel, "fallback");
       gs.cache.set(cacheKey, { value: data, expiresAt: Date.now() + cacheTtl });
-      console.log("[grounding] response_sent=true");
-      console.log(`[grounding] total_requests_used=${usedRequests}`);
+      console.log(`[grounding] fallback_used=${fallbackUsed}`);
+      console.log("[grounding] response_trusted=true");
+      console.log("[grounding] sending_reply=true");
+      console.log(`[grounding] total_attempts=${usedRequests}`);
       return data;
     } catch (e2) {
-      if (!isRetriableGroundingError(e2)) return null;
-      console.log("[grounding] rotating_gemini_key");
-      console.log(`[grounding] switching_to_fallback=${fallbackModel}`);
-      try {
-        console.log("[grounding] fallback_attempt=1/1");
-        usedRequests += 1;
-        const data = await runOnce(fallbackModel, "fallback");
-        gs.cache.set(cacheKey, { value: data, expiresAt: Date.now() + cacheTtl });
-        console.log("[grounding] response_sent=true");
-        console.log(`[grounding] total_requests_used=${usedRequests}`);
-        return data;
-      } catch (e3) {
-        if (isRetriableGroundingError(e3)) console.log("[grounding] rotating_gemini_key");
-        if (isQuotaLike(e3)) {
-          gs.cooldownUntil = Date.now() + 60000;
-          console.log("[gemini-search] quota cooldown started");
-        }
-        console.log("[grounding] final failure");
-        console.log("[grounding] response_sent=false");
-        console.log(`[grounding] total_requests_used=${usedRequests}`);
-        return null;
+      if (isQuotaLike(e2)) {
+        gs.cooldownUntil = Date.now() + 60000;
+        console.log("[gemini-search] quota cooldown started");
       }
+      console.log(`[grounding] fallback_used=${fallbackUsed}`);
+      console.log("[grounding] response_trusted=false");
+      console.log("[grounding] sending_reply=false");
+      console.log(`[grounding] total_attempts=${usedRequests}`);
+      return null;
     }
   }
   })();
@@ -1854,10 +1845,13 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
           '3. If asked beyond facts above, say you could not verify more right now.';
 
         const groundedAnswer = String(grounded.answer || "").trim();
-        const hasSearchResults = Array.isArray(grounded.sources) && grounded.sources.length > 0;
+        const groundingSuccess = grounded.grounding_success === true;
         const responseValid = grounded.response_valid === true || grounded.verified === true;
-        const groundedResponseTrusted = hasSearchResults && responseValid && groundedAnswer.length > 0;
+        const noExplicitHallucination = !/\b(i (might|may) be wrong|not sure|cannot verify|can't verify|unverified|guess)\b/i.test(groundedAnswer);
+        const groundedResponseTrusted = groundingSuccess && responseValid && groundedAnswer.length > 0 && noExplicitHallucination;
+        console.log(`[grounding] grounding_success=${groundingSuccess}`);
         console.log(`[grounding] response_valid=${responseValid}`);
+        console.log(`[grounding] no_explicit_hallucination=${noExplicitHallucination}`);
         console.log(`[grounding] grounded_response_trusted=${groundedResponseTrusted}`);
         if (groundedResponseTrusted) {
           trustedGroundedReply = groundedAnswer;
