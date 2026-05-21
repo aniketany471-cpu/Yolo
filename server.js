@@ -149,6 +149,48 @@ process.on("unhandledRejection", (err) => {
   console.error("UNHANDLED: " + (err?.stack || err));
 });
 const db = new Database(path.join(__dirname, "bot_database.sqlite"));
+
+const DONNA_DB_PATH = path.join(__dirname, "donna.db");
+let donnaDb = null;
+let donnaSearchStmtByMode = { username: null, id: null };
+
+function initDonnaDb() {
+  if (donnaDb) return { ok: true };
+  if (!fs.existsSync(DONNA_DB_PATH)) {
+    return { ok: false, reason: "missing" };
+  }
+  try {
+    donnaDb = new Database(DONNA_DB_PATH, { readonly: true, fileMustExist: true });
+    donnaDb.pragma("journal_mode = WAL");
+    const table = donnaDb.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name LIMIT 1").get()?.name;
+    if (!table) return { ok: false, reason: "no_tables" };
+    const columns = donnaDb.prepare(`PRAGMA table_info(${table})`).all().map((r) => r.name);
+    const usernameCol = columns.find((c) => /^username$/i.test(c));
+    const idCol = columns.find((c) => /^(telegram_id|telegramid|tg_id|user_id|userid|id)$/i.test(c));
+    if (!usernameCol || !idCol) return { ok: false, reason: "bad_schema", table, columns };
+    try {
+      donnaDb.exec(`CREATE INDEX IF NOT EXISTS idx_${table}_${usernameCol} ON ${table}(${usernameCol});`);
+      donnaDb.exec(`CREATE INDEX IF NOT EXISTS idx_${table}_${idCol} ON ${table}(${idCol});`);
+    } catch (_) {}
+    donnaSearchStmtByMode.username = donnaDb.prepare(`SELECT * FROM ${table} WHERE ${usernameCol} = ? COLLATE NOCASE LIMIT 10`);
+    donnaSearchStmtByMode.id = donnaDb.prepare(`SELECT * FROM ${table} WHERE ${idCol} = ? LIMIT 10`);
+    return { ok: true, table, usernameCol, idCol };
+  } catch (e) {
+    return { ok: false, reason: "open_failed", error: e?.message || String(e) };
+  }
+}
+
+function formatInfoRows(rows) {
+  if (!rows || rows.length === 0) return "❌ No results found.";
+  const lines = ["🔎 **Search Results**"];
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    const keys = Object.keys(row).filter((k) => row[k] !== null && row[k] !== "").slice(0, 8);
+    const body = keys.map((k) => `• **${k}:** ${String(row[k]).slice(0, 120)}`).join("\n");
+    lines.push(`\n**#${i + 1}**\n${body || "(empty row)"}`);
+  }
+  return lines.join("\n");
+}
 db.pragma("journal_mode = WAL");
 db.exec(`
   CREATE TABLE IF NOT EXISTS messages (
@@ -237,6 +279,12 @@ db.exec(`
     userId TEXT PRIMARY KEY,
     count INTEGER DEFAULT 0,
     resetAt INTEGER DEFAULT 0
+  );
+
+  CREATE TABLE IF NOT EXISTS info_search_usage (
+    userId TEXT PRIMARY KEY,
+    count INTEGER DEFAULT 0,
+    updatedAt INTEGER
   );
 
   CREATE TABLE IF NOT EXISTS nsfw_logs (
@@ -4118,7 +4166,8 @@ async function startServer() {
             "summarize",
             "translate",
             "help",
-            "commands"
+            "commands",
+            "info"
           ].includes(cmdName);
           if (isPublicCommand) {
             if (!auth.allowed && !isMe) {
@@ -4300,6 +4349,42 @@ _Visit the dashboard for advanced configuration._`;
                   await handleTranslate(client, message, config2, status, args);
                 }
               );
+              return;
+            }
+            if (text.startsWith("/info") || text.startsWith(".info")) {
+              await CommandProcessor.process(client, message, config2, myId, "info", textRaw, async (status) => {
+                const sender = senderId || "";
+                if (!sender) return status.fail("Unable to identify user.");
+                const usage = db.prepare("SELECT count FROM info_search_usage WHERE userId = ?").get(sender);
+                if ((usage?.count || 0) >= 2) {
+                  return status.fail("🚫 Limit reached: you can use /info only 2 times.");
+                }
+                const args = textRaw.split(/\s+/).slice(1).join(" ").trim();
+                if (!args) return status.fail("Usage: /info <@username|telegram_id>");
+                if (/^\+\d{7,15}$/.test(args) || /phone/i.test(args)) {
+                  return status.fail("❌ Phone search is disabled. Use username or Telegram ID only.");
+                }
+                const init = initDonnaDb();
+                if (!init.ok) {
+                  return status.fail("⚠️ Database unavailable right now. Please try later.");
+                }
+                let mode = "username";
+                let term = args;
+                if (/^id:/i.test(args)) {
+                  mode = "id";
+                  term = args.replace(/^id:/i, "").trim();
+                } else if (/^@/.test(args)) {
+                  mode = "username";
+                  term = args.slice(1).trim();
+                } else if (/^\d{5,20}$/.test(args)) {
+                  mode = "id";
+                  term = args;
+                }
+                if (!term) return status.fail("Invalid query.");
+                const rows = donnaSearchStmtByMode[mode].all(term);
+                db.prepare("INSERT INTO info_search_usage (userId, count, updatedAt) VALUES (?, 1, ?) ON CONFLICT(userId) DO UPDATE SET count = count + 1, updatedAt = excluded.updatedAt").run(sender, Date.now());
+                await status.finish(formatInfoRows(rows));
+              });
               return;
             }
           }
