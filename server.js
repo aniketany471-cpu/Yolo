@@ -1913,10 +1913,18 @@ User Message: ${prompt}`;
     key: userGeminiK || systemGeminiK,
     fn: (p, k, ctx, inst) => getGeminiResponse(p, k, config.activeModel, ctx, inst, requestId)
   };
+  const groqModels = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"];
   const groqProvider = {
     name: "Groq",
     key: groqK,
-    fn: (p, k, ctx, inst) => getGroqResponse(p, k, config.activeModel, ctx, inst)
+    fn: async (p, k, ctx, inst) => {
+      for (const m of groqModels) {
+        console.log(`[text-ai] groq_model=${m}`);
+        const out = await getGroqResponse(p, k, m, ctx, inst);
+        if (out && out.trim().length > 2) return out;
+      }
+      return null;
+    }
   };
   const grokProvider = {
     name: "xAI/Grok",
@@ -1944,15 +1952,18 @@ User Message: ${prompt}`;
   } else if (config.aiProvider === "groq") {
     providers.push(groqProvider, bluesmindsProvider, geminiProvider, grokProvider, orProvider);
   } else if (config.aiProvider === "bluesminds") {
-    providers.push(bluesmindsProvider, geminiProvider, groqProvider, grokProvider, orProvider);
+    providers.push(bluesmindsProvider, groqProvider, geminiProvider, grokProvider, orProvider);
   } else if (config.aiProvider === "xai") {
-    providers.push(grokProvider, bluesmindsProvider, geminiProvider, groqProvider, orProvider);
+    providers.push(grokProvider, bluesmindsProvider, groqProvider, geminiProvider, orProvider);
   } else {
-    providers.push(orProvider, bluesmindsProvider, geminiProvider, groqProvider, grokProvider);
+    providers.push(orProvider, bluesmindsProvider, groqProvider, geminiProvider, grokProvider);
   }
   for (const p of providers) {
     if (p.key && p.key !== "undefined" && p.key !== "null" && p.key.length > 5) {
       try {
+        if (p.name === "BluesMinds") {
+          console.log("[text-ai] provider=blueminds");
+        }
         const resRaw = await p.fn(
           prompt,
           p.key,
@@ -1960,8 +1971,10 @@ User Message: ${prompt}`;
           `${timeContext} ${systemPrompt} ${searchContext ? "\n\n" + searchContext : ""}`
         );
         if (resRaw && resRaw.trim().length > 2) {
+          if (p.name === "Groq") {
+            console.log("[text-ai] fallback_success=true");
+          }
           const res = cleanAIResponse(resRaw, config);
-          // Don't save empty or sub-minimal responses to conversation memory
           if (!res || res.trim().length < 3) continue;
           if (memoryKey && config.conversationMemory === 1) {
             db.prepare(
@@ -1973,7 +1986,17 @@ User Message: ${prompt}`;
           }
           return res;
         }
+        if (p.name === "BluesMinds") {
+          console.log("[text-ai] provider_failure_detected=true");
+          console.log("[text-ai] switching_provider=groq");
+        }
       } catch (err) {
+        if (p.name === "BluesMinds") {
+          const em = (err?.message || String(err) || "").toLowerCase();
+          const bmRetriable = em.includes("503") || em.includes("model_not_found") || em.includes("no available channel") || em.includes("upstream unavailable") || em.includes("provider unavailable") || em.includes("timeout") || em.includes("connection");
+          console.log(`[text-ai] provider_failure_detected=${bmRetriable ? "true" : "false"}`);
+          if (bmRetriable) console.log("[text-ai] switching_provider=groq");
+        }
         console.error(`[AI] Exception in ${p.name}:`, err.message || err);
       }
     }
