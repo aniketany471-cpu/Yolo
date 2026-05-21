@@ -180,6 +180,46 @@ function initDonnaDb() {
   }
 }
 
+async function ensureDonnaDbReady() {
+  if (fs.existsSync(DONNA_DB_PATH)) {
+    const init = initDonnaDb();
+    if (init.ok) console.log("SQLite connected");
+    return init;
+  }
+  console.log("Downloading donna.db...");
+  try {
+    const sourceUrl = "https://t.me/DARU_BAAZ/3";
+    const embedUrl = "https://t.me/DARU_BAAZ/3?embed=1&mode=tme";
+    let fileUrl = sourceUrl;
+    // Telegram post URLs are HTML pages; resolve the real file URL first.
+    try {
+      const embedRes = await fetch(embedUrl, { redirect: "follow" });
+      if (embedRes.ok) {
+        const html = await embedRes.text();
+        const m = html.match(/href="([^"]*\/file\/[^"]*)"/i);
+        if (m?.[1]) {
+          fileUrl = m[1].startsWith("http") ? m[1] : `https://t.me${m[1]}`;
+        }
+      }
+    } catch (_) {}
+    const res = await fetch(fileUrl, { redirect: "follow" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const contentType = (res.headers.get("content-type") || "").toLowerCase();
+    if (contentType.includes("text/html")) {
+      throw new Error("resolved URL returned HTML instead of database file");
+    }
+    const buffer = Buffer.from(await res.arrayBuffer());
+    await fs.writeFile(DONNA_DB_PATH, buffer);
+    console.log("Database download complete");
+  } catch (e) {
+    console.warn(`[donna-db] Download failed: ${e?.message || String(e)}`);
+    return { ok: false, reason: "download_failed", error: e?.message || String(e) };
+  }
+  const init = initDonnaDb();
+  if (init.ok) console.log("SQLite connected");
+  return init;
+}
+
 function formatInfoRows(rows) {
   if (!rows || rows.length === 0) return "❌ No results found.";
   const lines = ["🔎 **Search Results**"];
@@ -4640,6 +4680,7 @@ ${mStr}`);
       isConnecting = false;
     }
   };
+  await ensureDonnaDbReady();
   loadTelethon().then(() => {
     addLog("Backend server initialized.", "info");
   });
