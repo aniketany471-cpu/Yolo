@@ -774,6 +774,28 @@ async function getGroqResponse(prompt, apiKey, model = "llama3-8b-8192", context
     return null;
   }
 }
+async function getOfficialDeepSeekResponse(prompt, apiKey, model = "deepseek-chat", context = [], systemInstruction) {
+  try {
+    const cleanKey = apiKey?.trim();
+    if (!cleanKey || cleanKey === "undefined" || cleanKey === "null") return null;
+    const finalModel = ["deepseek-chat", "deepseek-reasoner"].includes(model) ? model : "deepseek-chat";
+    const messages = normalizeContextMessages(prompt, context, systemInstruction);
+    const result = await fetchJsonWithRetry(
+      "https://api.deepseek.com/chat/completions",
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${cleanKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ model: finalModel, messages })
+      },
+      { provider: "Official DeepSeek", model: finalModel, endpoint: "/chat/completions" }
+    );
+    if (!result.ok) return null;
+    return result.data?.choices?.[0]?.message?.content?.trim() || null;
+  } catch (e) {
+    console.error("[Official DeepSeek] Fetch Error:", e?.message || e);
+    return null;
+  }
+}
 async function getGrokResponse(prompt, apiKey, model = "grok-4", context = [], systemInstruction) {
   try {
     const cleanKey = apiKey?.trim();
@@ -1535,6 +1557,14 @@ async function generateImage(prompt, apiKey, model = "flux") {
   }
 }
 async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = false, forceDeep = false, senderUsername = null, requestId = "chat", opts = {}) {
+  const bmFailureHints = ["503", "model_not_found", "no available channel", "upstream unavailable", "provider unavailable", "timeout", "connection"];
+  const bmNoFallbackHints = ["invalid prompt", "blocked content", "malformed payload", "validation failed", "validation error"];
+  const shouldFallbackFromBmMessage = (msg) => {
+    const m = (msg || "").toLowerCase();
+    if (!m) return false;
+    if (bmNoFallbackHints.some((h) => m.includes(h))) return false;
+    return bmFailureHints.some((h) => m.includes(h));
+  };
   const userGeminiK = (config.geminiKey || "").trim();
   const systemGeminiK = (getGeminiPrimaryKey() || "").trim();
   const groqK = (config.groqKey || "").trim();
@@ -1926,6 +1956,17 @@ User Message: ${prompt}`;
       return null;
     }
   };
+  const officialDeepSeekProvider = {
+    name: "Official DeepSeek",
+    key: (process.env.DEEPSEEK_API_KEY || "").trim(),
+    fn: async (p, k, ctx, inst) => {
+      for (const m of ["deepseek-chat", "deepseek-reasoner"]) {
+        const out = await getOfficialDeepSeekResponse(p, k, m, ctx, inst);
+        if (out && out.trim().length > 2) return out;
+      }
+      return null;
+    }
+  };
   const grokProvider = {
     name: "xAI/Grok",
     key: config.xaiKey,
@@ -1948,16 +1989,17 @@ User Message: ${prompt}`;
     )
   };
   if (config.aiProvider === "gemini") {
-    providers.push(geminiProvider, bluesmindsProvider, groqProvider, grokProvider, orProvider);
+    providers.push(geminiProvider, bluesmindsProvider, officialDeepSeekProvider, groqProvider, grokProvider, orProvider);
   } else if (config.aiProvider === "groq") {
-    providers.push(groqProvider, bluesmindsProvider, geminiProvider, grokProvider, orProvider);
+    providers.push(groqProvider, bluesmindsProvider, officialDeepSeekProvider, geminiProvider, grokProvider, orProvider);
   } else if (config.aiProvider === "bluesminds") {
-    providers.push(bluesmindsProvider, groqProvider, geminiProvider, grokProvider, orProvider);
+    providers.push(bluesmindsProvider, officialDeepSeekProvider, groqProvider, geminiProvider, grokProvider, orProvider);
   } else if (config.aiProvider === "xai") {
-    providers.push(grokProvider, bluesmindsProvider, groqProvider, geminiProvider, orProvider);
+    providers.push(grokProvider, bluesmindsProvider, officialDeepSeekProvider, groqProvider, geminiProvider, orProvider);
   } else {
-    providers.push(orProvider, bluesmindsProvider, groqProvider, geminiProvider, grokProvider);
+    providers.push(orProvider, bluesmindsProvider, officialDeepSeekProvider, groqProvider, geminiProvider, grokProvider);
   }
+  let bmRetriableFailureDetected = false;
   for (const p of providers) {
     if (p.key && p.key !== "undefined" && p.key !== "null" && p.key.length > 5) {
       try {
@@ -1971,6 +2013,7 @@ User Message: ${prompt}`;
           `${timeContext} ${systemPrompt} ${searchContext ? "\n\n" + searchContext : ""}`
         );
         if (resRaw && resRaw.trim().length > 2) {
+          if (p.name === "Official DeepSeek") console.log("[text-ai] official_deepseek_success=true");
           if (p.name === "Groq") {
             console.log("[text-ai] fallback_success=true");
           }
@@ -1987,15 +2030,24 @@ User Message: ${prompt}`;
           return res;
         }
         if (p.name === "BluesMinds") {
+          bmRetriableFailureDetected = true;
           console.log("[text-ai] provider_failure_detected=true");
+          console.log("[text-ai] switching_provider=official_deepseek");
+        }
+        if (p.name === "Official DeepSeek" && bmRetriableFailureDetected) {
           console.log("[text-ai] switching_provider=groq");
         }
       } catch (err) {
         if (p.name === "BluesMinds") {
           const em = (err?.message || String(err) || "").toLowerCase();
-          const bmRetriable = em.includes("503") || em.includes("model_not_found") || em.includes("no available channel") || em.includes("upstream unavailable") || em.includes("provider unavailable") || em.includes("timeout") || em.includes("connection");
+          const bmRetriable = shouldFallbackFromBmMessage(em);
           console.log(`[text-ai] provider_failure_detected=${bmRetriable ? "true" : "false"}`);
-          if (bmRetriable) console.log("[text-ai] switching_provider=groq");
+          bmRetriableFailureDetected = bmRetriable;
+          if (bmRetriable) console.log("[text-ai] switching_provider=official_deepseek");
+          else return null;
+        }
+        if (p.name === "Official DeepSeek" && bmRetriableFailureDetected) {
+          console.log("[text-ai] switching_provider=groq");
         }
         console.error(`[AI] Exception in ${p.name}:`, err.message || err);
       }
