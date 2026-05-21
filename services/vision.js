@@ -91,21 +91,30 @@ function extractTextFromOpenAICompatibleResponse(resp) {
     if (!content) return "";
     if (typeof content === "string") return content.trim();
     if (Array.isArray(content)) {
-      return content
-        .map((item) => {
-          if (!item) return "";
-          if (typeof item === "string") return item;
-          if (typeof item?.text === "string") return item.text;
-          if (typeof item?.content === "string") return item.content;
-          if (typeof item?.value === "string") return item.value;
-          return "";
-        })
-        .filter(Boolean)
-        .join("\n")
-        .trim();
+      const chunks = [];
+      for (const item of content) {
+        const blockType = typeof item === "object" ? item?.type || "object" : typeof item;
+        console.log(`[vision] content_block_type=${blockType}`);
+
+        let chunk = "";
+        if (typeof item === "string") chunk = item;
+        else if (item && typeof item === "object") {
+          if (typeof item?.text === "string") chunk = item.text;
+          else if (typeof item?.content === "string") chunk = item.content;
+          else if (typeof item?.output_text === "string") chunk = item.output_text;
+          else if (typeof item?.value === "string") chunk = item.value;
+        }
+
+        const normalizedChunk = String(chunk || "").trim();
+        console.log(`[vision] extracted_chunk=${normalizedChunk.slice(0, 200)}`);
+        if (normalizedChunk) chunks.push(normalizedChunk);
+      }
+      return chunks.join("\n").trim();
     }
     if (typeof content === "object") {
       if (typeof content?.text === "string") return content.text.trim();
+      if (typeof content?.content === "string") return content.content.trim();
+      if (typeof content?.output_text === "string") return content.output_text.trim();
       if (typeof content?.value === "string") return content.value.trim();
     }
     return "";
