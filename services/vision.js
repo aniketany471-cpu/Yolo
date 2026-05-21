@@ -85,6 +85,49 @@ function extractTextFromGeminiResponse(resp) {
   return "";
 }
 
+
+function extractTextFromOpenAICompatibleResponse(resp) {
+  const contentToText = (content) => {
+    if (!content) return "";
+    if (typeof content === "string") return content.trim();
+    if (Array.isArray(content)) {
+      return content
+        .map((item) => {
+          if (!item) return "";
+          if (typeof item === "string") return item;
+          if (typeof item?.text === "string") return item.text;
+          if (typeof item?.content === "string") return item.content;
+          if (typeof item?.value === "string") return item.value;
+          return "";
+        })
+        .filter(Boolean)
+        .join("\n")
+        .trim();
+    }
+    if (typeof content === "object") {
+      if (typeof content?.text === "string") return content.text.trim();
+      if (typeof content?.value === "string") return content.value.trim();
+    }
+    return "";
+  };
+
+  if (!resp || typeof resp !== "object") return "";
+  const choice0 = resp?.choices?.[0] || null;
+
+  const candidates = [
+    choice0?.message?.content,
+    choice0?.content,
+    resp?.output_text,
+    resp?.outputText
+  ];
+
+  for (const candidate of candidates) {
+    const text = contentToText(candidate);
+    if (text) return text;
+  }
+
+  return "";
+}
 function parseVisionText(rawText) {
   const cleaned = stripCodeFences(rawText || "").trim();
   if (!cleaned) throw new Error("malformed response");
@@ -160,8 +203,17 @@ async function requestVisionWithBluesMinds({ mimeType, base64Data }) {
 
   if (!res.ok) throw new Error(`blueminds ${res.status}`);
   const json = await res.json();
-  const text = json?.choices?.[0]?.message?.content || "";
-  return parseVisionText(typeof text === "string" ? text : JSON.stringify(text));
+  const rawType = Array.isArray(json?.choices) ? "choices" : typeof json;
+  console.log(`[vision] raw_response_type=${rawType}`);
+
+  const normalized = extractTextFromOpenAICompatibleResponse(json);
+  const malformed = !normalized;
+  console.log("[vision] normalized_response=true");
+  console.log(`[vision] extracted_text_length=${normalized.length}`);
+  console.log(`[vision] malformed_response=${malformed}`);
+  if (malformed) throw new Error("malformed response");
+
+  return parseVisionText(normalized);
 }
 
 async function runVisionPipeline(mimeType, base64Data, requestId = "vision") {
