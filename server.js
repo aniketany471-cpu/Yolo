@@ -1192,6 +1192,17 @@ function isRealtimeQuery(query) {
   return /\b(live|today|tonight|right now|this week|current|latest|breaking|just now|happening|trending|score[s]?|result[s]?|match|winner|champion|ipl|cricket|t20|odi|football|soccer|nba|nfl|f1|grand\s*prix|motogp|tennis|wimbledon|us\s*open|french\s*open|australian\s*open|atp|wta|boxing|ufc|mma|knockout|hockey|nhl|badminton|bwf|golf|pga|masters|rugby|six\s*nations|kabaddi|pkl|wwe|olympics|athletics|prix|price[s]?|crypto|bitcoin|btc|eth|stock|nifty|sensex|share\s*price|weather|temp(erature)?|forecast|news|election|who\s*won|what\s*happened|did\s*.{0,20}\s*win|update[s]?)\b/i.test(q);
 }
 
+function detectImageGenerationIntent(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return false;
+  const lower = raw.toLowerCase();
+  const explicitImagePattern = /\b(generate|create|make|draw|artwork|wallpaper|poster|render|illustration|anime style|cinematic scene|ultra realistic|image|photo|picture|pic|visualize|concept art)\b/i;
+  const verbObjectPattern = /\b(generate|create|make|draw|design|paint|render|visualize|illustrate)\b[\s\S]{0,90}\b(image|photo|picture|pic|wallpaper|poster|artwork|illustration|portrait|scene|character)\b/i;
+  const longVisualPrompt = raw.length >= 70 &&
+    /\b(with|lighting|angle|background|composition|high detail|4k|8k|cinematic|realistic|photorealistic|ultra realistic|anime|render|depth of field)\b/i.test(lower);
+  return explicitImagePattern.test(raw) || verbObjectPattern.test(raw) || longVisualPrompt;
+}
+
 function getKolkataNowParts() {
   const fmt = new Intl.DateTimeFormat("en-CA", {
     timeZone: "Asia/Kolkata",
@@ -1779,11 +1790,17 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
   let searchContext = "";
   let realtimeSearchFailed = false;
   let trustedGroundedReply = "";
+  const imageGenerationIntent = detectImageGenerationIntent(prompt);
+  console.log(`[intent] detected=${imageGenerationIntent ? "image_generation" : "text_or_other"}`);
   const skipRealtimeVerification = !!opts?.skipRealtimeVerification;
   if (skipRealtimeVerification) {
     console.log("[vision] skipping_realtime_verification=true");
   }
-  if (!skipRealtimeVerification && config.searchEnabled === 1) {
+  if (imageGenerationIntent) {
+    console.log("[intent] skipping_realtime=true");
+    console.log("[intent] skipping_serper=true");
+    console.log("[img] generation_started=true");
+  } else if (!skipRealtimeVerification && config.searchEnabled === 1) {
     // Gate 1: never search casual/short messages — saves API quota and avoids false triggers
     const promptTrimmed = prompt.trim();
     const isCasualMessage =
