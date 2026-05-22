@@ -1420,17 +1420,30 @@ function resolveRealtimeContext(query) {
 }
 
 function detectSportsIntent(query) {
-  const q = (query || "").toLowerCase();
-  const sportsKeywords = /\b(ipl|cricket|football|soccer|nba|nfl|match|matches|score|scores|won|winner|playing|result|live|standings|points\s+table|current|now|today|yesterday)\b/;
-  return sportsKeywords.test(q);
-}
+  const q = String(query || "").toLowerCase();
 
-function detectSportsLiveIntent(query) {
-  const q = (query || "").toLowerCase();
-  const sportsContext = /\b(ipl|cricket|football|soccer|nba|nfl|match|league|tournament|standings|points\s+table)\b/;
-  const sportsLiveKeywords = /\b(live|score|playing|today|yesterday|match|won|current|now|standings|points\s+table)\b/;
-  const winnerPattern = /\bwho\s+won\b|\bwon\s+yesterday\b/;
-  return (sportsContext.test(q) && sportsLiveKeywords.test(q)) || winnerPattern.test(q);
+  // RESULT INTENT
+  if (
+    /who won|winner|won today|won yesterday|today winner|yesterday winner|match result|race result|result|beat|defeated|last race|last match|previous race|previous match/i.test(q)
+  ) {
+    return "sports_result";
+  }
+
+  // LIVE INTENT
+  if (
+    /live|score|scorecard|runs|wickets|live score/i.test(q)
+  ) {
+    return "sports_live";
+  }
+
+  // SCHEDULE INTENT
+  if (
+    /playing today|matches today|fixture|schedule|next match/i.test(q)
+  ) {
+    return "sports_schedule";
+  }
+
+  return "sports_general";
 }
 
 function sanitizeSportsLiveQuery(q) {
@@ -1659,9 +1672,10 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
   console.log(`[IST DATE] ${nowIST.toISOString()}`);
   let finalQuery = rtc.rewrittenQuery || query;
   const sportsIntent = detectSportsIntent(rawQuery);
-  const sportsLiveIntent = detectSportsLiveIntent(rawQuery);
-  if (sportsIntent) {
+  const sportsLiveIntent = sportsIntent === "sports_live";
+  if (sportsIntent !== "sports_general") {
     console.log(`[SPORTS INTENT] raw="${rawQuery}"`);
+    console.log(`[SPORTS INTENT TYPE] ${sportsIntent}`);
     console.log(`[SPORTS LIVE INTENT] ${sportsLiveIntent}`);
     const sportsQuery = buildSportsGroundingQuery(rawQuery, finalQuery, temporalContext);
     console.log(`[SPORTS QUERY TEMPLATE] "${sportsQuery}"`);
