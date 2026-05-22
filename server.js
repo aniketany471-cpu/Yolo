@@ -1588,9 +1588,11 @@ async function performWebSearch(query, config, deep = false) {
       console.log(`[search] Gemini grounding (type=${type}): "${groundingInput.slice(0, 70)}"`);
       let result = await geminiGroundedSearch(groundingInput, geminiKey, type, { bypassCache: isSports, queryType: 'realtime' });
       if (result && result.trim().length > 30) {
-        // For sports: verify actual score pattern exists so we don't pass a "no match" summary
-        if (isSports && !hasActualScoreData(result)) {
-          // Gemini said no live match — still return it so Donna can relay that honestly
+        // For live-score sports queries: if no score pattern found and Gemini says "no live", relay honestly.
+        // For result/schedule queries: never suppress the answer based on "no live" phrases —
+        // those queries ask about completed matches, which naturally don't have live data.
+        const isSportsLiveQuery = isSports && /\blive\b|\bscore\b|\bscores\b|\blive score\b/i.test(query) && !/\bwho won\b|\bresult\b|\bwinner\b|\blast race\b|\blast match\b/i.test(query);
+        if (isSportsLiveQuery && !hasActualScoreData(result)) {
           if (result.toLowerCase().includes('no live') || result.toLowerCase().includes('no match') || result.toLowerCase().includes('not live')) {
             console.log('[search] Gemini: no live match right now — returning as-is');
             return result;
@@ -1720,7 +1722,14 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
   }
   const primaryModel = "gemini-2.5-flash";
   const fallbackModel = "gemini-1.5-flash";
-  const prompt = `Realtime query: ${finalQuery}`;
+  const intentHint = sportsLiveIntent
+    ? 'LIVE MATCH QUERY: Search for the CURRENTLY IN-PROGRESS match. Return live scores, current innings, wickets, overs, and which team is batting now. Do NOT return completed results from previous matches.'
+    : sportsIntent === 'sports_result'
+    ? 'COMPLETED RESULT QUERY: Search for the MOST RECENTLY COMPLETED match result. Return the winner, final score, date, and key highlights. Do NOT confuse with live or upcoming matches. Do NOT return data from previous seasons.'
+    : sportsIntent === 'sports_schedule'
+    ? 'SCHEDULE QUERY: Search for today\'s match schedule and upcoming fixtures. Return match times, teams, and venues.'
+    : '';
+  const prompt = intentHint ? `${intentHint}\n\nRealtime query: ${finalQuery}` : `Realtime query: ${finalQuery}`;
   const retryPrefix = "IMPORTANT: Search the live web before answering. Do not rely on internal memory.";
   const extractJson = (txt) => {
     try { return JSON.parse(txt); } catch {}
@@ -1753,7 +1762,11 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
     const data = extractJson(raw);
     if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error("invalid json");
     const citations = extractGroundingCitations(data, response);
-    const answerText = normalizeNoLiveIplResponse(data.answer, rawQuery);
+    // Only normalize "no live matches" phrasing when the user explicitly asked for live scores.
+    // Never apply it to result or schedule queries — it would erase correct completed-match answers.
+    const answerText = sportsLiveIntent
+      ? normalizeNoLiveIplResponse(data.answer, rawQuery)
+      : String(data.answer || "").trim();
     data.answer = answerText;
     console.log(`[GROUNDING DATA SOURCE] ${citations.length ? citations.join(" | ") : "none"}`);
     const groundingMetadata = response?.candidates?.[0]?.groundingMetadata;
@@ -2242,7 +2255,12 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
           const sourceBlock = cleanSources.length
             ? `\n\nSources:\n${cleanSources.map((s, i) => `${i + 1}. ${s}`).join("\n")}`
             : "";
-          trustedGroundedReply = normalizeNoLiveIplResponse(groundedAnswer, rawUserMessage) + sourceBlock;
+          // Only apply live-match normalization when the user is asking for live scores,
+          // never when asking for results or schedule — it would destroy correct answers.
+          const isLiveScoreQuery = /\blive\b|\blive score\b|\bscore now\b/i.test(rawUserMessage) && !/\bwho won\b|\bresult\b|\bwinner\b|\blast race\b|\blast match\b/i.test(rawUserMessage);
+          trustedGroundedReply = isLiveScoreQuery
+            ? normalizeNoLiveIplResponse(groundedAnswer, rawUserMessage) + sourceBlock
+            : (groundedAnswer || '') + sourceBlock;
           console.log(`[DYNAMIC SPORTS RESPONSE] ${/\bipl|cricket|match|score\b/i.test(rawUserMessage) ? "enabled" : "not_applicable"}`);
           realtimeSearchFailed = false;
         } else if (isRealtimeQuery) {
@@ -2350,8 +2368,12 @@ User Message: ${prompt}`;
   if (realtimeSearchFailed) {
     console.log("[AI bypass] Returning realtime verification failure message");
     if (/\bipl\b/i.test(rawUserMessage)) {
-      console.log("[DYNAMIC SPORTS RESPONSE] no_live_ipl_fallback");
-      return "There are currently no live IPL matches happening right now.";
+      const isResultQuery = /\bwho won\b|\bresult\b|\bwinner\b|\byesterday\b|\blast match\b/i.test(rawUserMessage);
+      const isLiveQuery   = /\blive\b|\bscore\b|\bscores\b/i.test(rawUserMessage);
+      console.log("[DYNAMIC SPORTS RESPONSE] ipl_fallback");
+      if (isResultQuery) return "I couldn't fetch the latest IPL result right now. Please check Cricbuzz or ESPNcricinfo for the latest match result.";
+      if (isLiveQuery)   return "There are currently no live IPL matches happening right now.";
+      return "I couldn't fetch the latest IPL data right now. Please check Cricbuzz or ESPNcricinfo for live scores and results.";
     }
     return "I couldn't verify live realtime information.";
   }
