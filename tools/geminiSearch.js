@@ -31,7 +31,7 @@ function setCache(q, t, r) {
 }
 
 // ── Global cooldown ───────────────────────────────────────────────────────────
-const COOLDOWN_MS = 10_000;
+const COOLDOWN_MS = 2_000;
 let lastCallAt = 0;
 function onCooldown() { return (Date.now() - lastCallAt) < COOLDOWN_MS; }
 
