@@ -183,25 +183,29 @@ function initDonnaDb() {
 async function ensureDonnaDbReady() {
   if (fs.existsSync(DONNA_DB_PATH)) {
     const init = initDonnaDb();
-    if (init.ok) console.log("SQLite connected");
+    if (init.ok) console.log("[DB] SQLite connected");
     return init;
   }
-  console.log("Downloading donna.db...");
+  console.log("[DB] Downloading database...");
   try {
-    const sourceUrl = "https://t.me/DARU_BAAZ/3";
-    const embedUrl = "https://t.me/DARU_BAAZ/3?embed=1&mode=tme";
-    let fileUrl = sourceUrl;
-    // Telegram post URLs are HTML pages; resolve the real file URL first.
-    try {
-      const embedRes = await fetch(embedUrl, { redirect: "follow" });
-      if (embedRes.ok) {
-        const html = await embedRes.text();
-        const m = html.match(/href="([^"]*\/file\/[^"]*)"/i);
-        if (m?.[1]) {
-          fileUrl = m[1].startsWith("http") ? m[1] : `https://t.me${m[1]}`;
-        }
-      }
-    } catch (_) {}
+    const goFilePageUrl = "https://gofile.io/d/5N0nN6";
+    const idMatch = goFilePageUrl.match(/gofile\.io\/d\/([a-zA-Z0-9_-]+)/i);
+    const contentId = idMatch?.[1];
+    if (!contentId) throw new Error("invalid GoFile URL: missing content id");
+
+    const apiUrl = `https://api.gofile.io/contents/${encodeURIComponent(contentId)}?wt=4fd6sg89d7s6`;
+    const apiRes = await fetch(apiUrl, { redirect: "follow" });
+    if (!apiRes.ok) throw new Error(`GoFile API HTTP ${apiRes.status}`);
+    const payload = await apiRes.json();
+    const contents = payload?.data?.contents;
+    if (!contents || typeof contents !== "object") {
+      throw new Error("GoFile API returned no downloadable contents");
+    }
+    const files = Object.values(contents).filter((entry) => entry?.type === "file" && typeof entry?.link === "string");
+    if (files.length === 0) throw new Error("GoFile API contains no files");
+    const preferred = files.find((f) => typeof f?.name === "string" && f.name.toLowerCase().endsWith(".db")) || files[0];
+    const fileUrl = preferred.link;
+
     const res = await fetch(fileUrl, { redirect: "follow" });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const contentType = (res.headers.get("content-type") || "").toLowerCase();
@@ -210,13 +214,13 @@ async function ensureDonnaDbReady() {
     }
     const buffer = Buffer.from(await res.arrayBuffer());
     await fs.writeFile(DONNA_DB_PATH, buffer);
-    console.log("Database download complete");
+    console.log("[DB] Download complete");
   } catch (e) {
     console.warn(`[donna-db] Download failed: ${e?.message || String(e)}`);
     return { ok: false, reason: "download_failed", error: e?.message || String(e) };
   }
   const init = initDonnaDb();
-  if (init.ok) console.log("SQLite connected");
+  if (init.ok) console.log("[DB] SQLite connected");
   return init;
 }
 
