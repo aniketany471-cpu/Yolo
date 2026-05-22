@@ -1421,9 +1421,48 @@ function resolveRealtimeContext(query) {
 
 function detectSportsIntent(query) {
   const q = (query || "").toLowerCase();
-  const sportsKeywords = /\b(ipl|cricket|football|soccer|nba|nfl|match|matches|score|scores|won|winner|playing|result|live)\b/;
-  const liveIntentKeywords = /\b(live|score|scores|won|winner|playing|today|yesterday|match|result)\b/;
-  return sportsKeywords.test(q) || liveIntentKeywords.test(q);
+  const sportsKeywords = /\b(ipl|cricket|football|soccer|nba|nfl|match|matches|score|scores|won|winner|playing|result|live|standings|points\s+table|current|now|today|yesterday)\b/;
+  return sportsKeywords.test(q);
+}
+
+function detectSportsLiveIntent(query) {
+  const q = (query || "").toLowerCase();
+  const sportsContext = /\b(ipl|cricket|football|soccer|nba|nfl|match|league|tournament|standings|points\s+table)\b/;
+  const sportsLiveKeywords = /\b(live|score|playing|today|yesterday|match|won|current|now|standings|points\s+table)\b/;
+  const winnerPattern = /\bwho\s+won\b|\bwon\s+yesterday\b/;
+  return (sportsContext.test(q) && sportsLiveKeywords.test(q)) || winnerPattern.test(q);
+}
+
+function sanitizeSportsLiveQuery(q) {
+  return String(q || "")
+    .replace(/\b(schedule\s+release|release\s+date|future\s+season|announcement|announced|upcoming\s+tournament|not\s+started\s+yet)\b/ig, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+function buildSportsLiveSearchQueries(rawQuery, sportName = "Sports") {
+  const q = String(rawQuery || "").toLowerCase();
+  if (/\blive\b/.test(q) && /\b(score|scores)\b/.test(q)) {
+    return [
+      `${sportName} live score today`,
+      `${sportName} current match score`
+    ];
+  }
+  if (/\bwho\s+won\s+yesterday\b|\bwon\s+yesterday\b|\byesterday\b/.test(q)) {
+    return [`${sportName} yesterday match winner`];
+  }
+  if (/\bwho\s+(is|are)\s+playing\s+today\b|\bplaying\s+today\b|\btoday\b/.test(q)) {
+    return [
+      `${sportName} matches today`,
+      `${sportName} live matches today`,
+      `Who is playing ${sportName} today`
+    ];
+  }
+  return [
+    `${sportName} matches today`,
+    `${sportName} live matches today`,
+    `Who is playing ${sportName} today`
+  ];
 }
 
 function buildSportsGroundingQuery(rawQuery, fallbackQuery = "") {
@@ -1443,16 +1482,8 @@ function buildSportsGroundingQuery(rawQuery, fallbackQuery = "") {
   else if (/\blive\s+score\b/.test(q)) templated = `Live ${sportName} scores today`;
   else if (/\bmatch\s+result\b/.test(q)) templated = `${sportName} match result today`;
 
-  const hasHardBlockTerm = /\b(live|score|scores|won|playing|today|yesterday|match)\b/i.test(original);
-  if (hasHardBlockTerm) {
-    templated = templated
-      .replace(/\bschedule\s+release\b/ig, "")
-      .replace(/\brelease\s+date\b/ig, "")
-      .replace(/\bfuture\b/ig, "")
-      .replace(/\bannounced?\b/ig, "")
-      .replace(/\bupcoming\s+tournament\b/ig, "")
-      .replace(/\s{2,}/g, " ")
-      .trim();
+  if (detectSportsLiveIntent(original)) {
+    templated = sanitizeSportsLiveQuery(templated);
   }
   return templated || original || fallbackQuery;
 }
@@ -1554,12 +1585,15 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
   const rawQuery = query;
   let finalQuery = rtc.rewrittenQuery || query;
   const sportsIntent = detectSportsIntent(rawQuery);
+  const sportsLiveIntent = detectSportsLiveIntent(rawQuery);
   if (sportsIntent) {
     console.log(`[SPORTS INTENT] raw="${rawQuery}"`);
+    console.log(`[SPORTS LIVE INTENT] ${sportsLiveIntent}`);
     const sportsQuery = buildSportsGroundingQuery(rawQuery, finalQuery);
     console.log(`[SPORTS QUERY TEMPLATE] "${sportsQuery}"`);
-    finalQuery = sportsQuery;
+    finalQuery = sportsLiveIntent ? sanitizeSportsLiveQuery(sportsQuery) : sportsQuery;
   }
+  console.log(`[SEARCH QUERY BUILDER INPUT] "${rawQuery}"`);
   console.log(`[FINAL GROUNDING SEARCH] "${finalQuery}"`);
   const realtimeStrict = /\b(live|score|scores|result|results|who won|today|yesterday|latest|current|breaking|news|trending|update|match|ipl|cricket|football|nba|nfl|weather|temperature|forecast|price|stock|crypto|bitcoin|schedule|2025|2026|now)\b/i.test(finalQuery);
   if (!realtimeStrict) return null;
@@ -1634,7 +1668,18 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
     const citations = extractGroundingCitations(data, response);
     const groundingMetadata = response?.candidates?.[0]?.groundingMetadata;
     data.sources = citations;
-    data.search_queries = Array.isArray(data.search_queries) ? data.search_queries : [finalQuery];
+    const modelQueries = Array.isArray(data.search_queries) ? data.search_queries : [finalQuery];
+    if (sportsLiveIntent) {
+      const sportName = /\bipl\b/i.test(rawQuery) ? "IPL" : /\bcricket\b/i.test(rawQuery) ? "Cricket" : /\b(football|soccer)\b/i.test(rawQuery) ? "Football" : "Sports";
+      const strictQueries = buildSportsLiveSearchQueries(rawQuery, sportName).map(sanitizeSportsLiveQuery).filter(Boolean);
+      data.search_queries = strictQueries.length ? strictQueries : [sanitizeSportsLiveQuery(finalQuery) || finalQuery];
+    } else {
+      data.search_queries = modelQueries;
+    }
+    data.search_queries = data.search_queries
+      .map((q) => sportsLiveIntent ? sanitizeSportsLiveQuery(q) : String(q || "").trim())
+      .filter(Boolean);
+    console.log(`[FINAL SEARCH QUERIES] ${JSON.stringify(data.search_queries)}`);
     const answerOk = answerText.length > 0;
     const verifiedOk = data.verified === true;
     const usedGrounding = data.grounding_used === true || citations.length > 0;
