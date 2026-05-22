@@ -1434,10 +1434,14 @@ function detectSportsLiveIntent(query) {
 }
 
 function sanitizeSportsLiveQuery(q) {
-  return String(q || "")
-    .replace(/\b(schedule\s+release|release\s+date|future\s+season|announcement|announced|upcoming\s+tournament|not\s+started\s+yet)\b/ig, "")
+  const input = String(q || "");
+  const output = input
+    .replace(/\b(schedule\s+release\s+date|season\s+release|tournament\s+release|future\s+schedule|upcoming\s+schedule|schedule\s+announcement|fixture\s+release)\b/ig, "")
     .replace(/\s{2,}/g, " ")
     .trim();
+  console.log("[SANITIZE BEFORE]", input);
+  console.log("[SANITIZE AFTER]", output);
+  return output;
 }
 
 function normalizeNoLiveIplResponse(answer = "", rawQuery = "") {
@@ -1505,6 +1509,11 @@ function buildSportsGroundingQuery(rawQuery, fallbackQuery = "", temporalContext
   } else if (/\bmatch\s+result\b|\bwho\s+won\b|\blast\s+match\b/.test(q)) {
     groundingQueryType = "latest_completed";
     templated = `latest completed ${sportName} match`;
+  }
+
+  if (["yesterday_result", "live_now", "today_matches", "tomorrow_next_match"].includes(groundingQueryType)) {
+    console.log(`[GROUNDING QUERY TYPE] ${groundingQueryType}`);
+    return templated;
   }
 
   templated = sanitizeSportsLiveQuery(templated);
