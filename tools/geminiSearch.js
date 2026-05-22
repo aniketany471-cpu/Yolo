@@ -57,7 +57,7 @@ function buildRealtimeContext(nowIso) {
 }
 
 function hasRelativeTimeTerm(query = '') {
-  return /\b(yesterday|today|tomorrow|currently|live|now)\b/i.test(query);
+  return /\b(yesterday|today|tomorrow|currently|live|now|latest|current|recent|last race|last match)\b/i.test(query);
 }
 
 function isFutureHallucination(text = '') {
@@ -223,13 +223,17 @@ function parseGroundedFact(text, type) {
  * @param {string} [type]  — 'sports' | 'weather' | 'general' (default: 'general')
  * @returns {Promise<string|null>}
  */
-export async function geminiGroundedSearch(query, apiKey, type = 'general') {
+export async function geminiGroundedSearch(query, apiKey, type = 'general', opts = {}) {
 
-  // Cache hit
-  const cached = getCached(query, type);
-  if (cached !== null) {
-    console.log('[gemini-search] Cache hit (' + type + '): "' + query.slice(0, 60) + '"');
-    return cached;
+  const bypassCache = Boolean(opts.bypassCache);
+  if (!bypassCache) {
+    const cached = getCached(query, type);
+    if (cached !== null) {
+      console.log('[gemini-search] Cache hit (' + type + '): "' + query.slice(0, 60) + '"');
+      return cached;
+    }
+  } else {
+    console.log('[gemini-search] cache bypass enabled');
   }
 
   // Cooldown
@@ -289,7 +293,7 @@ export async function geminiGroundedSearch(query, apiKey, type = 'general') {
       const structured = parseGroundedFact(text, type);
       if (structured !== null) {
         console.log('[gemini-search] OK (' + type + ', verified) — ' + structured.length + ' chars');
-        setCache(query, type, structured);
+        if (!bypassCache) setCache(query, type, structured);
         return structured;
       }
       // JSON extraction failed — return raw text (better than nothing, Serper still available as fallback)
@@ -297,7 +301,7 @@ export async function geminiGroundedSearch(query, apiKey, type = 'general') {
     }
 
     console.log('[gemini-search] OK (' + type + ', raw) — ' + text.length + ' chars');
-    setCache(query, type, text);
+    if (!bypassCache) setCache(query, type, text);
     return text;
 
   } catch (e) {

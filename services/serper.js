@@ -118,7 +118,7 @@ const INTENT_PATTERNS = [
     /\b(website|site|app|platform|service|company|brand|product|tool|software|startup)\b/i,
     /https?:\/\/|www\.|\.com\b|\.io\b|\.net\b|\.org\b|\.in\b/i,
   ]},
-  { intent: 'general',   patterns: [/\b(today|latest|current|recent|now|live|real.?time|breaking|2024|2025|2026|election|launch|release|announce)\b/i] },
+  { intent: 'general',   patterns: [/\b(today|latest|current|recent|now|live|real.?time|breaking|election|launch|release|announce)\b/i] },
 ];
 
 export function detectIntent(text) {

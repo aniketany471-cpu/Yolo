@@ -1259,7 +1259,7 @@ function isUsableResult(text, query) {
  * commentary links, etc.) from passing as real score data.
  */
 function hasActualScoreData(text) {
-  return /\d+\/\d+|\d+\s*(?:run[s]?|wkt[s]?|wicket[s]?)|\bover[s]?\s*:\s*\d+|\b\d+\s*\/\s*\d+\s*\(|\b[A-Z]{2,}\s+\d+\/\d+/i.test(text);
+  return /\d+\/\d+|\d+\s*(?:run[s]?|wkt[s]?|wicket[s]?)\b|\bover[s]?\s*:\s*\d+|\b\d+\s*\/\s*\d+\s*\(|\b[A-Z]{2,}\s+\d+\/\d+/i.test(text);
 }
 
 
@@ -1272,7 +1272,7 @@ function isRealtimeQuery(query) {
   const q = query.toLowerCase();
   const realtimeKeywords = [
     "today", "latest", "current", "live", "news", "ipl", "score", "match",
-    "schedule", "weather", "price", "stock", "crypto", "2025", "2026", "now", "update"
+    "schedule", "weather", "price", "stock", "crypto", "now", "update"
   ];
   // Hard casual overrides — these never need live data
   if (/^(hi|hello|hey|sup|yo|ok|okay|sure|thanks|thank you|bye|lol|haha|good morning|good night|how are you|what's up|whats up|love you|miss you)\b/.test(q)) return false;
@@ -1458,73 +1458,95 @@ function normalizeNoLiveIplResponse(answer = "", rawQuery = "") {
 function extractTemporalContext(rawQuery) {
   const q = String(rawQuery || "").toLowerCase();
   const explicitDateMatch = q.match(/\b(\d{4}-\d{2}-\d{2}|\d{1,2}[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?)\b/);
-
-  return {
-    isYesterday: /\byesterday\b|\blast night\b|\bprevious match\b|\bwho\s+won\s+yesterday\b/.test(q),
-    isToday: /\btoday\b|\bcurrent\b/.test(q),
+  const temporalContext = {
+    isYesterday: /\byesterday\b|\blast night\b|\bprevious match\b|\bwho\s+won\s+yesterday\b|\blast race\b|\blatest completed\b|\blast match\b/.test(q),
+    isToday: /\btoday\b|\bcurrent\b|\bnow\b|\btonight\b/.test(q),
     isTomorrow: /\btomorrow\b|\bnext match\b/.test(q),
-    isLiveNow: /\bnow\b|\blive\b|\bright now\b/.test(q),
+    isLiveNow: /\blive\b|\blive score\b|\bscore now\b|\bcurrent score\b|\bright now\b/.test(q),
     isTonight: /\btonight\b/.test(q),
     explicitDate: explicitDateMatch ? explicitDateMatch[1] : ""
   };
+  return temporalContext;
 }
 
-function buildSportsLiveSearchQueries(rawQuery, sportName = "Sports", temporalContext = {}) {
+function detectSportsSubIntent(rawQuery, temporalContext = {}) {
+  const q = String(rawQuery || '').toLowerCase();
   const tc = temporalContext || {};
-  if (tc.explicitDate) return [`${sportName} match result ${tc.explicitDate}`];
-  if (tc.isYesterday) return [`${sportName} match result yesterday`, `latest completed ${sportName} match`];
-  if (tc.isTomorrow) return [`${sportName} next match tomorrow`];
-  if (tc.isLiveNow) return [`live ${sportName} score now`];
-  if (tc.isToday || tc.isTonight) return [`${sportName} matches today`];
-  return [`${sportName} latest match result`];
+  if (tc.isLiveNow) return 'LIVE_MATCH';
+  if (tc.isYesterday || /\b(who\s+won|result|winner|latest completed|last race|last match|most recent)\b/.test(q)) return 'MATCH_RESULT';
+  if (tc.isToday || tc.isTonight) return 'TODAY_FIXTURES';
+  if (/\b(standings|points\s*table|table)\b/.test(q)) return 'STANDINGS';
+  if (tc.isTomorrow || /\b(next|upcoming|fixtures?)\b/.test(q)) return 'UPCOMING_MATCHES';
+  return 'MATCH_RESULT';
 }
 
-function buildSportsGroundingQuery(rawQuery, fallbackQuery = "", temporalContext = {}) {
-  const original = (rawQuery || "").trim();
+function buildSportsGroundingQuery(rawQuery, fallbackQuery = '', temporalContext = {}) {
+  const original = (rawQuery || '').trim();
+  const nowIST = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+  const CURRENT_YEAR = nowIST.getFullYear();
   const q = original.toLowerCase();
-  const sportName = /\bipl\b/i.test(original) ? "IPL"
-    : /\b(cricket)\b/i.test(original) ? "Cricket"
-    : /\b(football|soccer)\b/i.test(original) ? "Football"
-    : "Sports";
+  const sportName = /\bformula\s*1\b|\bf1\b/i.test(original) ? 'Formula 1'
+    : /\bipl\b/i.test(original) ? 'IPL'
+    : /\b(cricket)\b/i.test(original) ? 'Cricket'
+    : /\b(football|soccer)\b/i.test(original) ? 'Football'
+    : 'Sports';
 
-  const tc = temporalContext || {};
-  let groundingQueryType = "default";
-  let templated = fallbackQuery || original;
+  const sportsIntent = detectSportsSubIntent(original, temporalContext);
+  let groundingQueryType = 'default';
+  let dynamicQuery = fallbackQuery || original;
 
-  if (tc.explicitDate) {
-    groundingQueryType = "explicit_date";
-    templated = `${sportName} match result ${tc.explicitDate}`;
-  } else if (tc.isYesterday) {
-    groundingQueryType = "yesterday_result";
-    templated = `${sportName} match result yesterday`;
-  } else if (tc.isTomorrow) {
-    groundingQueryType = "tomorrow_next_match";
-    templated = `${sportName} next match tomorrow`;
-  } else if (tc.isLiveNow) {
-    groundingQueryType = "live_now";
-    templated = `live ${sportName} score now`;
-  } else if (tc.isToday || tc.isTonight) {
-    groundingQueryType = "today_matches";
-    templated = `${sportName} matches today`;
-  } else if (/\bmatch\s+result\b|\bwho\s+won\b|\blast\s+match\b/.test(q)) {
-    groundingQueryType = "latest_completed";
-    templated = `latest completed ${sportName} match`;
+  if (temporalContext.explicitDate) {
+    groundingQueryType = 'explicit_date';
+    dynamicQuery = `${sportName} match result ${temporalContext.explicitDate}`;
+  } else if (sportsIntent === 'LIVE_MATCH') {
+    groundingQueryType = 'live_now';
+    dynamicQuery = `live ${sportName} ${/score/.test(q) ? 'scores' : 'score now'} ${CURRENT_YEAR}`;
+  } else if (sportsIntent === 'MATCH_RESULT') {
+    groundingQueryType = temporalContext.isYesterday ? 'yesterday_result' : 'latest_result';
+    dynamicQuery = temporalContext.isYesterday
+      ? `${sportName} yesterday match result ${CURRENT_YEAR}`
+      : `latest ${sportName} match result ${CURRENT_YEAR}`;
+  } else if (sportsIntent === 'TODAY_FIXTURES') {
+    groundingQueryType = 'today_matches';
+    dynamicQuery = `${sportName} matches today ${CURRENT_YEAR}`;
+  } else if (sportsIntent === 'STANDINGS') {
+    groundingQueryType = 'standings';
+    dynamicQuery = `${sportName} standings ${CURRENT_YEAR}`;
+  } else if (sportsIntent === 'UPCOMING_MATCHES') {
+    groundingQueryType = 'tomorrow_next_match';
+    dynamicQuery = `${sportName} next match tomorrow ${CURRENT_YEAR}`;
   }
 
-  if (["yesterday_result", "live_now", "today_matches", "tomorrow_next_match"].includes(groundingQueryType)) {
-    console.log(`[GROUNDING QUERY TYPE] ${groundingQueryType}`);
-    return templated;
-  }
+  const bypassSanitize = ['yesterday_result', 'live_now', 'today_matches', 'tomorrow_next_match'].includes(groundingQueryType);
 
-  templated = sanitizeSportsLiveQuery(templated);
-  console.log(`[GROUNDING QUERY TYPE] ${groundingQueryType}`);
-  return templated || original || fallbackQuery;
+  console.log('[RAW MESSAGE]', original);
+  console.log('[TEMPORAL]', JSON.stringify(temporalContext));
+  console.log('[IST DATE]', nowIST.toISOString());
+  console.log('[CURRENT_YEAR]', CURRENT_YEAR);
+  console.log('[SPORTS INTENT]', sportsIntent);
+  console.log('[GROUNDING QUERY TYPE]', groundingQueryType);
+  console.log('[DYNAMIC_QUERY]', dynamicQuery);
+  console.log('[CACHE_BYPASS]', 'true');
+
+  if (bypassSanitize) return dynamicQuery;
+  const sanitized = sanitizeSportsLiveQuery(dynamicQuery);
+  return sanitized || original || fallbackQuery;
+}
+
+function isRealtimeTemporalQuery(query = '') {
+  return /\b(latest|current|live|today|yesterday|now|recent|last race|last match)\b/i.test(String(query || ''));
+}
+
+function containsStaleYear(text = '', currentYear = new Date().getFullYear()) {
+  const years = (String(text).match(/\b20\d{2}\b/g) || []).map(Number);
+  return years.some((y) => y < currentYear);
 }
 
 
 async function performWebSearch(query, config, deep = false) {
   const rtc = resolveRealtimeContext(query);
-  const searchQuery = rtc.rewrittenQuery || query;
+  const searchQuery = query;
+  const temporalContext = extractTemporalContext(query);
   if (rtc.detected.length > 0) {
     console.log(`[time] detected: ${rtc.detected.join(", ")}`);
     if (rtc.resolvedDate) console.log(`[time] resolved date: ${rtc.resolvedDate}`);
@@ -1533,6 +1555,7 @@ async function performWebSearch(query, config, deep = false) {
   const geminiKey = (config.geminiKey || getGeminiPrimaryKey() || '').trim();
 
   // Detect query type for targeted Gemini prompts
+  console.log('[FINAL GROUNDING INPUT]', searchQuery);
   const isSports  = /\b(ipl|cricket|t20|odi|test\s*match|wpl|psl|ranji|bbl|cpl|sa20|ashes|wtc|srh|csk|rcb|kkr|pbks|lsg|sunrisers|chennai\s*super|royal\s*challengers|mumbai\s*indians|kolkata\s*knight|rajasthan\s*royals|delhi\s*capitals|punjab\s*kings|gujarat\s*titans|lucknow\s*super|football|soccer|premier\s*league|champions\s*league|la\s*liga|bundesliga|serie\s*a|ligue\s*1|mls|isl|afc\s*cup|uefa|fifa|euro\s*cup|copa\s*america|fa\s*cup|carabao|world\s*cup|epl|nba|basketball|wnba|euroleague|nfl|super\s*bowl|american\s*football|formula\s*1|formula\s*one|f1|motogp|indycar|grand\s*prix|nascar|rally|wrc|tennis|wimbledon|us\s*open|french\s*open|australian\s*open|roland\s*garros|atp|wta|davis\s*cup|laver\s*cup|itf|boxing|ufc|mma|wbc|wba|ibf|wbo|knockout|prizefight|bout\b|hockey|nhl|badminton|bwf|thomas\s*cup|uber\s*cup|all\s*england|golf|pga\s*tour|masters\s*tournament|ryder\s*cup|open\s*championship|liv\s*golf|rugby|six\s*nations|super\s*rugby|premiership\s*rugby|rugby\s*world\s*cup|kabaddi|pkl|pro\s*kabaddi|wwe|aew|wrestling|wwe\s*raw|smackdown|wrestlemania|olympics|paralympics|athletics|marathon\b|sprint\b|javelin|long\s*jump|high\s*jump|table\s*tennis|ping\s*pong|ittf|volleyball|fivb|handball|squash\b|snooker\b|cycling\b|tour\s*de\s*france|giro\s*d.italia|triathlon|swimming\b|fina|gymnastics)\b/i.test(searchQuery) ||
     /\b(which\s+team|who\s+(?:is|are)\s+playing|playing\s+today|match\s+today|today[''s]*\s+match|today[''s]*\s+game|today[''s]*\s+ipl|ipl\s+today|cricket\s+today|fixture|fixtures|next\s+match|upcoming\s+match|match\s+schedule|schedule\s+today|what.*match.*today|today.*fixture)\b/i.test(query);
   const isWeather = /\bweather\b|\btemperature\b|\btemp\b|\bforecast\b/i.test(searchQuery);
@@ -1544,9 +1567,13 @@ async function performWebSearch(query, config, deep = false) {
   // ── 1. Gemini grounding — only for realtime queries, never casual chat ────
   if (geminiGroundedSearch && geminiKey && isRealtimeQuery(searchQuery)) {
     const type = isSports ? 'sports' : isWeather ? 'weather' : 'general';
+    const nowIST = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+    const CURRENT_YEAR = nowIST.getFullYear();
+    const groundingInput = isSports ? buildSportsGroundingQuery(query, searchQuery, temporalContext) : searchQuery;
+    console.log('[GROUNDING_SEARCHES]', groundingInput);
     try {
-      console.log(`[search] Gemini grounding (type=${type}): "${searchQuery.slice(0, 70)}"`);
-      const result = await geminiGroundedSearch(searchQuery, geminiKey, type);
+      console.log(`[search] Gemini grounding (type=${type}): "${groundingInput.slice(0, 70)}"`);
+      let result = await geminiGroundedSearch(groundingInput, geminiKey, type, { bypassCache: isSports, queryType: 'realtime' });
       if (result && result.trim().length > 30) {
         // For sports: verify actual score pattern exists so we don't pass a "no match" summary
         if (isSports && !hasActualScoreData(result)) {
@@ -1556,6 +1583,12 @@ async function performWebSearch(query, config, deep = false) {
             return result;
           }
           console.warn('[search] Gemini sports result has no score pattern — returning as-is for AI to assess');
+        }
+        if (isSports && isRealtimeTemporalQuery(query) && containsStaleYear(result, CURRENT_YEAR)) {
+          console.log('[STALE_YEAR_DETECTED]', 'true');
+          console.log('[GROUNDING_RETRY]', 'true');
+          const strictQuery = buildSportsGroundingQuery(query, groundingInput, temporalContext);
+          result = await geminiGroundedSearch(strictQuery, geminiKey, type, { bypassCache: true, queryType: 'realtime', strictRealtime: true }) || result;
         }
         console.log(`[search] Gemini grounding OK — ${result.length} chars`);
         return result;
@@ -1636,7 +1669,7 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
   }
   console.log(`[SEARCH QUERY BUILDER INPUT] "${rawQuery}"`);
   console.log(`[FINAL GROUNDING SEARCH] "${finalQuery}"`);
-  const realtimeStrict = /\b(live|score|scores|result|results|who won|today|yesterday|latest|current|breaking|news|trending|update|match|ipl|cricket|football|nba|nfl|weather|temperature|forecast|price|stock|crypto|bitcoin|schedule|2025|2026|now)\b/i.test(finalQuery);
+  const realtimeStrict = /\b(live|score|scores|result|results|who won|today|yesterday|latest|current|breaking|news|trending|update|match|ipl|cricket|football|nba|nfl|weather|temperature|forecast|price|stock|crypto|bitcoin|schedule|now)\b/i.test(finalQuery);
   if (!realtimeStrict) return null;
   const qLower = finalQuery.toLowerCase();
   const isSportsType = /\b(ipl|cricket|football|soccer|nba|nfl|live score|match|result)\b/.test(qLower);
