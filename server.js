@@ -189,31 +189,51 @@ async function ensureDonnaDbReady() {
   console.log("[DB] Downloading database...");
   try {
     const goFilePageUrl = "https://gofile.io/d/5N0nN6";
-    const idMatch = goFilePageUrl.match(/gofile\.io\/d\/([a-zA-Z0-9_-]+)/i);
-    const contentId = idMatch?.[1];
-    if (!contentId) throw new Error("invalid GoFile URL: missing content id");
+    const pageRes = await fetch(goFilePageUrl, { redirect: "follow" });
+    if (!pageRes.ok) throw new Error(`GoFile page HTTP ${pageRes.status}`);
+    const html = await pageRes.text();
 
-    const apiUrl = `https://api.gofile.io/contents/${encodeURIComponent(contentId)}?wt=4fd6sg89d7s6`;
-    const apiRes = await fetch(apiUrl, { redirect: "follow" });
-    if (!apiRes.ok) throw new Error(`GoFile API HTTP ${apiRes.status}`);
-    const payload = await apiRes.json();
-    const contents = payload?.data?.contents;
-    if (!contents || typeof contents !== "object") {
-      throw new Error("GoFile API returned no downloadable contents");
+    const candidateUrls = new Set();
+    const directLinkPattern = /https?:\/\/[^"'\s<>]+gofile\.io\/download\/[^"'\s<>]+/gi;
+    for (const match of html.match(directLinkPattern) || []) {
+      try {
+        candidateUrls.add(match.replace(/\\\//g, "/"));
+      } catch (_) {}
     }
-    const files = Object.values(contents).filter((entry) => entry?.type === "file" && typeof entry?.link === "string");
-    if (files.length === 0) throw new Error("GoFile API contains no files");
-    const preferred = files.find((f) => typeof f?.name === "string" && f.name.toLowerCase().endsWith(".db")) || files[0];
-    const fileUrl = preferred.link;
 
-    const res = await fetch(fileUrl, { redirect: "follow" });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const contentType = (res.headers.get("content-type") || "").toLowerCase();
-    if (contentType.includes("text/html")) {
-      throw new Error("resolved URL returned HTML instead of database file");
+    const escapedLinkPattern = /\"link\"\s*:\s*\"([^\"]+)\"/gi;
+    for (const m of html.matchAll(escapedLinkPattern)) {
+      const link = (m[1] || "").replace(/\\\//g, "/");
+      if (/^https?:\/\/.*gofile\.io\/download\//i.test(link)) candidateUrls.add(link);
     }
-    const buffer = Buffer.from(await res.arrayBuffer());
-    await fs.writeFile(DONNA_DB_PATH, buffer);
+
+    const fileCandidates = [...candidateUrls];
+    if (fileCandidates.length === 0) {
+      throw new Error("no public GoFile download link found in page response");
+    }
+
+    let downloaded = false;
+    let lastErr = null;
+    for (const fileUrl of fileCandidates) {
+      try {
+        const res = await fetch(fileUrl, { redirect: "follow" });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const contentType = (res.headers.get("content-type") || "").toLowerCase();
+        if (contentType.includes("text/html")) throw new Error("resolved URL returned HTML");
+        const buffer = Buffer.from(await res.arrayBuffer());
+        if (!buffer?.length) throw new Error("empty file payload");
+        await fs.writeFile(DONNA_DB_PATH, buffer);
+        downloaded = true;
+        break;
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+
+    if (!downloaded) {
+      throw new Error(`all public download links failed${lastErr ? `: ${lastErr.message || String(lastErr)}` : ""}`);
+    }
+
     console.log("[DB] Download complete");
   } catch (e) {
     console.warn(`[donna-db] Download failed: ${e?.message || String(e)}`);
