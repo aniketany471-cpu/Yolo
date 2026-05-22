@@ -153,7 +153,7 @@ const db = new Database(path.join(__dirname, "bot_database.sqlite"));
 const DONNA_DATA_DIR = "/data";
 const DONNA_DB_PATH = path.join(DONNA_DATA_DIR, "donna.db");
 const DONNA_DB_GZ_PATH = path.join(DONNA_DATA_DIR, "donna.db.gz");
-const DONNA_DB_DOWNLOAD_URL = "https://github.com/Skyemike1/Skye/releases/download/V1/donna.db.gz";
+const DONNA_DB_DOWNLOAD_URL = "https://github.com/Skyemike1/Skye/releases/download/V1/donna.db.gz"; // force-set release URL
 let donnaDb = null;
 let donnaSearchStmtByMode = { username: null, id: null };
 
