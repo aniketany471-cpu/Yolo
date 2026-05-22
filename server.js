@@ -1451,32 +1451,31 @@ function normalizeNoLiveIplResponse(answer = "", rawQuery = "") {
   return String(answer || "").trim();
 }
 
-function buildSportsLiveSearchQueries(rawQuery, sportName = "Sports") {
+function extractTemporalContext(rawQuery) {
   const q = String(rawQuery || "").toLowerCase();
-  if (/\blive\b/.test(q) && /\b(score|scores)\b/.test(q)) {
-    return [
-      `${sportName} live score today`,
-      `${sportName} current match score`
-    ];
-  }
-  if (/\bwho\s+won\s+yesterday\b|\bwon\s+yesterday\b|\byesterday\b/.test(q)) {
-    return [`${sportName} yesterday match winner`];
-  }
-  if (/\bwho\s+(is|are)\s+playing\s+today\b|\bplaying\s+today\b|\btoday\b/.test(q)) {
-    return [
-      `${sportName} matches today`,
-      `${sportName} live matches today`,
-      `Who is playing ${sportName} today`
-    ];
-  }
-  return [
-    `${sportName} matches today`,
-    `${sportName} live matches today`,
-    `Who is playing ${sportName} today`
-  ];
+  const explicitDateMatch = q.match(/\b(\d{4}-\d{2}-\d{2}|\d{1,2}[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?)\b/);
+
+  return {
+    isYesterday: /\byesterday\b|\blast night\b|\bprevious match\b|\bwho\s+won\s+yesterday\b/.test(q),
+    isToday: /\btoday\b|\bcurrent\b/.test(q),
+    isTomorrow: /\btomorrow\b|\bnext match\b/.test(q),
+    isLiveNow: /\bnow\b|\blive\b|\bright now\b/.test(q),
+    isTonight: /\btonight\b/.test(q),
+    explicitDate: explicitDateMatch ? explicitDateMatch[1] : ""
+  };
 }
 
-function buildSportsGroundingQuery(rawQuery, fallbackQuery = "") {
+function buildSportsLiveSearchQueries(rawQuery, sportName = "Sports", temporalContext = {}) {
+  const tc = temporalContext || {};
+  if (tc.explicitDate) return [`${sportName} match result ${tc.explicitDate}`];
+  if (tc.isYesterday) return [`${sportName} match result yesterday`, `latest completed ${sportName} match`];
+  if (tc.isTomorrow) return [`${sportName} next match tomorrow`];
+  if (tc.isLiveNow) return [`live ${sportName} score now`];
+  if (tc.isToday || tc.isTonight) return [`${sportName} matches today`];
+  return [`${sportName} latest match result`];
+}
+
+function buildSportsGroundingQuery(rawQuery, fallbackQuery = "", temporalContext = {}) {
   const original = (rawQuery || "").trim();
   const q = original.toLowerCase();
   const sportName = /\bipl\b/i.test(original) ? "IPL"
@@ -1484,18 +1483,32 @@ function buildSportsGroundingQuery(rawQuery, fallbackQuery = "") {
     : /\b(football|soccer)\b/i.test(original) ? "Football"
     : "Sports";
 
+  const tc = temporalContext || {};
+  let groundingQueryType = "default";
   let templated = fallbackQuery || original;
-  if (/\blive\b/.test(q) && /\b(score|scores)\b/.test(q)) templated = `Live ${sportName} scores today`;
-  else if (/\bwho\s+won\s+yesterday\b|\bwon\s+yesterday\b/.test(q)) templated = `${sportName} match winner yesterday`;
-  else if (/\bwho\s+(is|are)\s+playing\s+today\b|\bwho\s+playing\s+today\b|\bplaying\s+today\b/.test(q)) templated = `${sportName} matches today`;
-  else if (/\btoday\s+match\b|\bmatch\s+today\b/.test(q)) templated = `${sportName} matches today`;
-  else if (/\b(cricket|football)\s+score\b/.test(q)) templated = `Live ${sportName} scores today`;
-  else if (/\blive\s+score\b/.test(q)) templated = `Live ${sportName} scores today`;
-  else if (/\bmatch\s+result\b/.test(q)) templated = `${sportName} match result today`;
 
-  if (detectSportsLiveIntent(original)) {
-    templated = sanitizeSportsLiveQuery(templated);
+  if (tc.explicitDate) {
+    groundingQueryType = "explicit_date";
+    templated = `${sportName} match result ${tc.explicitDate}`;
+  } else if (tc.isYesterday) {
+    groundingQueryType = "yesterday_result";
+    templated = `${sportName} match result yesterday`;
+  } else if (tc.isTomorrow) {
+    groundingQueryType = "tomorrow_next_match";
+    templated = `${sportName} next match tomorrow`;
+  } else if (tc.isLiveNow) {
+    groundingQueryType = "live_now";
+    templated = `live ${sportName} score now`;
+  } else if (tc.isToday || tc.isTonight) {
+    groundingQueryType = "today_matches";
+    templated = `${sportName} matches today`;
+  } else if (/\bmatch\s+result\b|\bwho\s+won\b|\blast\s+match\b/.test(q)) {
+    groundingQueryType = "latest_completed";
+    templated = `latest completed ${sportName} match`;
   }
+
+  templated = sanitizeSportsLiveQuery(templated);
+  console.log(`[GROUNDING QUERY TYPE] ${groundingQueryType}`);
   return templated || original || fallbackQuery;
 }
 
@@ -1594,13 +1607,21 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
   }
   const rtc = resolveRealtimeContext(query);
   const rawQuery = query;
+  const temporalContext = extractTemporalContext(rawQuery);
+  const nowIST = new Date(
+    new Date().toLocaleString("en-US", {
+      timeZone: "Asia/Kolkata"
+    })
+  );
+  console.log(`[TEMPORAL] ${JSON.stringify(temporalContext)}`);
+  console.log(`[IST DATE] ${nowIST.toISOString()}`);
   let finalQuery = rtc.rewrittenQuery || query;
   const sportsIntent = detectSportsIntent(rawQuery);
   const sportsLiveIntent = detectSportsLiveIntent(rawQuery);
   if (sportsIntent) {
     console.log(`[SPORTS INTENT] raw="${rawQuery}"`);
     console.log(`[SPORTS LIVE INTENT] ${sportsLiveIntent}`);
-    const sportsQuery = buildSportsGroundingQuery(rawQuery, finalQuery);
+    const sportsQuery = buildSportsGroundingQuery(rawQuery, finalQuery, temporalContext);
     console.log(`[SPORTS QUERY TEMPLATE] "${sportsQuery}"`);
     finalQuery = sportsLiveIntent ? sanitizeSportsLiveQuery(sportsQuery) : sportsQuery;
   }
@@ -1684,7 +1705,7 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
     const modelQueries = Array.isArray(data.search_queries) ? data.search_queries : [finalQuery];
     if (sportsLiveIntent) {
       const sportName = /\bipl\b/i.test(rawQuery) ? "IPL" : /\bcricket\b/i.test(rawQuery) ? "Cricket" : /\b(football|soccer)\b/i.test(rawQuery) ? "Football" : "Sports";
-      const strictQueries = buildSportsLiveSearchQueries(rawQuery, sportName).map(sanitizeSportsLiveQuery).filter(Boolean);
+      const strictQueries = buildSportsLiveSearchQueries(rawQuery, sportName, temporalContext).map(sanitizeSportsLiveQuery).filter(Boolean);
       data.search_queries = strictQueries.length ? strictQueries : [sanitizeSportsLiveQuery(finalQuery) || finalQuery];
     } else {
       data.search_queries = modelQueries;
