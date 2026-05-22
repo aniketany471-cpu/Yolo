@@ -14,6 +14,8 @@ import sharp from "sharp";
 import fs from "fs-extra";
 import yts from "yt-search";
 import youtubedl from "youtube-dl-exec";
+import axios from "axios";
+import { gunzipSync } from "node:zlib";
 import { analyzeTelegramImageWithGemini, buildVisionPrompt } from "./services/vision.js";
 import { requestGemini, beginGeminiRequestScope } from "./services/geminiManager.js";
 import { getGeminiPrimaryKey } from "./services/geminiKeyManager.js";
@@ -196,17 +198,28 @@ async function ensureDonnaDbReady() {
     return init;
   }
 
-  console.log("[DB] Downloading database...");
+  console.log("[DB] Starting download");
   try {
-    const res = await fetch(DONNA_DB_DOWNLOAD_URL, { redirect: "follow" });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const buffer = Buffer.from(await res.arrayBuffer());
-    if (!buffer?.length) throw new Error("empty file payload");
-    await fs.writeFile(DONNA_DB_GZ_PATH, buffer);
+    const res = await axios.get(DONNA_DB_DOWNLOAD_URL, {
+      maxRedirects: 10,
+      responseType: "stream",
+    });
 
-    console.log("[DB] Extracting database...");
-    await fs.writeFile(DONNA_DB_PATH, await import("node:zlib").then(({ gunzipSync }) => gunzipSync(buffer)));
-    console.log("[DB] Database ready");
+    await new Promise((resolve, reject) => {
+      const writer = fs.createWriteStream(DONNA_DB_GZ_PATH);
+      res.data.pipe(writer);
+      writer.on("finish", resolve);
+      writer.on("error", reject);
+      res.data.on("error", reject);
+    });
+    console.log("[DB] Download complete");
+
+    const gzBuffer = await fs.readFile(DONNA_DB_GZ_PATH);
+    if (!gzBuffer?.length) throw new Error("empty file payload");
+
+    console.log("[DB] Extracting");
+    await fs.writeFile(DONNA_DB_PATH, gunzipSync(gzBuffer));
+    console.log("[DB] Ready");
   } catch (e) {
     console.warn(`[DB] Database bootstrap failed: ${e?.message || String(e)}`);
     return { ok: false, reason: "bootstrap_failed", error: e?.message || String(e) };
