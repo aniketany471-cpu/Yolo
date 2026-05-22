@@ -1347,18 +1347,20 @@ function classifyImageIntent(text) {
   return { imageScore, securityScore, hasSecuritySignal, shouldGenerateImage, finalHandler };
 }
 
+function getISTDate() {
+  return new Date(
+    new Date().toLocaleString("en-US", {
+      timeZone: "Asia/Kolkata"
+    })
+  );
+}
+
 function getKolkataNowParts() {
-  const fmt = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Asia/Kolkata",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit"
-  });
-  const parts = fmt.formatToParts(new Date());
+  const nowIST = getISTDate();
   return {
-    y: Number(parts.find((p) => p.type === "year")?.value || 0),
-    m: Number(parts.find((p) => p.type === "month")?.value || 1),
-    d: Number(parts.find((p) => p.type === "day")?.value || 1)
+    y: nowIST.getFullYear(),
+    m: nowIST.getMonth() + 1,
+    d: nowIST.getDate()
   };
 }
 function addDaysYmd(y, m, d, deltaDays) {
@@ -1379,33 +1381,44 @@ function formatLongDate(obj) {
 }
 function resolveRealtimeContext(query) {
   const q = (query || "").toLowerCase();
+  const istNow = getISTDate();
   const base = getKolkataNowParts();
+  const istToday = base;
+  const istYesterday = addDaysYmd(base.y, base.m, base.d, -1);
+  const istTomorrow = addDaysYmd(base.y, base.m, base.d, 1);
+
+  console.log(`[IST TIME] ${istNow.toISOString()} | IST locale: ${istNow.toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour12: false })}`);
+  console.log(`[IST TODAY] ${formatYmd(istToday)} | IST YESTERDAY: ${formatYmd(istYesterday)} | IST TOMORROW: ${formatYmd(istTomorrow)}`);
+
   const detected = [];
   let resolved = null;
   if (/\byesterday\b|\blast night\b/.test(q)) {
     detected.push("yesterday");
-    resolved = addDaysYmd(base.y, base.m, base.d, -1);
+    resolved = istYesterday;
   } else if (/\btomorrow\b|\btonight\b/.test(q)) {
     detected.push("tomorrow");
-    resolved = addDaysYmd(base.y, base.m, base.d, 1);
-  } else if (/\btoday\b|\bnow\b|\bcurrently\b|\bcurrent\b|\blatest\b|\bthis morning\b|\brecent\b/.test(q)) {
+    resolved = istTomorrow;
+  } else if (/\btoday\b|\bnow\b|\bcurrently\b|\bcurrent\b|\blatest\b|\blive\b|\bthis morning\b|\brecent\b/.test(q)) {
     detected.push("today");
-    resolved = base;
+    resolved = istToday;
   }
   if (/\bthis week\b/.test(q)) detected.push("this week");
-  if (detected.length === 0) return { rewrittenQuery: query, resolvedDate: null, detected };
-  const ref = resolved || base;
+  if (detected.length === 0) return { rewrittenQuery: query, resolvedDate: null, detected, istToday: formatYmd(istToday), istYesterday: formatYmd(istYesterday), istTomorrow: formatYmd(istTomorrow) };
+
+  const ref = resolved || istToday;
   const longDate = formatLongDate(ref);
   let rewritten = query
     .replace(/\byesterday\b|\blast night\b/ig, `on ${longDate}`)
     .replace(/\btoday\b|\bthis morning\b/ig, `on ${longDate}`)
     .replace(/\btomorrow\b|\btonight\b/ig, `on ${longDate}`)
-    .replace(/\bnow\b|\bcurrently\b|\bcurrent\b|\blatest\b|\brecent\b/ig, `as of ${longDate}`);
+    .replace(/\bnow\b|\bcurrently\b|\bcurrent\b|\blatest\b|\blive\b|\brecent\b/ig, `as of ${longDate}`);
   if (/\b(ipl|cricket|match|score|news|weather|stock|price|live)\b/i.test(rewritten)) {
-    rewritten += ` [timezone: Asia/Kolkata] [reference_date: ${longDate} (${formatYmd(ref)})] [year: ${base.y}]`;
+    rewritten += ` [timezone: Asia/Kolkata] [reference_date: ${longDate} (${formatYmd(ref)})] [year: ${istToday.y}]`;
   }
-  return { rewrittenQuery: rewritten, resolvedDate: formatYmd(ref), detected };
+  console.log(`[GROUNDING DATE RESOLVED] ${formatYmd(ref)} | detected=${detected.join(",") || "none"}`);
+  return { rewrittenQuery: rewritten, resolvedDate: formatYmd(ref), detected, istToday: formatYmd(istToday), istYesterday: formatYmd(istYesterday), istTomorrow: formatYmd(istTomorrow) };
 }
+
 
 async function performWebSearch(query, config, deep = false) {
   const rtc = resolveRealtimeContext(query);
