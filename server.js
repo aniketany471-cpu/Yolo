@@ -1282,16 +1282,20 @@ function isRealtimeQuery(query) {
   return /\b(live|today|tonight|right now|this week|current|latest|breaking|just now|happening|trending|score[s]?|result[s]?|match|winner|champion|ipl|cricket|t20|odi|football|soccer|nba|nfl|f1|grand\s*prix|motogp|tennis|wimbledon|us\s*open|french\s*open|australian\s*open|atp|wta|boxing|ufc|mma|knockout|hockey|nhl|badminton|bwf|golf|pga|masters|rugby|six\s*nations|kabaddi|pkl|wwe|olympics|athletics|prix|price[s]?|crypto|bitcoin|btc|eth|stock|nifty|sensex|share\s*price|weather|temp(erature)?|forecast|news|election|who\s*won|what\s*happened|did\s*.{0,20}\s*win|update[s]?)\b/i.test(q);
 }
 
-function buildRealtimeGroundingInstruction({ strict = false } = {}) {
+function buildRealtimeGroundingInstruction({ strict = false, todayIST = "" } = {}) {
+  const dateContext = todayIST
+    ? `TODAY'S DATE IS ${todayIST} (IST). This is factual and must be treated as ground truth. Your training data may be outdated — IGNORE internal memory about schedules, season status, or events and rely ONLY on Google Search results.`
+    : "";
   const base = [
     "You are Donna, a live AI assistant.",
-    "For any realtime or current-event related query, you MUST verify information using Google Search before answering.",
-    "Never rely only on internal memory for live events, schedules, scores, prices, weather, or news.",
+    dateContext,
+    "CRITICAL: You MUST use the Google Search tool before answering. Do NOT answer from training memory for any sports, news, scores, results, or current events.",
+    "Your training data is outdated. Any season, tournament, or event you think 'has not started' may already be in progress or completed. SEARCH to verify.",
+    "Never rely on internal memory for live events, schedules, scores, prices, weather, or news.",
     "If live verification fails, clearly say you could not verify the information.",
-    "Prefer verified search facts over assumptions.",
-    "If sources conflict, mention uncertainty and state what could not be confirmed.",
+    "Prefer verified search facts over your own assumptions.",
     "Return JSON only: {\"query_type\":\"\",\"subject\":\"\",\"answer\":\"\",\"sources\":[],\"timestamp\":\"\",\"verified\":true,\"grounding_used\":true,\"search_queries\":[]}"
-  ];
+  ].filter(Boolean);
   if (strict) {
     base.push("STRICT: If grounding/search is unavailable or not used, set verified=false and grounding_used=false, and set answer to exactly: I couldn't verify live realtime information.");
   }
@@ -1720,14 +1724,18 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
     }
     return null;
   }
-  const primaryModel = "gemini-2.5-flash";
+  // gemini-2.0-flash reliably triggers Google Search grounding.
+  // gemini-2.5-flash often ignores the Search tool and answers from stale training data.
+  const isSportsGrounding = sportsIntent !== 'sports_general';
+  const primaryModel = isSportsGrounding ? "gemini-2.0-flash" : "gemini-2.5-flash";
   const fallbackModel = "gemini-1.5-flash";
+  const nowISTForPrompt = nowIST.toLocaleDateString('en-IN', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: 'Asia/Kolkata' });
   const intentHint = sportsLiveIntent
-    ? 'LIVE MATCH QUERY: Search for the CURRENTLY IN-PROGRESS match. Return live scores, current innings, wickets, overs, and which team is batting now. Do NOT return completed results from previous matches.'
+    ? `LIVE MATCH QUERY (today is ${nowISTForPrompt}): Search for the CURRENTLY IN-PROGRESS match. Return live scores, current innings, wickets, overs, and which team is batting now. Do NOT return completed results from previous matches.`
     : sportsIntent === 'sports_result'
-    ? 'COMPLETED RESULT QUERY: Search for the MOST RECENTLY COMPLETED match result. Return the winner, final score, date, and key highlights. Do NOT confuse with live or upcoming matches. Do NOT return data from previous seasons.'
+    ? `COMPLETED RESULT QUERY (today is ${nowISTForPrompt}): Search for the MOST RECENTLY COMPLETED match result on or before today. Return the winner, final score, date, and key highlights. Do NOT say a season "hasn't started" without searching — your training data is outdated.`
     : sportsIntent === 'sports_schedule'
-    ? 'SCHEDULE QUERY: Search for today\'s match schedule and upcoming fixtures. Return match times, teams, and venues.'
+    ? `SCHEDULE QUERY (today is ${nowISTForPrompt}): Search for today's match schedule and upcoming fixtures.`
     : '';
   const prompt = intentHint ? `${intentHint}\n\nRealtime query: ${finalQuery}` : `Realtime query: ${finalQuery}`;
   const retryPrefix = "IMPORTANT: Search the live web before answering. Do not rely on internal memory.";
@@ -1754,7 +1762,7 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
       model,
       contents: [{ role: "user", parts: [{ text: realtimePrompt }] }],
       tools: [{ googleSearch: {} }],
-      config: { temperature: strict ? 0.1 : 0.2, systemInstruction: buildRealtimeGroundingInstruction({ strict }) },
+      config: { temperature: strict ? 0.1 : 0.2, systemInstruction: buildRealtimeGroundingInstruction({ strict, todayIST: nowISTForPrompt }) },
       attemptType
     });
     if (!response) throw new Error("quota exhausted");
