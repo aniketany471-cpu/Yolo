@@ -150,7 +150,10 @@ process.on("unhandledRejection", (err) => {
 });
 const db = new Database(path.join(__dirname, "bot_database.sqlite"));
 
-const DONNA_DB_PATH = path.join(__dirname, "donna.db");
+const DONNA_DATA_DIR = "/data";
+const DONNA_DB_PATH = path.join(DONNA_DATA_DIR, "donna.db");
+const DONNA_DB_GZ_PATH = path.join(DONNA_DATA_DIR, "donna.db.gz");
+const DONNA_DB_DOWNLOAD_URL = "https://github.com/Skyemike1/Skye/releases/download/V1/donna.db.gz";
 let donnaDb = null;
 let donnaSearchStmtByMode = { username: null, id: null };
 
@@ -181,66 +184,36 @@ function initDonnaDb() {
 }
 
 async function ensureDonnaDbReady() {
+  try {
+    fs.ensureDirSync(DONNA_DATA_DIR);
+  } catch (e) {
+    console.warn(`[DB] Failed to prepare data directory: ${e?.message || String(e)}`);
+  }
+
   if (fs.existsSync(DONNA_DB_PATH)) {
     const init = initDonnaDb();
-    if (init.ok) console.log("[DB] SQLite connected");
+    if (init.ok) console.log("[DB] Database ready");
     return init;
   }
+
   console.log("[DB] Downloading database...");
   try {
-    const goFilePageUrl = "https://gofile.io/d/5N0nN6";
-    const pageRes = await fetch(goFilePageUrl, { redirect: "follow" });
-    if (!pageRes.ok) throw new Error(`GoFile page HTTP ${pageRes.status}`);
-    const html = await pageRes.text();
+    const res = await fetch(DONNA_DB_DOWNLOAD_URL, { redirect: "follow" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const buffer = Buffer.from(await res.arrayBuffer());
+    if (!buffer?.length) throw new Error("empty file payload");
+    await fs.writeFile(DONNA_DB_GZ_PATH, buffer);
 
-    const candidateUrls = new Set();
-    const directLinkPattern = /https?:\/\/[^"'\s<>]+gofile\.io\/download\/[^"'\s<>]+/gi;
-    for (const match of html.match(directLinkPattern) || []) {
-      try {
-        candidateUrls.add(match.replace(/\\\//g, "/"));
-      } catch (_) {}
-    }
-
-    const escapedLinkPattern = /\"link\"\s*:\s*\"([^\"]+)\"/gi;
-    for (const m of html.matchAll(escapedLinkPattern)) {
-      const link = (m[1] || "").replace(/\\\//g, "/");
-      if (/^https?:\/\/.*gofile\.io\/download\//i.test(link)) candidateUrls.add(link);
-    }
-
-    const fileCandidates = [...candidateUrls];
-    if (fileCandidates.length === 0) {
-      throw new Error("no public GoFile download link found in page response");
-    }
-
-    let downloaded = false;
-    let lastErr = null;
-    for (const fileUrl of fileCandidates) {
-      try {
-        const res = await fetch(fileUrl, { redirect: "follow" });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const contentType = (res.headers.get("content-type") || "").toLowerCase();
-        if (contentType.includes("text/html")) throw new Error("resolved URL returned HTML");
-        const buffer = Buffer.from(await res.arrayBuffer());
-        if (!buffer?.length) throw new Error("empty file payload");
-        await fs.writeFile(DONNA_DB_PATH, buffer);
-        downloaded = true;
-        break;
-      } catch (err) {
-        lastErr = err;
-      }
-    }
-
-    if (!downloaded) {
-      throw new Error(`all public download links failed${lastErr ? `: ${lastErr.message || String(lastErr)}` : ""}`);
-    }
-
-    console.log("[DB] Download complete");
+    console.log("[DB] Extracting database...");
+    await fs.writeFile(DONNA_DB_PATH, await import("node:zlib").then(({ gunzipSync }) => gunzipSync(buffer)));
+    console.log("[DB] Database ready");
   } catch (e) {
-    console.warn(`[donna-db] Download failed: ${e?.message || String(e)}`);
-    return { ok: false, reason: "download_failed", error: e?.message || String(e) };
+    console.warn(`[DB] Database bootstrap failed: ${e?.message || String(e)}`);
+    return { ok: false, reason: "bootstrap_failed", error: e?.message || String(e) };
   }
+
   const init = initDonnaDb();
-  if (init.ok) console.log("[DB] SQLite connected");
+  if (init.ok) console.log("[DB] Database ready");
   return init;
 }
 
