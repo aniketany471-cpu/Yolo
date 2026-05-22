@@ -303,8 +303,7 @@ export async function geminiGroundedSearch(query, apiKey, type = 'general') {
   } catch (e) {
     const msg = (e && e.message ? e.message : String(e)).split('\n')[0];
     if (isQuotaError(e)) {
-      console.warn('[gemini-search] Quota/429 — backing off 30s:', msg);
-      lastCallAt = Date.now() + 30_000;
+      console.warn('[gemini-search] Quota/429 detected — immediate key rotation handled by manager:', msg);
       return null;
     }
     if (msg.includes('API_KEY_INVALID') || msg.includes('API key not valid')) {
