@@ -1419,6 +1419,44 @@ function resolveRealtimeContext(query) {
   return { rewrittenQuery: rewritten, resolvedDate: formatYmd(ref), detected, istToday: formatYmd(istToday), istYesterday: formatYmd(istYesterday), istTomorrow: formatYmd(istTomorrow) };
 }
 
+function detectSportsIntent(query) {
+  const q = (query || "").toLowerCase();
+  const sportsKeywords = /\b(ipl|cricket|football|soccer|nba|nfl|match|matches|score|scores|won|winner|playing|result|live)\b/;
+  const liveIntentKeywords = /\b(live|score|scores|won|winner|playing|today|yesterday|match|result)\b/;
+  return sportsKeywords.test(q) || liveIntentKeywords.test(q);
+}
+
+function buildSportsGroundingQuery(rawQuery, fallbackQuery = "") {
+  const original = (rawQuery || "").trim();
+  const q = original.toLowerCase();
+  const sportName = /\bipl\b/i.test(original) ? "IPL"
+    : /\b(cricket)\b/i.test(original) ? "Cricket"
+    : /\b(football|soccer)\b/i.test(original) ? "Football"
+    : "Sports";
+
+  let templated = fallbackQuery || original;
+  if (/\blive\b/.test(q) && /\b(score|scores)\b/.test(q)) templated = `Live ${sportName} scores today`;
+  else if (/\bwho\s+won\s+yesterday\b|\bwon\s+yesterday\b/.test(q)) templated = `${sportName} match winner yesterday`;
+  else if (/\bwho\s+(is|are)\s+playing\s+today\b|\bwho\s+playing\s+today\b|\bplaying\s+today\b/.test(q)) templated = `${sportName} matches today`;
+  else if (/\btoday\s+match\b|\bmatch\s+today\b/.test(q)) templated = `${sportName} matches today`;
+  else if (/\b(cricket|football)\s+score\b/.test(q)) templated = `Live ${sportName} scores today`;
+  else if (/\blive\s+score\b/.test(q)) templated = `Live ${sportName} scores today`;
+  else if (/\bmatch\s+result\b/.test(q)) templated = `${sportName} match result today`;
+
+  const hasHardBlockTerm = /\b(live|score|scores|won|playing|today|yesterday|match)\b/i.test(original);
+  if (hasHardBlockTerm) {
+    templated = templated
+      .replace(/\bschedule\s+release\b/ig, "")
+      .replace(/\brelease\s+date\b/ig, "")
+      .replace(/\bfuture\b/ig, "")
+      .replace(/\bannounced?\b/ig, "")
+      .replace(/\bupcoming\s+tournament\b/ig, "")
+      .replace(/\s{2,}/g, " ")
+      .trim();
+  }
+  return templated || original || fallbackQuery;
+}
+
 
 async function performWebSearch(query, config, deep = false) {
   const rtc = resolveRealtimeContext(query);
@@ -1513,7 +1551,16 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
     return null;
   }
   const rtc = resolveRealtimeContext(query);
-  const finalQuery = rtc.rewrittenQuery || query;
+  const rawQuery = query;
+  let finalQuery = rtc.rewrittenQuery || query;
+  const sportsIntent = detectSportsIntent(rawQuery);
+  if (sportsIntent) {
+    console.log(`[SPORTS INTENT] raw="${rawQuery}"`);
+    const sportsQuery = buildSportsGroundingQuery(rawQuery, finalQuery);
+    console.log(`[SPORTS QUERY TEMPLATE] "${sportsQuery}"`);
+    finalQuery = sportsQuery;
+  }
+  console.log(`[FINAL GROUNDING SEARCH] "${finalQuery}"`);
   const realtimeStrict = /\b(live|score|scores|result|results|who won|today|yesterday|latest|current|breaking|news|trending|update|match|ipl|cricket|football|nba|nfl|weather|temperature|forecast|price|stock|crypto|bitcoin|schedule|2025|2026|now)\b/i.test(finalQuery);
   if (!realtimeStrict) return null;
   const qLower = finalQuery.toLowerCase();
