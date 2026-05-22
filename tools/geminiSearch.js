@@ -46,12 +46,41 @@ function todayStr() {
   return new Date().toLocaleDateString('en-GB', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
 }
 
+function buildRealtimeContext(nowIso) {
+  return (
+    'Current real-world UTC date/time: ' + nowIso + '\n\n' +
+    'IMPORTANT:\n' +
+    'Use this datetime as factual truth.\n' +
+    "Do not rely on internal model assumptions for today's date.\n" +
+    'For sports/news/live queries, answer relative to this provided datetime.\n'
+  );
+}
+
+function hasRelativeTimeTerm(query = '') {
+  return /\b(yesterday|today|tomorrow|currently|live|now)\b/i.test(query);
+}
+
+function isFutureHallucination(text = '') {
+  const lower = text.toLowerCase();
+  return lower.includes('future') || lower.includes('not yet happened') || lower.includes('not announced');
+}
+
+function shouldRetryForDateHallucination(query, responseText) {
+  if (!isFutureHallucination(responseText)) return false;
+  // Safe retry policy:
+  // - explicit relative-time queries (yesterday/today/now/live/currently/tomorrow), or
+  // - any query likely asking about a real-time event.
+  return hasRelativeTimeTerm(query) || /\b(won|score|result|match|game|news|price|weather)\b/i.test(query);
+}
+
 // ── Per-type prompts ─────────────────────────────────────────────────────────
-function buildPrompt(query, type) {
+function buildPrompt(query, type, nowIso) {
   const today = 'Today is ' + todayStr() + '.';
+  const realtimeContext = buildRealtimeContext(nowIso);
 
   if (type === 'sports') {
     return (
+      realtimeContext +
       today + ' Use this exact date when searching.\n\n' +
       'Search for information about: ' + query + '\n\n' +
       'This may be asking about a PAST result OR an UPCOMING match. Check both.\n' +
@@ -76,6 +105,7 @@ function buildPrompt(query, type) {
 
   if (type === 'weather') {
     return (
+      realtimeContext +
       today + '\n\n' +
       'Find the CURRENT real-time weather for: ' + query + '\n\n' +
       'Return ONLY a valid JSON object — no markdown, no extra text, nothing else:\n' +
@@ -97,6 +127,7 @@ function buildPrompt(query, type) {
 
   // General realtime
   return (
+    realtimeContext +
     today + ' Use this date for context when searching.\n\n' +
     'Search for current, accurate information about: ' + query + '\n\n' +
     'Return only factual information from TODAY or the most recent available date.\n' +
@@ -210,19 +241,44 @@ export async function geminiGroundedSearch(query, apiKey, type = 'general') {
 
   lastCallAt = Date.now();
   try {
+    const nowIso = new Date().toISOString();
+    const finalPrompt = buildPrompt(query, type, nowIso);
+    console.log('[CURRENT SERVER DATE] ' + nowIso);
+    console.log('[FINAL REALTIME PROMPT]\n' + finalPrompt);
+
     console.log('[gemini-search] Grounding (' + (type === 'sports' ? SEARCH_MODEL_SPORTS : SEARCH_MODEL_GENERAL) + ', type=' + type + '): "' + query.slice(0, 80) + '"');
-    const response = await requestGemini({
+    let response = await requestGemini({
       source: 'realtime_grounding',
       requestId: `search:${type}:${query.slice(0, 30)}`,
       apiKey: (apiKey || "").trim(),
       model: type === 'sports' ? SEARCH_MODEL_SPORTS : SEARCH_MODEL_GENERAL,
-      contents: [{ role: 'user', parts: [{ text: buildPrompt(query, type) }] }],
+      contents: [{ role: 'user', parts: [{ text: finalPrompt }] }],
       tools: [{ googleSearch: {} }],
       config: { temperature: 0 },
       attemptType: 'primary',
     });
 
-    const text = (response.text || '').trim();
+    let text = (response.text || '').trim();
+    if (shouldRetryForDateHallucination(query, text)) {
+      console.warn('[gemini-search] Potential date hallucination detected. Retrying grounding once.');
+      const retryPrompt =
+        finalPrompt +
+        '\nAdditional guardrail:\n' +
+        'If an event date is on or before the provided UTC date/time, do not label it as future/not yet happened/not announced.\n';
+      console.log('[FINAL REALTIME PROMPT][RETRY]\n' + retryPrompt);
+      response = await requestGemini({
+        source: 'realtime_grounding',
+        requestId: `search_retry:${type}:${query.slice(0, 24)}`,
+        apiKey: (apiKey || "").trim(),
+        model: type === 'sports' ? SEARCH_MODEL_SPORTS : SEARCH_MODEL_GENERAL,
+        contents: [{ role: 'user', parts: [{ text: retryPrompt }] }],
+        tools: [{ googleSearch: {} }],
+        config: { temperature: 0 },
+        attemptType: 'fallback',
+      });
+      text = (response.text || '').trim();
+    }
+
     if (!text || text.length < 10) {
       console.warn('[gemini-search] Empty response');
       return null;
