@@ -1440,6 +1440,17 @@ function sanitizeSportsLiveQuery(q) {
     .trim();
 }
 
+function normalizeNoLiveIplResponse(answer = "", rawQuery = "") {
+  const q = String(rawQuery || "").toLowerCase();
+  const a = String(answer || "").toLowerCase();
+  const isIpl = /\bipl\b/.test(q) || /\bipl\b/.test(a);
+  const noLive = /\b(no\s+live|no\s+match(?:es)?(?:\s+(?:right\s+now|currently|today))?|not\s+live|no\s+ongoing\s+match(?:es)?)\b/.test(a);
+  if (isIpl && noLive) {
+    return "There are currently no live IPL matches happening right now.";
+  }
+  return String(answer || "").trim();
+}
+
 function buildSportsLiveSearchQueries(rawQuery, sportName = "Sports") {
   const q = String(rawQuery || "").toLowerCase();
   if (/\blive\b/.test(q) && /\b(score|scores)\b/.test(q)) {
@@ -1664,8 +1675,10 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
     const raw = (response?.text || "").trim();
     const data = extractJson(raw);
     if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error("invalid json");
-    const answerText = String(data.answer || "").trim();
     const citations = extractGroundingCitations(data, response);
+    const answerText = normalizeNoLiveIplResponse(data.answer, rawQuery);
+    data.answer = answerText;
+    console.log(`[GROUNDING DATA SOURCE] ${citations.length ? citations.join(" | ") : "none"}`);
     const groundingMetadata = response?.candidates?.[0]?.groundingMetadata;
     data.sources = citations;
     const modelQueries = Array.isArray(data.search_queries) ? data.search_queries : [finalQuery];
@@ -1703,6 +1716,7 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
     const data = await runOnce(primaryModel, "primary", false);
     gs.cache.set(cacheKey, { value: data, expiresAt: Date.now() + cacheTtl });
     console.log("[grounding] fallback_used=false");
+    console.log("[FALLBACK RESPONSE USED] false");
     console.log("[grounding] response_trusted=true");
     console.log("[grounding] sending_reply=true");
     console.log(`[grounding] total_attempts=${usedRequests}`);
@@ -1717,6 +1731,7 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
       const data = await runOnce(fallbackModel, "fallback", true);
       gs.cache.set(cacheKey, { value: data, expiresAt: Date.now() + cacheTtl });
       console.log(`[grounding] fallback_used=${fallbackUsed}`);
+      console.log(`[FALLBACK RESPONSE USED] ${fallbackUsed}`);
       console.log("[grounding] response_trusted=true");
       console.log("[grounding] sending_reply=true");
       console.log(`[grounding] total_attempts=${usedRequests}`);
@@ -1727,6 +1742,7 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
         console.log("[gemini-search] quota cooldown started");
       }
       console.log(`[grounding] fallback_used=${fallbackUsed}`);
+      console.log(`[FALLBACK RESPONSE USED] ${fallbackUsed}`);
       console.log("[grounding] response_trusted=false");
       console.log("[grounding] sending_reply=false");
       console.log(`[grounding] total_attempts=${usedRequests}`);
@@ -1879,7 +1895,10 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
     dateStyle: "full",
     timeStyle: "short"
   });
-  const timeContext = `[Current Context: Date is ${dateStr}. Timezone is Asia/Kolkata (IST). Current Year: 2026. Month: May 2026. You are operating in realtime. Never assume outdated relative dates.]`;
+  const nowIST = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
+  const currentYearIST = nowIST.getFullYear();
+  const currentMonthIST = nowIST.toLocaleString("en-US", { month: "long" });
+  const timeContext = `[Current Context: Date is ${dateStr}. Timezone is Asia/Kolkata (IST). Current Year: ${currentYearIST}. Month: ${currentMonthIST} ${currentYearIST}. You are operating in realtime. Never assume outdated relative dates.]`;
   let systemPrompt = isRealtimeQuery ? [
     "Realtime mode is active.",
     "Use only grounded live web facts.",
@@ -2146,7 +2165,8 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
           const sourceBlock = cleanSources.length
             ? `\n\nSources:\n${cleanSources.map((s, i) => `${i + 1}. ${s}`).join("\n")}`
             : "";
-          trustedGroundedReply = groundedAnswer + sourceBlock;
+          trustedGroundedReply = normalizeNoLiveIplResponse(groundedAnswer, rawUserMessage) + sourceBlock;
+          console.log(`[DYNAMIC SPORTS RESPONSE] ${/\bipl|cricket|match|score\b/i.test(rawUserMessage) ? "enabled" : "not_applicable"}`);
           realtimeSearchFailed = false;
         } else if (isRealtimeQuery) {
           realtimeSearchFailed = true;
@@ -2252,6 +2272,10 @@ User Message: ${prompt}`;
   // ── Realtime query + search failed: bypass AI entirely — prevent training-data hallucination ──
   if (realtimeSearchFailed) {
     console.log("[AI bypass] Returning realtime verification failure message");
+    if (/\bipl\b/i.test(rawUserMessage)) {
+      console.log("[DYNAMIC SPORTS RESPONSE] no_live_ipl_fallback");
+      return "There are currently no live IPL matches happening right now.";
+    }
     return "I couldn't verify live realtime information.";
   }
 
