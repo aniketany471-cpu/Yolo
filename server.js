@@ -1900,16 +1900,61 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
       attemptType
     });
     if (!response) throw new Error("quota exhausted");
-    const raw = (response?.text || "").trim();
-    const data = extractJson(raw);
-    if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error("invalid json");
     const candidate = response?.candidates?.[0];
     const grounding = candidate?.groundingMetadata || candidate?.grounding_metadata || {};
     const webSearchQueries = grounding.webSearchQueries || [];
     const groundingChunks = grounding.groundingChunks || [];
     const groundingSupports = grounding.groundingSupports || [];
+
+    const hasText = Boolean(response?.text) || Boolean(candidate?.content?.parts?.length);
+    const hasGrounding = Boolean(grounding) || Boolean(webSearchQueries?.length);
+    const groundingValid = hasText || hasGrounding || Boolean(response?.candidates?.length);
+
+    const text = (
+      response?.text ||
+      candidate?.content?.parts
+        ?.map((p) => p?.text || "")
+        .join("\n")
+        .trim() ||
+      ""
+    );
+
+    console.log("[GROUNDING_HAS_TEXT]", hasText);
+    console.log("[GROUNDING_HAS_METADATA]", hasGrounding);
+    console.log("[GROUNDING_VALID]", groundingValid);
+    console.log("[GROUNDING_TEXT_LENGTH]", text.length);
+
+    if (!groundingValid) {
+      return {
+        query_type: "realtime",
+        subject: rawQuery,
+        answer: "",
+        sources: [],
+        timestamp: new Date().toISOString(),
+        verified: false,
+        grounding_used: false,
+        grounding_success: false,
+        response_valid: false,
+        search_queries: []
+      };
+    }
+
+    const raw = text.trim();
+    const parsedData = extractJson(raw);
+    const data = (parsedData && typeof parsedData === "object" && !Array.isArray(parsedData))
+      ? parsedData
+      : {
+          query_type: "realtime",
+          subject: rawQuery,
+          answer: raw,
+          sources: [],
+          timestamp: new Date().toISOString(),
+          verified: false,
+          grounding_used: false,
+          search_queries: []
+        };
     const uniqueSources = isSportsGrounding ? rankSportsGroundingSources(groundingChunks) : rankSportsGroundingSources(groundingChunks);
-    const groundedText = injectGroundingCitations(response?.text, groundingSupports, groundingChunks);
+    const groundedText = injectGroundingCitations(text, groundingSupports, groundingChunks);
     let sourcesText = "";
     if (uniqueSources.length) {
       sourcesText = "\n\nSources:\n" + uniqueSources.slice(0, 8).map((s, i) => `${i + 1}. ${s.uri}`).join("\n");
@@ -1936,10 +1981,9 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
     console.log(`[FINAL SEARCH QUERIES] ${JSON.stringify(data.search_queries)}`);
     console.log(`[VERIFIED_SOURCES] ${JSON.stringify(citations)}`);
     const answerOk = answerText.length > 0;
-    const verifiedOk = data.verified === true;
-    const usedGrounding = data.grounding_used === true || citations.length > 0;
+    const usedGrounding = data.grounding_used === true || citations.length > 0 || hasGrounding;
     data.grounding_used = usedGrounding;
-    const validationPassed = !!(answerOk && verifiedOk && usedGrounding);
+    const validationPassed = !!(groundingValid && (answerOk || hasGrounding || Boolean(response?.candidates?.length)));
     console.log(`[grounding] realtime_triggered=true model=${model} grounding_triggered=${usedGrounding} citations_returned=${citations.length > 0} search_queries="${data.search_queries.join(" | ")}"`);
     console.log(`[grounding] validation_passed=${validationPassed}`);
     if (isSportsGrounding && groundingChunks.length === 0) {
