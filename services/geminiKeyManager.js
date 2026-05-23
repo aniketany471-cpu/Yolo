@@ -1,11 +1,10 @@
-const COOLDOWN_MS = 5 * 60 * 1000;
-const HARD_COOLDOWN_MS = 10 * 60 * 1000;
+const TEMP_ERROR_COOLDOWN_MS = 15 * 1000;
+const QUOTA_COOLDOWN_MS = 60 * 1000;
 
 const state = {
   loaded: false,
   keys: [],
-  cooldowns: new Map(),
-  consecutive429: new Map(),
+  keyStates: [],
   currentIndex: 0
 };
 
@@ -23,6 +22,12 @@ function normalizeKeys() {
 function ensureLoaded() {
   if (state.loaded) return;
   state.keys = normalizeKeys();
+  state.keyStates = state.keys.map(() => ({
+    cooldownUntil: 0,
+    failures: 0,
+    lastUsed: 0,
+    requests: 0
+  }));
   state.loaded = true;
   console.log(`[gemini-keys] loaded=${state.keys.length}`);
 }
@@ -34,7 +39,21 @@ function isRetriableError(error) {
 
 function isQuotaLikeError(error) {
   const msg = (error?.message || String(error || "")).toLowerCase();
-  return msg.includes("429") || msg.includes("resource_exhausted") || msg.includes("quota exceeded") || msg.includes("quota") || msg.includes("rate limit") || msg.includes("too many requests");
+  return msg.includes("429") || msg.includes("resource_exhausted") || msg.includes("quota exceeded");
+}
+
+function isTemporaryError(error) {
+  const msg = (error?.message || String(error || "")).toLowerCase();
+  return msg.includes("503") || msg.includes("econnreset") || msg.includes("etimedout") || msg.includes("fetch failed") || msg.includes("socket hang up") || msg.includes("timeout") || msg.includes("temporar") || msg.includes("unavailable") || /\b5\d\d\b/.test(msg);
+}
+
+function restoreIfExpired(index) {
+  const ks = state.keyStates[index];
+  if (!ks) return;
+  if (ks.cooldownUntil > 0 && Date.now() >= ks.cooldownUntil) {
+    ks.cooldownUntil = 0;
+    console.log("[KEY RESTORED]", index + 1);
+  }
 }
 
 function selectNextHealthyKey(keys) {
@@ -42,29 +61,46 @@ function selectNextHealthyKey(keys) {
   const now = Date.now();
   for (let offset = 0; offset < keys.length; offset++) {
     const idx = (state.currentIndex + offset) % keys.length;
-    const key = keys[idx];
-    const until = state.cooldowns.get(key) || 0;
+    const keyState = state.keyStates[idx];
+    restoreIfExpired(idx);
+    const until = keyState?.cooldownUntil || 0;
+    console.log("[KEY STATUS]", {
+      index: idx + 1,
+      cooldownUntil: until,
+      failures: keyState?.failures || 0
+    });
     if (until > now) {
-      console.warn(`[KEY SKIPPED] index=${idx + 1}`);
-      console.warn(`[KEY COOLDOWN] until=${new Date(until).toISOString()} ms_remaining=${until - now}`);
+      console.log("[KEY COOLDOWN]", idx + 1);
       continue;
     }
     state.currentIndex = (idx + 1) % keys.length;
-    return { key, index: idx };
+    return { key: keys[idx], index: idx };
   }
   return null;
 }
 
-function markCooldown(key, index, reason, error) {
-  const quotaLike = isQuotaLikeError(error);
-  const prev429 = state.consecutive429.get(key) || 0;
-  const next429 = quotaLike ? prev429 + 1 : 0;
-  state.consecutive429.set(key, next429);
-  const cooldownMs = quotaLike && next429 >= 2 ? HARD_COOLDOWN_MS : COOLDOWN_MS;
-  const until = Date.now() + cooldownMs;
-  state.cooldowns.set(key, until);
-  console.warn(`[KEY ROTATION] key_failed index=${index + 1} reason=${reason}`);
-  console.warn(`[KEY COOLDOWN] index=${index + 1} ms=${cooldownMs} until=${new Date(until).toISOString()} consecutive_429=${next429}`);
+function selectOldestCooldownKey(keys) {
+  let best = null;
+  for (let i = 0; i < keys.length; i++) {
+    restoreIfExpired(i);
+    const until = state.keyStates[i]?.cooldownUntil || 0;
+    if (best === null || until < best.cooldownUntil) best = { key: keys[i], index: i, cooldownUntil: until };
+  }
+  return best;
+}
+
+function markCooldown(index, error) {
+  const keyState = state.keyStates[index];
+  if (!keyState) return;
+  keyState.failures += 1;
+  if (isQuotaLikeError(error)) {
+    keyState.cooldownUntil = Date.now() + QUOTA_COOLDOWN_MS;
+    console.log("[KEY QUOTA ERROR]", error?.message || String(error || ""));
+  } else if (isTemporaryError(error)) {
+    keyState.cooldownUntil = Date.now() + TEMP_ERROR_COOLDOWN_MS;
+    console.log("[KEY TEMP ERROR]", error?.message || String(error || ""));
+  }
+  console.log("[KEY COOLDOWN]", index + 1);
 }
 
 export function getGeminiPrimaryKey() {
@@ -82,25 +118,27 @@ export async function withGeminiKeyRotation(executor, { source = "unknown", over
 
   const tried = new Set();
   while (tried.size < candidateKeys.length) {
-    const selected = selectNextHealthyKey(candidateKeys);
+    let selected = selectNextHealthyKey(candidateKeys);
     if (!selected) {
-      console.warn("[ALL KEYS EXHAUSTED]");
-      return null;
+      const retryKey = selectOldestCooldownKey(candidateKeys);
+      if (!retryKey) return null;
+      console.log("[KEY RETRY]", retryKey.index + 1);
+      selected = { key: retryKey.key, index: retryKey.index };
     }
     if (tried.has(selected.index)) continue;
     tried.add(selected.index);
     console.log(`[ACTIVE KEY INDEX] ${selected.index + 1}`);
+    state.keyStates[selected.index].lastUsed = Date.now();
+    state.keyStates[selected.index].requests += 1;
 
     try {
       return await executor(selected.key, selected.index);
     } catch (error) {
-      const reason = (error?.message || "unknown").slice(0, 80);
       if (!isRetriableError(error)) throw error;
-      markCooldown(selected.key, selected.index, reason, error);
+      markCooldown(selected.index, error);
       const next = selectNextHealthyKey(candidateKeys);
       if (next) console.log(`[KEY ROTATION] rotating_to=${next.index + 1} source=${source}`);
     }
   }
-  console.warn("[ALL KEYS EXHAUSTED]");
   return null;
 }
