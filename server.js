@@ -18,7 +18,6 @@ import { analyzeTelegramImageWithGemini, buildVisionPrompt } from "./services/vi
 import { requestGemini, beginGeminiRequestScope } from "./services/geminiManager.js";
 import { getGeminiPrimaryKey } from "./services/geminiKeyManager.js";
 import { getAccuWeather } from "./services/weather.js";
-import { isVertexAIAvailable, vertexGroundedSearch } from "./services/vertexai.js";
 // Image service — loaded dynamically so a missing/broken module never crashes the bot
 let ziGenerateImage = null;
 let ziParseImageModelKeyword = null;
@@ -1821,6 +1820,7 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
   // gemini-2.5-flash often ignores the Search tool and answers from stale training data.
   const isSportsGrounding = sportsIntent !== 'sports_general';
   const primaryModel = isSportsGrounding ? "gemini-2.0-flash" : "gemini-2.5-flash";
+  console.log("[GROUNDING_PROVIDER]", "Google AI Studio Gemini");
   const fallbackModel = "gemini-1.5-flash";
   const nowISTForPrompt = nowIST.toLocaleDateString('en-IN', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: 'Asia/Kolkata' });
   const intentHint = isSportsLive
@@ -1927,39 +1927,6 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
     if (!validationPassed) throw new Error("validation failed");
     return { ...data, grounding_success: true, response_valid: true };
   };
-
-  // ── Vertex AI grounding (sports only) ──────────────────────────────────────
-  // Uses service-account credentials → produces vertexaisearch.cloud.google.com
-  // citations and reliably fires Google Search every time (no training-data fallback).
-  if (isSportsGrounding && isVertexAIAvailable()) {
-    try {
-      console.log('[grounding] trying Vertex AI grounding for sports query');
-      const sysInstruction = buildRealtimeGroundingInstruction({ strict: false, todayIST: nowISTForPrompt });
-      const vx = await vertexGroundedSearch(prompt, sysInstruction);
-      if (vx.groundingUsed && vx.text) {
-        let vxData = null;
-        try { vxData = JSON.parse(vx.text); } catch {
-          const s = vx.text.indexOf('{'), e = vx.text.lastIndexOf('}');
-          if (s >= 0 && e > s) { try { vxData = JSON.parse(vx.text.slice(s, e + 1)); } catch {} }
-        }
-        if (vxData && typeof vxData === 'object' && vxData.answer) {
-          const answerText = isSportsLive
-            ? normalizeNoLiveIplResponse(String(vxData.answer || ''), rawQuery)
-            : String(vxData.answer || '').trim();
-          vxData.answer       = answerText;
-          vxData.sources      = vx.citations.slice(0, 5);
-          vxData.search_queries = vx.searchQueries;
-          vxData.verified     = true;
-          vxData.grounding_used = true;
-          console.log(`[grounding] vertex_ai_success citations=${vx.citations.length} queries=${JSON.stringify(vx.searchQueries)}`);
-          return { ...vxData, grounding_success: true, response_valid: true };
-        }
-      }
-      console.log('[grounding] vertex_ai_no_grounding — falling back to Gemini AI Studio');
-    } catch (vxErr) {
-      console.log(`[grounding] vertex_ai_failed: ${vxErr.message} — falling back to Gemini AI Studio`);
-    }
-  }
 
   let usedRequests = 0;
   let fallbackUsed = false;
