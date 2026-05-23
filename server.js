@@ -1284,25 +1284,17 @@ function isRealtimeQuery(query) {
   return /\b(live|today|tonight|right now|this week|current|latest|breaking|just now|happening|trending|score[s]?|result[s]?|match|winner|champion|ipl|cricket|t20|odi|football|soccer|nba|nfl|f1|grand\s*prix|motogp|tennis|wimbledon|us\s*open|french\s*open|australian\s*open|atp|wta|boxing|ufc|mma|knockout|hockey|nhl|badminton|bwf|golf|pga|masters|rugby|six\s*nations|kabaddi|pkl|wwe|olympics|athletics|prix|price[s]?|crypto|bitcoin|btc|eth|stock|nifty|sensex|share\s*price|weather|temp(erature)?|forecast|news|election|who\s*won|what\s*happened|did\s*.{0,20}\s*win|update[s]?)\b/i.test(q);
 }
 
-function buildRealtimeGroundingInstruction({ strict = false, todayIST = "" } = {}) {
+function buildRealtimeGroundingInstruction({ todayIST = "" } = {}) {
   const dateContext = todayIST
-    ? `TODAY'S DATE IS ${todayIST} (IST). This is factual and must be treated as ground truth. Your training data may be outdated — IGNORE internal memory about schedules, season status, or events and rely ONLY on Google Search results.`
-    : "";
-  const base = [
+    ? `Today is ${todayIST} (IST). Use Google Search grounding for current information.`
+    : "Use Google Search grounding for current information.";
+  return [
     "You are Donna, a live AI assistant.",
     dateContext,
-    "CRITICAL: You MUST use the Google Search tool before answering. Do NOT answer from training memory for any sports, news, scores, results, or current events.",
-    "Your training data is outdated. Any season, tournament, or event you think 'has not started' may already be in progress or completed. SEARCH to verify.",
-    "Never rely on internal memory for live events, schedules, scores, prices, weather, or news.",
-    "If live verification fails, clearly say you could not verify the information.",
-    "Prefer verified search facts over your own assumptions.",
-    "Return JSON only: {\"query_type\":\"\",\"subject\":\"\",\"answer\":\"\",\"sources\":[],\"timestamp\":\"\",\"verified\":true,\"grounding_used\":true,\"search_queries\":[]}"
-  ].filter(Boolean);
-  if (strict) {
-    base.push("STRICT: If grounding/search is unavailable or not used, set verified=false and grounding_used=false, and set answer to exactly: I couldn't verify live realtime information.");
-  }
-  return base.join("\n");
+    "Answer concisely and accurately in natural language."
+  ].join("\n");
 }
+
 
 function extractGroundingCitations(data = {}, response = {}) {
   const sourceSet = new Set();
@@ -1865,14 +1857,9 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
   console.log("[GROUNDING_PROVIDER]", "Google AI Studio Gemini");
   const fallbackModel = "gemini-1.5-flash";
   const nowISTForPrompt = nowIST.toLocaleDateString('en-IN', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: 'Asia/Kolkata' });
-  const intentHint = isSportsLive
-    ? `LIVE MATCH QUERY (today is ${nowISTForPrompt}): Search for the CURRENTLY IN-PROGRESS match. Return live scores, current innings, wickets, overs, and which team is batting now. Do NOT return completed results from previous matches.`
-    : sportsIntent === 'sports_result'
-    ? `COMPLETED RESULT QUERY (today is ${nowISTForPrompt}): Search for the MOST RECENTLY COMPLETED match result on or before today. Return the winner, final score, date, and key highlights. Do NOT say a season "hasn't started" without searching — your training data is outdated.`
-    : sportsIntent === 'sports_schedule'
-    ? `SCHEDULE QUERY (today is ${nowISTForPrompt}): Search for today's match schedule and upcoming fixtures.`
-    : '';
-  const prompt = intentHint ? `${intentHint}\n\nRealtime query: ${finalQuery}` : `Realtime query: ${finalQuery}`;
+  const prompt = (sportsIntent !== 'sports_general')
+    ? `Use realtime Google Search grounding.\n\nToday in IST: ${nowISTForPrompt}\n\nQuery:\n"${finalQuery}"\n\nProvide the latest sports information available right now.`
+    : `Answer this realtime query using Google Search grounding:\n\nToday in IST: ${nowISTForPrompt}\n\nQuery: "${finalQuery}"\n\nGive a concise and accurate realtime answer. Include teams, scores, winners, or match status if available.`;
   const extractJson = (txt) => {
     try { return JSON.parse(txt); } catch {}
     const s = txt.indexOf("{"), e = txt.lastIndexOf("}");
@@ -1887,7 +1874,7 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
     const msg = (error?.message || String(error || "")).toLowerCase();
     return msg.includes("429") || msg.includes("quota") || msg.includes("resource_exhausted");
   };
-  const runOnce = async (model, attemptType, strict = false) => {
+  const runOnce = async (model, attemptType) => {
     assertExternalRequestLimit();
     const response = await requestGemini({
       source: "realtime_grounding",
@@ -1896,7 +1883,7 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
       model,
       contents: [{ role: "user", parts: [{ text: prompt }] }],
       tools: [{ googleSearch: {} }],
-      config: { temperature: strict ? 0.1 : 0.2, systemInstruction: buildRealtimeGroundingInstruction({ strict, todayIST: nowISTForPrompt }) },
+      config: { temperature: 0.2, systemInstruction: buildRealtimeGroundingInstruction({ todayIST: nowISTForPrompt }) },
       attemptType
     });
     if (!response) throw new Error("quota exhausted");
@@ -2010,7 +1997,7 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
     console.log("[grounding] request_count=1");
     console.log(`[grounding] model=${primaryModel} attempt=1/1`);
     usedRequests += 1;
-    const data = await runOnce(primaryModel, "primary", false);
+    const data = await runOnce(primaryModel, "primary");
     console.log("[grounding] fallback_used=false");
     console.log("[FALLBACK RESPONSE USED] false");
     console.log("[grounding] response_trusted=true");
