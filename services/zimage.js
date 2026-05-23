@@ -1,16 +1,26 @@
 /**
  * Image generation service
- * Priority 1: Grok Imagine Image Lite (via Bluesminds API)
- * Priority 2: OpenAI GPT-Image-1 (via Bluesminds API)
- * Priority 3: Zimage Turbo
+ * Priority 1: Grok Imagine Image Lite — 3 attempts (via Bluesminds API)
+ * Priority 2: OpenAI GPT-Image-1     — 2 attempts (via Bluesminds API)
+ * Priority 3: Zimage Turbo           — last resort only
  */
 
 const ZIMAGE_GENERATE_URL = "https://zimageturbo.ai/api/generate";
 
-const PROVIDER_TIMEOUT_MS = 90_000;
-const DOWNLOAD_TIMEOUT_MS = 30_000;
-const OPENAI_MODEL        = "gpt-image-1";
-const GROK_IMAGINE_MODEL  = "grok-imagine-image-lite";
+const PROVIDER_TIMEOUT_MS  = 90_000;
+const DOWNLOAD_TIMEOUT_MS  = 30_000;
+const OPENAI_MODEL         = "gpt-image-1";
+const GROK_IMAGINE_MODEL   = "grok-imagine-image-lite";
+
+// Retry config — exhaust free providers before touching paid zimage-turbo
+const GROK_MAX_ATTEMPTS  = 3;   // attempt 1 + 2 retries
+const GROK_RETRY_DELAY   = 3000; // ms between grok retries
+const OPENAI_MAX_ATTEMPTS = 2;   // attempt 1 + 1 retry
+const OPENAI_RETRY_DELAY  = 5000; // ms between openai retries
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
 function sanitizePrompt(prompt) {
   return String(prompt || "")
@@ -61,7 +71,7 @@ async function grokImagineImage(prompt) {
   const baseUrl = (process.env.BLUEMINDS_BASE_URL || "https://api.bluesminds.com").replace(/\/+$/, "");
   const url     = `${baseUrl}/v1/images/generations`;
 
-  // Try b64_json first — avoids CDN download entirely
+  // Try b64_json first (no CDN download = no 403), then url as fallback
   for (const responseFormat of ["b64_json", "url"]) {
     const res = await fetchWithTimeout(
       url,
@@ -99,7 +109,6 @@ async function grokImagineImage(prompt) {
       });
     }
 
-    // If b64_json format returned neither, fall through to url format
     if (responseFormat === "b64_json") continue;
   }
 
@@ -185,46 +194,63 @@ async function zimageTurbo(prompt, options = {}) {
 
 /**
  * Generate an image for the given prompt.
- * Priority 1: Grok Imagine Image Lite  (BLUEMINDS_API_KEY + api.bluesminds.com)
- * Priority 2: OpenAI GPT-Image-1       (BLUEMINDS_API_KEY + BLUEMINDS_BASE_URL)
- * Priority 3: Zimage Turbo             (ZIMAGE_API_KEY)
+ *
+ * Attempt order (zimage-turbo only reached if all free attempts fail):
+ *   1. Grok Imagine Image Lite — attempt 1 of 3
+ *   2. Grok Imagine Image Lite — attempt 2 of 3 (after 3 s)
+ *   3. Grok Imagine Image Lite — attempt 3 of 3 (after 3 s)
+ *   4. OpenAI GPT-Image-1      — attempt 1 of 2
+ *   5. OpenAI GPT-Image-1      — attempt 2 of 2 (after 5 s)
+ *   6. Zimage Turbo            — last resort
+ *
  * Returns { buffer: Buffer, provider: string }
  */
 export async function generateImage(prompt, config = {}, options = {}) {
   void config;
   const errors = [];
 
-  // ── Priority 1: Grok Imagine Image Lite ────────────────────────────────────
-  console.log(`[img] provider=grok-imagine model=${GROK_IMAGINE_MODEL}`);
-  console.log("[img] primary_generation_started=true");
-  try {
-    const buffer = await grokImagineImage(prompt);
-    console.log("[img] generation_success=true provider=grok-imagine");
-    return { buffer, provider: "grok-imagine" };
-  } catch (e) {
-    console.warn(`[img] Grok Imagine failed: ${e.message}`);
-    errors.push(`grok-imagine: ${e.message}`);
+  // ── Priority 1: Grok Imagine Image Lite — up to 3 attempts ─────────────────
+  for (let attempt = 1; attempt <= GROK_MAX_ATTEMPTS; attempt++) {
+    console.log(`[img] provider=grok-imagine model=${GROK_IMAGINE_MODEL} attempt=${attempt}/${GROK_MAX_ATTEMPTS}`);
+    try {
+      const buffer = await grokImagineImage(prompt);
+      console.log(`[img] generation_success=true provider=grok-imagine attempt=${attempt}`);
+      return { buffer, provider: "grok-imagine" };
+    } catch (e) {
+      console.warn(`[img] grok-imagine attempt ${attempt}/${GROK_MAX_ATTEMPTS} failed: ${e.message}`);
+      errors.push(`grok-imagine[${attempt}]: ${e.message}`);
+      if (attempt < GROK_MAX_ATTEMPTS) {
+        console.log(`[img] retrying grok-imagine in ${GROK_RETRY_DELAY / 1000}s...`);
+        await sleep(GROK_RETRY_DELAY);
+      }
+    }
   }
 
-  // ── Priority 2: OpenAI GPT-Image-1 ─────────────────────────────────────────
-  console.log(`[img] switching_provider=openai model=${OPENAI_MODEL}`);
-  try {
-    const buffer = await openaiImage(prompt, options);
-    console.log("[img] generation_success=true provider=openai");
-    return { buffer, provider: "openai" };
-  } catch (e) {
-    console.warn(`[img] OpenAI fallback failed: ${e.message}`);
-    errors.push(`openai: ${e.message}`);
+  // ── Priority 2: OpenAI GPT-Image-1 — up to 2 attempts ──────────────────────
+  for (let attempt = 1; attempt <= OPENAI_MAX_ATTEMPTS; attempt++) {
+    console.log(`[img] switching_provider=openai model=${OPENAI_MODEL} attempt=${attempt}/${OPENAI_MAX_ATTEMPTS}`);
+    try {
+      const buffer = await openaiImage(prompt, options);
+      console.log(`[img] generation_success=true provider=openai attempt=${attempt}`);
+      return { buffer, provider: "openai" };
+    } catch (e) {
+      console.warn(`[img] openai attempt ${attempt}/${OPENAI_MAX_ATTEMPTS} failed: ${e.message}`);
+      errors.push(`openai[${attempt}]: ${e.message}`);
+      if (attempt < OPENAI_MAX_ATTEMPTS) {
+        console.log(`[img] retrying openai in ${OPENAI_RETRY_DELAY / 1000}s...`);
+        await sleep(OPENAI_RETRY_DELAY);
+      }
+    }
   }
 
-  // ── Priority 3: Zimage Turbo ────────────────────────────────────────────────
-  console.log("[img] switching_provider=zimage_turbo");
+  // ── Priority 3: Zimage Turbo — last resort ──────────────────────────────────
+  console.log("[img] switching_provider=zimage_turbo (last resort — all free providers exhausted)");
   try {
     const buffer = await zimageTurbo(prompt, options);
     console.log("[img] generation_success=true provider=zimage-turbo");
     return { buffer, provider: "zimage-turbo" };
   } catch (e) {
-    console.warn(`[img] Zimage fallback failed: ${e.message}`);
+    console.warn(`[img] zimage-turbo failed: ${e.message}`);
     errors.push(`zimage: ${e.message}`);
   }
 
