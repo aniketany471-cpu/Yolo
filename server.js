@@ -21,9 +21,11 @@ import { getAccuWeather } from "./services/weather.js";
 import { isVertexAIAvailable, vertexGroundedSearch } from "./services/vertexai.js";
 // Image service — loaded dynamically so a missing/broken module never crashes the bot
 let ziGenerateImage = null;
+let ziParseImageModelKeyword = null;
 try {
   const _ziMod = await import("./services/zimage.js");
   ziGenerateImage = _ziMod.generateImage;
+  ziParseImageModelKeyword = _ziMod.parseImageModelKeyword;
   console.log("[img] Image generation service loaded OK");
 } catch (_ziErr) {
   console.warn("[img] Image service unavailable:", _ziErr.message);
@@ -4099,9 +4101,11 @@ async function startServer() {
             await new Promise((r) => setTimeout(r, 800));
             await status.update(HS.imageRender());
             if (!ziGenerateImage) throw new Error("Image service not loaded — check server logs");
-            const { buffer, provider } = await ziGenerateImage(text, config);
+            const { cleanPrompt: _imgPrompt1, forceProvider: _imgForce1 } = ziParseImageModelKeyword ? ziParseImageModelKeyword(text) : { cleanPrompt: text, forceProvider: null };
+            if (_imgForce1) console.log(`[img] user_selected_model=${_imgForce1}`);
+            const { buffer, provider } = await ziGenerateImage(_imgPrompt1, config, { forceProvider: _imgForce1 });
             await status.update(HS.upload());
-            const caption = `🎨 **Generated Image**\n\`${text.slice(0, 120)}\`\n\n_${usedCount + 1}/${IMAGE_LIMIT} free generations used_`;
+            const caption = `🎨 **Generated Image**\n\`${_imgPrompt1.slice(0, 120)}\`\n\n_${usedCount + 1}/${IMAGE_LIMIT} free generations used_`;
             const tmpImgPath = path.join(tempDir, `img_${Date.now()}.jpg`);
             await fs.writeFile(tmpImgPath, buffer);
             try {
@@ -4181,7 +4185,9 @@ async function startServer() {
             try {
               await status.update(HS.image());
               if (!ziGenerateImage) throw new Error("Image service not loaded");
-              const { buffer, provider } = await ziGenerateImage(text, config);
+              const { cleanPrompt: _imgPrompt2, forceProvider: _imgForce2 } = ziParseImageModelKeyword ? ziParseImageModelKeyword(text) : { cleanPrompt: text, forceProvider: null };
+              if (_imgForce2) console.log(`[img] user_selected_model=${_imgForce2}`);
+              const { buffer, provider } = await ziGenerateImage(_imgPrompt2, config, { forceProvider: _imgForce2 });
               const tmpImgPath = path.join(tempDir, `img_${Date.now()}.jpg`);
               await fs.writeFile(tmpImgPath, buffer);
 
@@ -4256,9 +4262,11 @@ async function startServer() {
               await new Promise((r) => setTimeout(r, 800));
               await status.update(HS.imageRender());
               if (!ziGenerateImage) throw new Error("Image service not loaded — check server logs");
-              const { buffer, provider } = await ziGenerateImage(imgPrompt, config);
+              const { cleanPrompt: _imgPrompt3, forceProvider: _imgForce3 } = ziParseImageModelKeyword ? ziParseImageModelKeyword(imgPrompt) : { cleanPrompt: imgPrompt, forceProvider: null };
+              if (_imgForce3) console.log(`[img] user_selected_model=${_imgForce3}`);
+              const { buffer, provider } = await ziGenerateImage(_imgPrompt3, config, { forceProvider: _imgForce3 });
               await status.update(HS.upload());
-              const caption = `🎨 **Generated Image**\n\`${imgPrompt.slice(0, 120)}\`\n\n_${usedCount + 1}/${IMAGE_LIMIT} free generations used_`;
+              const caption = `🎨 **Generated Image**\n\`${_imgPrompt3.slice(0, 120)}\`\n\n_${usedCount + 1}/${IMAGE_LIMIT} free generations used_`;
               const tmpImgPath = path.join(tempDir, `img_${Date.now()}.jpg`);
               await fs.writeFile(tmpImgPath, buffer);
               try {
