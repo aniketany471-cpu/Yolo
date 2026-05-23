@@ -1750,6 +1750,14 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
   );
   console.log(`[TEMPORAL] ${JSON.stringify(temporalContext)}`);
   console.log(`[IST DATE] ${nowIST.toISOString()}`);
+  const MAX_EXTERNAL_REQUESTS = 2;
+  let externalRequestCount = 0;
+  const assertExternalRequestLimit = () => {
+    externalRequestCount += 1;
+    if (externalRequestCount > MAX_EXTERNAL_REQUESTS) {
+      throw new Error("External request limit reached");
+    }
+  };
   const realtimeInput = rawQuery;
   let finalQuery = realtimeInput;
   const sportsIntent = detectSportsIntent(rawQuery);
@@ -1765,35 +1773,29 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
     if (/\b(formula\s*1|formula\s*one|f1|grand\s*prix)\b/i.test(rawQuery) && isSportsResult) {
       dynamicQueries = [
         `latest Formula 1 race winner`,
-        `most recent F1 Grand Prix result`,
-        `who won latest F1 race`,
-        `Formula 1 latest result today`,
-        `current F1 standings`
+        `most recent F1 Grand Prix result`
       ];
     } else if (isSportsResult) {
       dynamicQueries = [
         `who won IPL today ${CURRENT_YEAR}`,
-        `IPL today result winner`,
-        `latest completed IPL match`,
-        `today IPL match winner`,
-        `IPL match result today`,
-        `IPL latest result`,
-        `IPL live scorecard`
+        `latest completed IPL match`
       ];
     } else if (isSportsLive) {
       dynamicQueries = [
         `live IPL score`,
-        `IPL live score today`,
-        `current IPL match score`,
-        `IPL scorecard live`,
-        `Cricbuzz IPL live`
+        `current IPL match`
       ];
     } else {
       dynamicQueries = [buildSportsGroundingQuery(rawQuery, finalQuery, temporalContext)];
     }
     console.log("[CURRENT_YEAR]", CURRENT_YEAR);
     console.log("[DYNAMIC_QUERY]", dynamicQueries);
-    finalQuery = dynamicQueries.map((q) => (isSportsLive ? sanitizeSportsLiveQuery(q) : q)).filter(Boolean).join(" OR ");
+    const sanitizedQueries = dynamicQueries
+      .slice(0, 2)
+      .map((q) => String(q || "").trim())
+      .map((q) => (isSportsLive ? sanitizeSportsLiveQuery(q) : q))
+      .filter(Boolean);
+    finalQuery = sanitizedQueries[0] || finalQuery;
     console.log("[FINAL_SEARCH_QUERIES]", dynamicQueries);
   }
   console.log("[CACHE_BYPASS]", true);
@@ -1808,10 +1810,10 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
   const cacheKey = `rt:${qLower}`;
   // Intentionally bypass cache for realtime grounding requests.
   const run = (async () => {
-  const MAX_GROUNDING_RETRIES = 1;
   const isWeatherQuery = /\b(weather|temperature|temp|hot|cold|rain|humidity|forecast|windy|climate|today'?s weather|tomorrow weather)\b/i.test(finalQuery);
   if (isWeatherQuery) {
     console.log("[weather] detected query");
+    assertExternalRequestLimit();
     const weather = await performWeatherGrounding(finalQuery, config, geminiKey);
     if (weather) {
       console.log("[weather] returning verified weather response");
@@ -1842,7 +1844,6 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
     ? `SCHEDULE QUERY (today is ${nowISTForPrompt}): Search for today's match schedule and upcoming fixtures.`
     : '';
   const prompt = intentHint ? `${intentHint}\n\nRealtime query: ${finalQuery}` : `Realtime query: ${finalQuery}`;
-  const retryPrefix = "IMPORTANT: Search the live web before answering. Do not rely on internal memory.";
   const extractJson = (txt) => {
     try { return JSON.parse(txt); } catch {}
     const s = txt.indexOf("{"), e = txt.lastIndexOf("}");
@@ -1857,14 +1858,14 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
     const msg = (error?.message || String(error || "")).toLowerCase();
     return msg.includes("429") || msg.includes("quota") || msg.includes("resource_exhausted");
   };
-  const runOnce = async (model, attemptType, strict = false, forceWebPrefix = "") => {
-    const realtimePrompt = forceWebPrefix ? `${forceWebPrefix}\n\n${prompt}` : prompt;
+  const runOnce = async (model, attemptType, strict = false) => {
+    assertExternalRequestLimit();
     const response = await requestGemini({
       source: "realtime_grounding",
       requestId,
       apiKey: geminiKey,
       model,
-      contents: [{ role: "user", parts: [{ text: realtimePrompt }] }],
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
       tools: [{ googleSearch: {} }],
       config: { temperature: strict ? 0.1 : 0.2, systemInstruction: buildRealtimeGroundingInstruction({ strict, todayIST: nowISTForPrompt }) },
       attemptType
@@ -1899,13 +1900,7 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
     data.answer = `${answerText}${sourcesText}`.trim() || finalResponse.trim();
     data.sources = citations.length ? citations : extractGroundingCitations(data, response);
     const modelQueries = Array.isArray(data.search_queries) ? data.search_queries : [finalQuery];
-    if (isSportsLive) {
-      const sportName = /\bipl\b/i.test(rawQuery) ? "IPL" : /\bcricket\b/i.test(rawQuery) ? "Cricket" : /\b(football|soccer)\b/i.test(rawQuery) ? "Football" : "Sports";
-      const strictQueries = buildSportsLiveSearchQueries(rawQuery, sportName, temporalContext).map(sanitizeSportsLiveQuery).filter(Boolean);
-      data.search_queries = strictQueries.length ? strictQueries : [sanitizeSportsLiveQuery(finalQuery) || finalQuery];
-    } else {
-      data.search_queries = modelQueries;
-    }
+    data.search_queries = modelQueries.slice(0, 2);
     data.search_queries = data.search_queries
       .map((q) => isSportsLive ? sanitizeSportsLiveQuery(q) : String(q || "").trim())
       .filter(Boolean);
@@ -1918,9 +1913,6 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
     const validationPassed = !!(answerOk && verifiedOk && usedGrounding);
     console.log(`[grounding] realtime_triggered=true model=${model} grounding_triggered=${usedGrounding} citations_returned=${citations.length > 0} search_queries="${data.search_queries.join(" | ")}"`);
     console.log(`[grounding] validation_passed=${validationPassed}`);
-    if ((groundingChunks.length === 0 || citations.length === 0) && !forceWebPrefix && MAX_GROUNDING_RETRIES > 0) {
-      return await runOnce(model, `${attemptType}_retry`, true, retryPrefix);
-    }
     if (isSportsGrounding && groundingChunks.length === 0) {
       return {
         query_type: "sports_realtime",
@@ -1935,7 +1927,7 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
         search_queries: data.search_queries || []
       };
     }
-    if (!validationPassed) throw new Error("validation failed");
+    if (!validationPassed) return { ...data, grounding_success: false, response_valid: false };
     return { ...data, grounding_success: true, response_valid: true };
   };
 
@@ -1959,6 +1951,7 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
       console.log(`[grounding] switching_to_fallback=${fallbackModel}`);
       usedRequests += 1;
       fallbackUsed = true;
+      if (usedRequests > MAX_EXTERNAL_REQUESTS) throw new Error("External request limit reached");
       const data = await runOnce(fallbackModel, "fallback", true);
       console.log(`[grounding] fallback_used=${fallbackUsed}`);
       console.log(`[FALLBACK RESPONSE USED] ${fallbackUsed}`);
