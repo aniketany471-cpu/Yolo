@@ -3,7 +3,6 @@ import { withGeminiKeyRotation } from "./geminiKeyManager.js";
 
 const REQUEST_TIMEOUT_MS = 20000;
 const perMessage = new Map();
-let EXTERNAL_REQUEST_COUNT = 0;
 const REQUEST_KEY_LOCK = new Map();
 
 function getState(requestId = "global") {
@@ -26,12 +25,6 @@ export async function requestGemini({ source = "unknown", requestId = "global", 
   if (attemptType === "primary") state.primary += 1;
   if (attemptType === "fallback") state.fallback += 1;
   console.log(`[gemini-manager] requestId=${requestId} source=${source} type=${attemptType} total=${state.total}`);
-  EXTERNAL_REQUEST_COUNT += 1;
-  console.log("[EXTERNAL_REQUEST_COUNT]", EXTERNAL_REQUEST_COUNT);
-  if (EXTERNAL_REQUEST_COUNT > 2) {
-    throw new Error("External request hard limit exceeded");
-  }
-
   try {
     return await withGeminiKeyRotation(async (key) => {
       if (!REQUEST_KEY_LOCK.has(requestId)) {
