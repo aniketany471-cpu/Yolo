@@ -1321,6 +1321,46 @@ function extractGroundingCitations(data = {}, response = {}) {
   return Array.from(sourceSet).slice(0, 5);
 }
 
+function isBlockedGroundingSource(url = "") {
+  const u = String(url || "").toLowerCase();
+  return (
+    u.includes("google.com/search") ||
+    u.includes("wikipedia.org") ||
+    u.includes("googleusercontent.com/search") ||
+    u.includes("webcache.googleusercontent.com")
+  );
+}
+
+function rankSportsGroundingSources(chunks = []) {
+  const preferredDomains = [
+    "cricbuzz.com",
+    "espncricinfo.com",
+    "icc-cricket.com",
+    "formula1.com",
+    "ndtv.com",
+    "indiatoday.in",
+    "indianexpress.com",
+    "outlookindia.com"
+  ];
+  const scored = [];
+  const seen = new Set();
+  for (const chunk of chunks || []) {
+    const uri = chunk?.web?.uri;
+    if (!uri || isBlockedGroundingSource(uri) || seen.has(uri)) continue;
+    seen.add(uri);
+    let score = 0;
+    try {
+      const host = new URL(uri).hostname.replace(/^www\./, "");
+      const idx = preferredDomains.findIndex((d) => host === d || host.endsWith(`.${d}`));
+      score = idx >= 0 ? (100 - idx) : 10;
+    } catch {
+      score = 1;
+    }
+    scored.push({ title: chunk?.web?.title || "source", uri, score });
+  }
+  return scored.sort((a, b) => b.score - a.score).map(({ title, uri }) => ({ title, uri }));
+}
+
 function injectGroundingCitations(text, supports, chunks) {
   if (!text) return "";
   let finalText = String(text);
@@ -1712,36 +1752,40 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
     console.log(`[SPORTS LIVE INTENT] ${isSportsLive}`);
     console.log(`[SPORTS RESULT INTENT] ${isSportsResult}`);
     const CURRENT_YEAR = nowIST.getFullYear();
-    let dynamicQuery = finalQuery;
+    let dynamicQueries = [finalQuery];
     if (/\b(formula\s*1|formula\s*one|f1|grand\s*prix)\b/i.test(rawQuery) && isSportsResult) {
-      dynamicQuery = [
+      dynamicQueries = [
         `latest Formula 1 race winner`,
         `most recent F1 Grand Prix result`,
         `who won latest F1 race`,
-        `Formula 1 latest result`
-      ].join(" OR ");
+        `Formula 1 latest result today`,
+        `current F1 standings`
+      ];
     } else if (isSportsResult) {
-      dynamicQuery = [
+      dynamicQueries = [
         `who won IPL today ${CURRENT_YEAR}`,
         `IPL today result winner`,
         `latest completed IPL match`,
         `today IPL match winner`,
-        `IPL match result today`
-      ].join(" OR ");
+        `IPL match result today`,
+        `IPL latest result`,
+        `IPL live scorecard`
+      ];
     } else if (isSportsLive) {
-      dynamicQuery = [
+      dynamicQueries = [
         `live IPL score`,
         `IPL live score today`,
         `current IPL match score`,
         `IPL scorecard live`,
         `Cricbuzz IPL live`
-      ].join(" OR ");
+      ];
     } else {
-      dynamicQuery = buildSportsGroundingQuery(rawQuery, finalQuery, temporalContext);
+      dynamicQueries = [buildSportsGroundingQuery(rawQuery, finalQuery, temporalContext)];
     }
     console.log("[CURRENT_YEAR]", CURRENT_YEAR);
-    console.log("[DYNAMIC_QUERY]", dynamicQuery);
-    finalQuery = isSportsLive ? sanitizeSportsLiveQuery(dynamicQuery) : dynamicQuery;
+    console.log("[DYNAMIC_QUERY]", dynamicQueries);
+    finalQuery = dynamicQueries.map((q) => (isSportsLive ? sanitizeSportsLiveQuery(q) : q)).filter(Boolean).join(" OR ");
+    console.log("[FINAL_SEARCH_QUERIES]", dynamicQueries);
   }
   console.log("[CACHE_BYPASS]", true);
   console.log(`[SEARCH QUERY BUILDER INPUT] "${rawQuery}"`);
@@ -1823,17 +1867,7 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
     const webSearchQueries = grounding.webSearchQueries || [];
     const groundingChunks = grounding.groundingChunks || [];
     const groundingSupports = grounding.groundingSupports || [];
-    const uniqueSources = [];
-    const seen = new Set();
-    for (const chunk of groundingChunks) {
-      const web = chunk?.web;
-      if (!web?.uri) continue;
-      const uri = web.uri;
-      const title = web.title || "source";
-      if (seen.has(uri)) continue;
-      seen.add(uri);
-      uniqueSources.push({ title, uri });
-    }
+    const uniqueSources = isSportsGrounding ? rankSportsGroundingSources(groundingChunks) : rankSportsGroundingSources(groundingChunks);
     const groundedText = injectGroundingCitations(response?.text, groundingSupports, groundingChunks);
     let sourcesText = "";
     if (uniqueSources.length) {
@@ -1865,6 +1899,7 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
       .map((q) => isSportsLive ? sanitizeSportsLiveQuery(q) : String(q || "").trim())
       .filter(Boolean);
     console.log(`[FINAL SEARCH QUERIES] ${JSON.stringify(data.search_queries)}`);
+    console.log(`[VERIFIED_SOURCES] ${JSON.stringify(citations)}`);
     const answerOk = answerText.length > 0;
     const verifiedOk = data.verified === true;
     const usedGrounding = data.grounding_used === true || citations.length > 0;
@@ -1874,6 +1909,20 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
     console.log(`[grounding] validation_passed=${validationPassed}`);
     if ((groundingChunks.length === 0 || citations.length === 0) && !forceWebPrefix) {
       return await runOnce(model, `${attemptType}_retry`, true, retryPrefix);
+    }
+    if (isSportsGrounding && groundingChunks.length === 0) {
+      return {
+        query_type: "sports_realtime",
+        subject: rawQuery,
+        answer: "I couldn't verify the latest realtime sports information from grounded sources.",
+        sources: [],
+        timestamp: new Date().toISOString(),
+        verified: false,
+        grounding_used: false,
+        grounding_success: false,
+        response_valid: false,
+        search_queries: data.search_queries || []
+      };
     }
     if (!validationPassed) throw new Error("validation failed");
     return { ...data, grounding_success: true, response_valid: true };
