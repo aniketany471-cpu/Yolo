@@ -1521,6 +1521,35 @@ function extractSourceQuery(text = "") {
     .replace(/^([./])src\s+/i, "")
     .trim();
 }
+async function handleSrcCommand({ client, message, config, rawQuery, requestId }) {
+  console.log("[SRC_MODE] enabled");
+  console.log("[SRC_BYPASS_AI] true");
+  console.log("[SRC_RAW_QUERY]", rawQuery);
+  console.log("[SRC_SINGLE_REQUEST_MODE] true");
+  if (!rawQuery) {
+    await client.sendMessage(message.chatId, {
+      message: "Please provide a query after .src",
+      replyTo: message.id
+    });
+    return;
+  }
+  const grounded = await performRealtimeGrounding(rawQuery, config, `${requestId}:src`);
+  if (!grounded || !grounded.answer) {
+    await client.sendMessage(message.chatId, {
+      message: "I couldn't verify live realtime information.",
+      replyTo: message.id
+    });
+    return;
+  }
+  const cleanSources = (grounded.sources || []).filter(Boolean).slice(0, 6);
+  const sourceBlock = cleanSources.length
+    ? `\n\nSources:\n${cleanSources.map((s, i) => `${i + 1}. ${s}`).join("\n")}`
+    : "";
+  await client.sendMessage(message.chatId, {
+    message: `${String(grounded.answer || "").trim()}${sourceBlock}`.trim(),
+    replyTo: message.id
+  });
+}
 
 function sanitizeSportsLiveQuery(q) {
   const input = String(q || "");
@@ -2086,6 +2115,8 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
   console.log("[RAW MESSAGE]", rawUserMessage);
   if (sourceMode) {
     console.log("[SRC_MODE] enabled");
+    console.log("[SRC_BYPASS_AI] true");
+    console.log("[SRC_SINGLE_REQUEST_MODE] true");
     console.log("[SRC_RAW_QUERY]", sourceQuery);
     if (!sourceQuery) return "Please provide a query after .src";
     const RAW_QUERY_ONLY = true;
@@ -4490,12 +4521,26 @@ async function startServer() {
           if (!message || !message.message) return;
           const textRaw = (message.message || "").trim();
           const text = textRaw.toLowerCase();
+          const rawText = String(message?.text || message?.message || "").trim();
+          const isSrcCommand = rawText.startsWith(".src ") || rawText.startsWith("/src ");
           const senderId = message.senderId?.toString();
           const chatIdStr = message.chatId?.toString();
           const requestId = `tg-${chatIdStr || "chat"}-${message.id || Date.now()}`;
           message.__requestId = requestId;
           beginGeminiRequestScope(requestId);
           console.log(`[gemini-manager] requestId=${requestId} source=telegram_message`);
+          if (isSrcCommand) {
+            console.log("[SRC_BYPASS] true");
+            let configSrc = db.prepare("SELECT * FROM config WHERE id = 1").get();
+            await handleSrcCommand({
+              client,
+              message,
+              config: configSrc,
+              rawQuery: rawText.replace(/^(\.src|\/src)\s*/i, "").trim(),
+              requestId
+            });
+            return;
+          }
           const isMe = message.out || myId && senderId === myId;
           let config2 = db.prepare("SELECT * FROM config WHERE id = 1").get();
           const admins = config2?.adminUsers ? config2.adminUsers.split(",").map((s) => s.trim()) : [];
