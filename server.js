@@ -1744,6 +1744,8 @@ async function performWebSearch(query, config, deep = false) {
 async function performRealtimeGrounding(query, config, requestId = "grounding") {
   const rawQuery = String(query || "").trim();
   if (!rawQuery) return null;
+  const MAX_TOTAL_GROUNDING_REQUESTS = 2;
+  const MAX_KEY_ROTATIONS = 2;
 
   const geminiKeys = [];
   for (let i = 1; i <= 20; i++) {
@@ -1774,19 +1776,30 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
   const markKeyFailed = (key) => state.failedByKey.set(key, Date.now());
   const markKeyCooldown = (key, ms) => state.cooldownByKey.set(key, Date.now() + ms);
 
-  const MAX_RETRIES = geminiKeys.length;
-  let count = 0;
+  let externalRequestCount = 0;
+  let rotations = 0;
+  let quotaFailures = 0;
   const prompt = `Answer this realtime query using Google Search grounding:
 
 Query: "${rawQuery}"
 
 Give a concise and accurate realtime answer.`;
 
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+  for (let attempt = 0; attempt < geminiKeys.length; attempt++) {
+    if (externalRequestCount >= MAX_TOTAL_GROUNDING_REQUESTS) {
+      console.log("[GROUNDING_STOP]", "Max external requests reached");
+      return {
+        success: false,
+        answer: "Realtime search is temporarily busy. Try again later."
+      };
+    }
+    if (rotations >= MAX_KEY_ROTATIONS) break;
     const key = getNextAvailableKey();
     if (!key) break;
-    count += 1;
-    console.log("[GROUNDING_REQUEST_COUNT]", count);
+    rotations++;
+    console.log("[KEY_ROTATION]", rotations);
+    externalRequestCount += 1;
+    console.log("[GROUNDING_REQUEST_COUNT]", externalRequestCount);
     try {
       const response = await requestGemini({
         source: "realtime_grounding",
@@ -1806,7 +1819,6 @@ Give a concise and accurate realtime answer.`;
       if (!valid) {
         markKeyFailed(key);
         console.log("[GROUNDING_EMPTY_RESPONSE_RETRY]");
-        console.log("[KEY_ROTATION]");
         continue;
       }
       const grounding = candidate?.groundingMetadata || candidate?.grounding_metadata || {};
@@ -1831,9 +1843,16 @@ Give a concise and accurate realtime answer.`;
         msg.includes("RESOURCE_EXHAUSTED") ||
         msg.toLowerCase().includes("quota");
       if (quotaError) {
+        quotaFailures++;
         markKeyCooldown(key, 15 * 60 * 1000);
         console.log("[KEY_QUOTA_ROTATION]", key.slice(0, 6) + "...");
-        console.log("[KEY_ROTATION]");
+        if (quotaFailures >= 2) {
+          console.log("[GROUNDING_ABORT]", "Too many quota failures");
+          return {
+            success: false,
+            answer: "Realtime search providers are currently rate limited."
+          };
+        }
         continue;
       }
       console.log("[GROUNDING_FATAL_ERROR]", msg);
