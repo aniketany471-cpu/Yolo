@@ -262,26 +262,7 @@ export async function geminiGroundedSearch(query, apiKey, type = 'general', opts
       attemptType: 'primary',
     });
 
-    let text = (response.text || '').trim();
-    if (shouldRetryForDateHallucination(query, text)) {
-      console.warn('[gemini-search] Potential date hallucination detected. Retrying grounding once.');
-      const retryPrompt =
-        finalPrompt +
-        '\nAdditional guardrail:\n' +
-        'If an event date is on or before the provided UTC date/time, do not label it as future/not yet happened/not announced.\n';
-      console.log('[FINAL REALTIME PROMPT][RETRY]\n' + retryPrompt);
-      response = await requestGemini({
-        source: 'realtime_grounding',
-        requestId: `search_retry:${type}:${query.slice(0, 24)}`,
-        apiKey: (apiKey || "").trim(),
-        model: type === 'sports' ? SEARCH_MODEL_SPORTS : SEARCH_MODEL_GENERAL,
-        contents: [{ role: 'user', parts: [{ text: retryPrompt }] }],
-        tools: [{ googleSearch: {} }],
-        config: { temperature: 0 },
-        attemptType: 'fallback',
-      });
-      text = (response.text || '').trim();
-    }
+    const text = (response.text || "").trim();
 
     if (!text || text.length < 10) {
       console.warn('[gemini-search] Empty response');
