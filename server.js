@@ -1505,12 +1505,15 @@ function detectSportsIntent(query) {
 
   return "sports_general";
 }
+const SRC_SINGLE_REQUEST_MODE = true;
+const MAX_EXTERNAL_REQUESTS = 1;
+
 function isSourceCommand(text = "") {
-  return /^([./])src\s+/i.test(String(text || "").trim());
+  return /^([./])(src|web)(\s|$)/i.test(String(text || "").trim());
 }
 function extractSourceQuery(text = "") {
   return String(text || "")
-    .replace(/^([./])src\s+/i, "")
+    .replace(/^([./])(src|web)\s*/i, "")
     .trim();
 }
 async function handleSrcCommand({ client, message, config, rawQuery, requestId }) {
@@ -1744,8 +1747,9 @@ async function performWebSearch(query, config, deep = false) {
 async function performRealtimeGrounding(query, config, requestId = "grounding") {
   const rawQuery = String(query || "").trim();
   if (!rawQuery) return null;
-  const MAX_TOTAL_GROUNDING_REQUESTS = 2;
-  const MAX_KEY_ROTATIONS = 2;
+
+  const cleanQuery = rawQuery;
+  const finalQuery = cleanQuery.trim();
 
   const geminiKeys = [];
   for (let i = 1; i <= 20; i++) {
@@ -1754,112 +1758,72 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
   }
   const legacy = String(config?.geminiKey || getGeminiPrimaryKey() || "").trim();
   if (legacy && !geminiKeys.includes(legacy)) geminiKeys.push(legacy);
-  if (!geminiKeys.length) return { success: false, answer: "All realtime search providers are currently busy. Try again later." };
-
-  if (!globalThis.__geminiGroundingRotation) {
-    globalThis.__geminiGroundingRotation = { cooldownByKey: new Map(), failedByKey: new Map(), activeIndex: 0 };
-  }
-  const state = globalThis.__geminiGroundingRotation;
-  const getNextAvailableKey = () => {
-    const now = Date.now();
-    for (let i = 0; i < geminiKeys.length; i++) {
-      const idx = (state.activeIndex + i) % geminiKeys.length;
-      const key = geminiKeys[idx];
-      const cooldown = state.cooldownByKey.get(key) || 0;
-      if (cooldown > now) continue;
-      state.activeIndex = (idx + 1) % geminiKeys.length;
-      console.log("[ACTIVE_KEY_INDEX]", idx);
-      return key;
-    }
-    return null;
-  };
-  const markKeyFailed = (key) => state.failedByKey.set(key, Date.now());
-  const markKeyCooldown = (key, ms) => state.cooldownByKey.set(key, Date.now() + ms);
+  if (!geminiKeys.length) return { success: false, answer: "Realtime search is temporarily busy. Try again later." };
 
   let externalRequestCount = 0;
-  let rotations = 0;
-  let quotaFailures = 0;
-  const prompt = `Answer this realtime query using Google Search grounding:
+  const key = geminiKeys[0];
 
-Query: "${rawQuery}"
+  externalRequestCount++;
+  console.log("[EXTERNAL_REQUEST_COUNT]", externalRequestCount);
 
-Give a concise and accurate realtime answer.`;
-
-  for (let attempt = 0; attempt < geminiKeys.length; attempt++) {
-    if (externalRequestCount >= MAX_TOTAL_GROUNDING_REQUESTS) {
-      console.log("[GROUNDING_STOP]", "Max external requests reached");
-      return {
-        success: false,
-        answer: "Realtime search is temporarily busy. Try again later."
-      };
-    }
-    if (rotations >= MAX_KEY_ROTATIONS) break;
-    const key = getNextAvailableKey();
-    if (!key) break;
-    rotations++;
-    console.log("[KEY_ROTATION]", rotations);
-    externalRequestCount += 1;
-    console.log("[GROUNDING_REQUEST_COUNT]", externalRequestCount);
-    try {
-      const response = await requestGemini({
-        source: "realtime_grounding",
-        requestId: `${requestId}:k${attempt + 1}`,
-        apiKey: key,
-        model: "gemini-2.0-flash",
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
-        tools: [{ googleSearch: {} }],
-        config: { temperature: 0.2, systemInstruction: buildRealtimeGroundingInstruction() }
-      });
-      const candidate = response?.candidates?.[0];
-      const text = String(response?.text || candidate?.content?.parts?.map((p) => p?.text || "").join("\n") || "").trim();
-      const valid = Boolean(text) && text.trim().length > 10;
-      console.log("[GROUNDING_VALID]", valid);
-      console.log("[GROUNDING_HAS_TEXT]", Boolean(text));
-      console.log("[GROUNDING_TEXT_LENGTH]", text.length);
-      if (!valid) {
-        markKeyFailed(key);
-        console.log("[GROUNDING_EMPTY_RESPONSE_RETRY]");
-        continue;
-      }
-      const grounding = candidate?.groundingMetadata || candidate?.grounding_metadata || {};
-      const chunks = grounding?.groundingChunks || [];
-      const sources = rankSportsGroundingSources(chunks).map((s) => s.uri).filter(Boolean);
-      return {
-        success: true,
-        query_type: "realtime",
-        subject: rawQuery,
-        answer: text,
-        sources,
-        timestamp: new Date().toISOString(),
-        grounding_success: true,
-        response_valid: true,
-        search_queries: grounding?.webSearchQueries || [rawQuery]
-      };
-    } catch (error) {
-      const msg = String(error?.message || "");
-      const quotaError =
-        error?.status === 429 ||
-        msg.includes("429") ||
-        msg.includes("RESOURCE_EXHAUSTED") ||
-        msg.toLowerCase().includes("quota");
-      if (quotaError) {
-        quotaFailures++;
-        markKeyCooldown(key, 15 * 60 * 1000);
-        console.log("[KEY_QUOTA_ROTATION]", key.slice(0, 6) + "...");
-        if (quotaFailures >= 2) {
-          console.log("[GROUNDING_ABORT]", "Too many quota failures");
-          return {
-            success: false,
-            answer: "Realtime search providers are currently rate limited."
-          };
-        }
-        continue;
-      }
-      console.log("[GROUNDING_FATAL_ERROR]", msg);
-      markKeyFailed(key);
-    }
+  if (externalRequestCount > MAX_EXTERNAL_REQUESTS) {
+    console.log("[GROUNDING_STOP]", "Max external requests reached");
+    return { success: false, error: "Realtime search is temporarily busy. Try again later." };
   }
-  return { success: false, answer: "All realtime search providers are currently busy. Try again later.", sources: [] };
+
+  try {
+    const response = await requestGemini({
+      source: "realtime_grounding",
+      requestId: `${requestId}:single`,
+      apiKey: key,
+      model: "gemini-2.0-flash",
+      contents: [
+        {
+          role: "user",
+          parts: [
+            {
+              text: finalQuery
+            }
+          ]
+        }
+      ],
+      tools: [{ googleSearch: {} }],
+      config: {
+        temperature: 0,
+        systemInstruction: "You are a realtime search assistant.\nAnswer only using verified grounded results.\nKeep answers short, factual, and current."
+      }
+    });
+
+    const candidate = response?.candidates?.[0];
+    const text = String(response?.text || candidate?.content?.parts?.map((p) => p?.text || "").join("\n") || "").trim();
+
+    const grounding = candidate?.groundingMetadata || candidate?.grounding_metadata || {};
+    const chunks = grounding?.groundingChunks || [];
+    const sources = rankSportsGroundingSources(chunks).map((src) => src.uri).filter(Boolean);
+
+    return {
+      success: Boolean(text),
+      query_type: "realtime",
+      subject: finalQuery,
+      answer: text,
+      sources,
+      timestamp: new Date().toISOString(),
+      grounding_success: Boolean(text),
+      response_valid: Boolean(text),
+      search_queries: [finalQuery]
+    };
+  } catch (error) {
+    if (error?.code === 429 || error?.status === "RESOURCE_EXHAUSTED") {
+      if (!globalThis.__geminiGroundingRotation) {
+        globalThis.__geminiGroundingRotation = { cooldownByKey: new Map() };
+      }
+      globalThis.__geminiGroundingRotation.cooldownByKey.set(key, Date.now() + 60 * 1000);
+      console.log("[KEY_COOLDOWN]", 0);
+      return { success: false, answer: "Realtime search is temporarily busy. Try again later." };
+    }
+    console.log("[GROUNDING_FATAL_ERROR]", String(error?.message || error));
+    return { success: false, answer: "Realtime search is temporarily busy. Try again later." };
+  }
 }
 async function performWeatherGrounding(query, config, geminiKey) {
   try {
@@ -4378,7 +4342,7 @@ async function startServer() {
           const textRaw = (message.message || "").trim();
           const text = textRaw.toLowerCase();
           const rawText = String(message?.text || message?.message || "").trim();
-          const isSrcCommand = rawText.startsWith(".src ") || rawText.startsWith("/src ");
+          const isSrcCommand = /^([./])(src|web)(\s|$)/i.test(rawText);
           const senderId = message.senderId?.toString();
           const chatIdStr = message.chatId?.toString();
           const requestId = `tg-${chatIdStr || "chat"}-${message.id || Date.now()}`;
@@ -4392,7 +4356,7 @@ async function startServer() {
               client,
               message,
               config: configSrc,
-              rawQuery: rawText.replace(/^(\.src|\/src)\s*/i, "").trim(),
+              rawQuery: rawText.replace(/^([./])(src|web)\s*/i, "").trim(),
               requestId
             });
             return;
