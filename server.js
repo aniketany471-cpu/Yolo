@@ -1513,6 +1513,14 @@ function detectSportsIntent(query) {
 
   return "sports_general";
 }
+function isSourceCommand(text = "") {
+  return /^([./])src\s+/i.test(String(text || "").trim());
+}
+function extractSourceQuery(text = "") {
+  return String(text || "")
+    .replace(/^([./])src\s+/i, "")
+    .trim();
+}
 
 function sanitizeSportsLiveQuery(q) {
   const input = String(q || "");
@@ -1716,7 +1724,7 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
   const now = Date.now();
   if (!globalThis.__geminiGroundingState) {
     globalThis.__geminiGroundingState = {
-      cooldownUntil: 0,
+      cooldownByKey: new Map(),
       inFlight: new Map(),
       cache: new Map()
     };
@@ -1726,8 +1734,10 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
   if (!geminiKey) return null;
   if (!isRealtimeQuery(query)) return null;
   console.log("[grounding] realtime detected");
-  if (gs.cooldownUntil > now) {
-    console.log("[grounding] cooldown active");
+  const keyCooldownUntil = gs.cooldownByKey.get(geminiKey) || 0;
+  console.log(`[KEY_COOLDOWN] key=${geminiKey.slice(0, 8)}... until=${keyCooldownUntil}`);
+  if (keyCooldownUntil > now) {
+    console.log("[grounding] cooldown active (per key)");
     return null;
   }
   const rtc = resolveRealtimeContext(query);
@@ -1798,6 +1808,7 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
   const cacheKey = `rt:${qLower}`;
   // Intentionally bypass cache for realtime grounding requests.
   const run = (async () => {
+  const MAX_GROUNDING_RETRIES = 1;
   const isWeatherQuery = /\b(weather|temperature|temp|hot|cold|rain|humidity|forecast|windy|climate|today'?s weather|tomorrow weather)\b/i.test(finalQuery);
   if (isWeatherQuery) {
     console.log("[weather] detected query");
@@ -1907,7 +1918,7 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
     const validationPassed = !!(answerOk && verifiedOk && usedGrounding);
     console.log(`[grounding] realtime_triggered=true model=${model} grounding_triggered=${usedGrounding} citations_returned=${citations.length > 0} search_queries="${data.search_queries.join(" | ")}"`);
     console.log(`[grounding] validation_passed=${validationPassed}`);
-    if ((groundingChunks.length === 0 || citations.length === 0) && !forceWebPrefix) {
+    if ((groundingChunks.length === 0 || citations.length === 0) && !forceWebPrefix && MAX_GROUNDING_RETRIES > 0) {
       return await runOnce(model, `${attemptType}_retry`, true, retryPrefix);
     }
     if (isSportsGrounding && groundingChunks.length === 0) {
@@ -1957,8 +1968,9 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
       return data;
     } catch (e2) {
       if (isQuotaLike(e2)) {
-        gs.cooldownUntil = Date.now() + 60000;
-        console.log("[gemini-search] quota cooldown started");
+        const until = Date.now() + 60000;
+        gs.cooldownByKey.set(geminiKey, until);
+        console.log(`[KEY_COOLDOWN] key=${geminiKey.slice(0, 8)}... cooldown_until=${until}`);
       }
       console.log(`[grounding] fallback_used=${fallbackUsed}`);
       console.log(`[FALLBACK RESPONSE USED] ${fallbackUsed}`);
@@ -2075,8 +2087,25 @@ async function generateImage(prompt, apiKey, model = "flux") {
 }
 async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = false, forceDeep = false, senderUsername = null, requestId = "chat", opts = {}) {
   const rawUserMessage = String(prompt || "").trim();
+  const sourceMode = isSourceCommand(rawUserMessage);
+  const sourceQuery = sourceMode ? extractSourceQuery(rawUserMessage) : "";
   const isRealtimeQuery = /today|live|score|match|ipl|news|weather|current|now|playing/i.test(rawUserMessage);
   console.log("[RAW MESSAGE]", rawUserMessage);
+  if (sourceMode) {
+    console.log("[SRC_MODE] enabled");
+    console.log("[SRC_RAW_QUERY]", sourceQuery);
+    if (!sourceQuery) return "Please provide a query after .src";
+    const RAW_QUERY_ONLY = true;
+    console.log("[SRC_RAW_QUERY_ONLY]", RAW_QUERY_ONLY);
+    const grounded = await performRealtimeGrounding(sourceQuery, config, `${requestId}:src`);
+    console.log("[GROUNDING_SEARCHES]", grounded?.search_queries || []);
+    if (!grounded || !grounded.answer) return "I couldn't verify live realtime information.";
+    const cleanSources = (grounded.sources || []).filter(Boolean).slice(0, 6);
+    const sourceBlock = cleanSources.length
+      ? `\n\nSources:\n${cleanSources.map((s, i) => `${i + 1}. ${s}`).join("\n")}`
+      : "";
+    return `${String(grounded.answer || "").trim()}${sourceBlock}`.trim();
+  }
   const bmFailureHints = ["503", "model_not_found", "no available channel", "upstream unavailable", "provider unavailable", "timeout", "connection"];
   const bmNoFallbackHints = ["invalid prompt", "blocked content", "malformed payload", "validation failed", "validation error"];
   const shouldFallbackFromBmMessage = (msg) => {
@@ -4636,6 +4665,39 @@ async function startServer() {
             return;
           }
           const cmdName = text.replace("/", "").replace(".", "").split(" ")[0];
+          if (isSourceCommand(textRaw)) {
+            await CommandProcessor.process(
+              client,
+              message,
+              config2,
+              myId,
+              "src",
+              textRaw,
+              async (status) => {
+                await status.update(HS.search());
+                const aiRes = await getAIResponse(
+                  textRaw,
+                  config2,
+                  message.chatId?.toString(),
+                  senderId,
+                  false,
+                  false,
+                  message.sender?.username || null,
+                  requestId
+                );
+                if (aiRes) {
+                  const formatted = formatAiMessage(aiRes);
+                  await status.finish(formatted.text, {
+                    parseMode: formatted.parseMode,
+                    replyTo: message.id
+                  });
+                } else {
+                  await status.fail("I couldn't verify live realtime information.");
+                }
+              }
+            );
+            return;
+          }
           const isPublicCommand = [
             "ans",
             "music",
