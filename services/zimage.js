@@ -1,7 +1,7 @@
 /**
  * Image generation service
- * Priority 1: Grok Imagine Image Lite — 3 attempts (via Bluesminds API)
- * Priority 2: OpenAI GPT-Image-1     — 2 attempts (via Bluesminds API)
+ * Priority 1: OpenAI GPT-Image-1     — 3 attempts (via Bluesminds API) — most reliable
+ * Priority 2: Grok Imagine Image Lite — 2 attempts (via Bluesminds API)
  * Priority 3: Zimage Turbo           — last resort only
  */
 
@@ -13,10 +13,10 @@ const OPENAI_MODEL         = "gpt-image-1";
 const GROK_IMAGINE_MODEL   = "grok-imagine-image-lite";
 
 // Retry config — exhaust free providers before touching paid zimage-turbo
-const GROK_MAX_ATTEMPTS  = 3;   // attempt 1 + 2 retries
-const GROK_RETRY_DELAY   = 3000; // ms between grok retries
-const OPENAI_MAX_ATTEMPTS = 2;   // attempt 1 + 1 retry
-const OPENAI_RETRY_DELAY  = 5000; // ms between openai retries
+const OPENAI_MAX_ATTEMPTS = 3;    // gpt-image-1: attempt 1 + 2 retries (most reliable)
+const OPENAI_RETRY_DELAY  = 4000; // ms between openai retries
+const GROK_MAX_ATTEMPTS   = 2;    // grok: attempt 1 + 1 retry (backup)
+const GROK_RETRY_DELAY    = 3000; // ms between grok retries
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -196,12 +196,12 @@ async function zimageTurbo(prompt, options = {}) {
  * Generate an image for the given prompt.
  *
  * Attempt order (zimage-turbo only reached if all free attempts fail):
- *   1. Grok Imagine Image Lite — attempt 1 of 3
- *   2. Grok Imagine Image Lite — attempt 2 of 3 (after 3 s)
- *   3. Grok Imagine Image Lite — attempt 3 of 3 (after 3 s)
- *   4. OpenAI GPT-Image-1      — attempt 1 of 2
- *   5. OpenAI GPT-Image-1      — attempt 2 of 2 (after 5 s)
- *   6. Zimage Turbo            — last resort
+ *   1. GPT-Image-1      — attempt 1 of 3  (most reliable)
+ *   2. GPT-Image-1      — attempt 2 of 3  (after 4 s)
+ *   3. GPT-Image-1      — attempt 3 of 3  (after 4 s)
+ *   4. Grok Imagine     — attempt 1 of 2  (backup)
+ *   5. Grok Imagine     — attempt 2 of 2  (after 3 s)
+ *   6. Zimage Turbo     — last resort only
  *
  * Returns { buffer: Buffer, provider: string }
  */
@@ -209,9 +209,26 @@ export async function generateImage(prompt, config = {}, options = {}) {
   void config;
   const errors = [];
 
-  // ── Priority 1: Grok Imagine Image Lite — up to 3 attempts ─────────────────
+  // ── Priority 1: OpenAI GPT-Image-1 — up to 3 attempts ──────────────────────
+  for (let attempt = 1; attempt <= OPENAI_MAX_ATTEMPTS; attempt++) {
+    console.log(`[img] provider=gpt-image-1 model=${OPENAI_MODEL} attempt=${attempt}/${OPENAI_MAX_ATTEMPTS}`);
+    try {
+      const buffer = await openaiImage(prompt, options);
+      console.log(`[img] generation_success=true provider=gpt-image-1 attempt=${attempt}`);
+      return { buffer, provider: "gpt-image-1" };
+    } catch (e) {
+      console.warn(`[img] gpt-image-1 attempt ${attempt}/${OPENAI_MAX_ATTEMPTS} failed: ${e.message}`);
+      errors.push(`gpt-image-1[${attempt}]: ${e.message}`);
+      if (attempt < OPENAI_MAX_ATTEMPTS) {
+        console.log(`[img] retrying gpt-image-1 in ${OPENAI_RETRY_DELAY / 1000}s...`);
+        await sleep(OPENAI_RETRY_DELAY);
+      }
+    }
+  }
+
+  // ── Priority 2: Grok Imagine Image Lite — up to 2 attempts ─────────────────
   for (let attempt = 1; attempt <= GROK_MAX_ATTEMPTS; attempt++) {
-    console.log(`[img] provider=grok-imagine model=${GROK_IMAGINE_MODEL} attempt=${attempt}/${GROK_MAX_ATTEMPTS}`);
+    console.log(`[img] fallback_provider=grok-imagine model=${GROK_IMAGINE_MODEL} attempt=${attempt}/${GROK_MAX_ATTEMPTS}`);
     try {
       const buffer = await grokImagineImage(prompt);
       console.log(`[img] generation_success=true provider=grok-imagine attempt=${attempt}`);
@@ -222,23 +239,6 @@ export async function generateImage(prompt, config = {}, options = {}) {
       if (attempt < GROK_MAX_ATTEMPTS) {
         console.log(`[img] retrying grok-imagine in ${GROK_RETRY_DELAY / 1000}s...`);
         await sleep(GROK_RETRY_DELAY);
-      }
-    }
-  }
-
-  // ── Priority 2: OpenAI GPT-Image-1 — up to 2 attempts ──────────────────────
-  for (let attempt = 1; attempt <= OPENAI_MAX_ATTEMPTS; attempt++) {
-    console.log(`[img] switching_provider=openai model=${OPENAI_MODEL} attempt=${attempt}/${OPENAI_MAX_ATTEMPTS}`);
-    try {
-      const buffer = await openaiImage(prompt, options);
-      console.log(`[img] generation_success=true provider=openai attempt=${attempt}`);
-      return { buffer, provider: "openai" };
-    } catch (e) {
-      console.warn(`[img] openai attempt ${attempt}/${OPENAI_MAX_ATTEMPTS} failed: ${e.message}`);
-      errors.push(`openai[${attempt}]: ${e.message}`);
-      if (attempt < OPENAI_MAX_ATTEMPTS) {
-        console.log(`[img] retrying openai in ${OPENAI_RETRY_DELAY / 1000}s...`);
-        await sleep(OPENAI_RETRY_DELAY);
       }
     }
   }
