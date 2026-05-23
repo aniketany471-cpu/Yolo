@@ -48,8 +48,8 @@ async function fetchWithTimeout(url, options, timeoutMs) {
   }
 }
 
-async function downloadImageBuffer(url) {
-  const res = await fetchWithTimeout(url, {}, DOWNLOAD_TIMEOUT_MS);
+async function downloadImageBuffer(url, extraHeaders = {}) {
+  const res = await fetchWithTimeout(url, { headers: extraHeaders }, DOWNLOAD_TIMEOUT_MS);
   if (!res.ok) throw new Error(`Image download failed: HTTP ${res.status}`);
   return Buffer.from(await res.arrayBuffer());
 }
@@ -61,30 +61,49 @@ async function grokImagineImage(prompt) {
   const baseUrl = (process.env.BLUEMINDS_BASE_URL || "https://api.bluesminds.com").replace(/\/+$/, "");
   const url     = `${baseUrl}/v1/images/generations`;
 
-  const res = await fetchWithTimeout(
-    url,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model:  GROK_IMAGINE_MODEL,
-        prompt: sanitizePrompt(prompt),
-        n:      1,
-        size:   "1024x1024",
-      }),
-    },
-    PROVIDER_TIMEOUT_MS
-  );
+  // Try b64_json first — avoids CDN download entirely
+  for (const responseFormat of ["b64_json", "url"]) {
+    const res = await fetchWithTimeout(
+      url,
+      {
+        method:  "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+        body:    JSON.stringify({
+          model:           GROK_IMAGINE_MODEL,
+          prompt:          sanitizePrompt(prompt),
+          n:               1,
+          size:            "1024x1024",
+          response_format: responseFormat,
+        }),
+      },
+      PROVIDER_TIMEOUT_MS
+    );
 
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const msg = data?.error?.message || `HTTP ${res.status}`;
-    throw new Error(`Grok Imagine error: ${msg}`);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const msg = data?.error?.message || `HTTP ${res.status}`;
+      throw new Error(`Grok Imagine error: ${msg}`);
+    }
+
+    // b64_json path — no CDN needed
+    const b64 = data?.data?.[0]?.b64_json;
+    if (b64) return Buffer.from(b64, "base64");
+
+    // URL path — download with browser-like headers to avoid 403
+    const imageUrl = data?.data?.[0]?.url;
+    if (imageUrl) {
+      return downloadImageBuffer(imageUrl, {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/124.0.0.0 Mobile Safari/537.36",
+        "Referer":    "https://x.ai/",
+        "Accept":     "image/webp,image/apng,image/*,*/*;q=0.8",
+      });
+    }
+
+    // If b64_json format returned neither, fall through to url format
+    if (responseFormat === "b64_json") continue;
   }
 
-  const imageUrl = data?.data?.[0]?.url;
-  if (!imageUrl) throw new Error("Grok Imagine returned no image URL");
-  return downloadImageBuffer(imageUrl);
+  throw new Error("Grok Imagine returned no image content");
 }
 
 // ── Provider 2: OpenAI GPT-Image-1 via Bluesminds ────────────────────────────
