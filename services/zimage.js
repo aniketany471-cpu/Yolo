@@ -193,57 +193,95 @@ async function zimageTurbo(prompt, options = {}) {
 }
 
 /**
+ * Parse model preference keyword from a user prompt.
+ * Keywords: "grok:", "using grok", "with grok" → "grok"
+ *           "gpt:", "using gpt", "with gpt"   → "gpt"
+ * Returns { cleanPrompt, forceProvider: "gpt"|"grok"|null }
+ */
+export function parseImageModelKeyword(text) {
+  const t = String(text || "");
+
+  const grokRe = /^grok\s*:\s*|(?:^|\s)(?:using|with|via)\s+grok\b/i;
+  const gptRe  = /^gpt\s*:\s*|(?:^|\s)(?:using|with|via)\s+gpt(?:[- ]?(?:1|image[- ]?1))?\b/i;
+
+  if (grokRe.test(t)) {
+    return { cleanPrompt: t.replace(grokRe, " ").trim(), forceProvider: "grok" };
+  }
+  if (gptRe.test(t)) {
+    return { cleanPrompt: t.replace(gptRe, " ").trim(), forceProvider: "gpt" };
+  }
+  return { cleanPrompt: t, forceProvider: null };
+}
+
+/**
  * Generate an image for the given prompt.
  *
- * Attempt order (zimage-turbo only reached if all free attempts fail):
- *   1. GPT-Image-1      — attempt 1 of 3  (most reliable)
- *   2. GPT-Image-1      — attempt 2 of 3  (after 4 s)
- *   3. GPT-Image-1      — attempt 3 of 3  (after 4 s)
- *   4. Grok Imagine     — attempt 1 of 2  (backup)
- *   5. Grok Imagine     — attempt 2 of 2  (after 3 s)
- *   6. Zimage Turbo     — last resort only
+ * options.forceProvider = "gpt"  → skip straight to gpt-image-1 (3 attempts)
+ * options.forceProvider = "grok" → skip straight to grok-imagine (3 attempts)
+ * (no forceProvider)             → gpt-image-1 first, grok backup, zimage-turbo last resort
  *
  * Returns { buffer: Buffer, provider: string }
  */
 export async function generateImage(prompt, config = {}, options = {}) {
   void config;
   const errors = [];
+  const force = options.forceProvider || null;
 
-  // ── Priority 1: OpenAI GPT-Image-1 — up to 3 attempts ──────────────────────
-  for (let attempt = 1; attempt <= OPENAI_MAX_ATTEMPTS; attempt++) {
-    console.log(`[img] provider=gpt-image-1 model=${OPENAI_MODEL} attempt=${attempt}/${OPENAI_MAX_ATTEMPTS}`);
-    try {
-      const buffer = await openaiImage(prompt, options);
-      console.log(`[img] generation_success=true provider=gpt-image-1 attempt=${attempt}`);
-      return { buffer, provider: "gpt-image-1" };
-    } catch (e) {
-      console.warn(`[img] gpt-image-1 attempt ${attempt}/${OPENAI_MAX_ATTEMPTS} failed: ${e.message}`);
-      errors.push(`gpt-image-1[${attempt}]: ${e.message}`);
-      if (attempt < OPENAI_MAX_ATTEMPTS) {
-        console.log(`[img] retrying gpt-image-1 in ${OPENAI_RETRY_DELAY / 1000}s...`);
-        await sleep(OPENAI_RETRY_DELAY);
+  if (force) {
+    console.log(`[img] forceProvider=${force} (user-selected model)`);
+  }
+
+  // ── Priority 1: OpenAI GPT-Image-1 ─────────────────────────────────────────
+  // Run if: no force, or user forced "gpt"
+  if (!force || force === "gpt") {
+    const maxAttempts = force === "gpt" ? 3 : OPENAI_MAX_ATTEMPTS;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      console.log(`[img] provider=gpt-image-1 model=${OPENAI_MODEL} attempt=${attempt}/${maxAttempts}`);
+      try {
+        const buffer = await openaiImage(prompt, options);
+        console.log(`[img] generation_success=true provider=gpt-image-1 attempt=${attempt}`);
+        return { buffer, provider: "gpt-image-1" };
+      } catch (e) {
+        console.warn(`[img] gpt-image-1 attempt ${attempt}/${maxAttempts} failed: ${e.message}`);
+        errors.push(`gpt-image-1[${attempt}]: ${e.message}`);
+        if (attempt < maxAttempts) {
+          console.log(`[img] retrying gpt-image-1 in ${OPENAI_RETRY_DELAY / 1000}s...`);
+          await sleep(OPENAI_RETRY_DELAY);
+        }
       }
+    }
+    // If user forced gpt and it failed all attempts, tell them clearly
+    if (force === "gpt") {
+      throw new Error(`gpt-image-1 failed after ${maxAttempts} attempts:\n${errors.join("\n")}`);
     }
   }
 
-  // ── Priority 2: Grok Imagine Image Lite — up to 2 attempts ─────────────────
-  for (let attempt = 1; attempt <= GROK_MAX_ATTEMPTS; attempt++) {
-    console.log(`[img] fallback_provider=grok-imagine model=${GROK_IMAGINE_MODEL} attempt=${attempt}/${GROK_MAX_ATTEMPTS}`);
-    try {
-      const buffer = await grokImagineImage(prompt);
-      console.log(`[img] generation_success=true provider=grok-imagine attempt=${attempt}`);
-      return { buffer, provider: "grok-imagine" };
-    } catch (e) {
-      console.warn(`[img] grok-imagine attempt ${attempt}/${GROK_MAX_ATTEMPTS} failed: ${e.message}`);
-      errors.push(`grok-imagine[${attempt}]: ${e.message}`);
-      if (attempt < GROK_MAX_ATTEMPTS) {
-        console.log(`[img] retrying grok-imagine in ${GROK_RETRY_DELAY / 1000}s...`);
-        await sleep(GROK_RETRY_DELAY);
+  // ── Priority 2: Grok Imagine Image Lite ────────────────────────────────────
+  // Run if: no force, or user forced "grok"
+  if (!force || force === "grok") {
+    const maxAttempts = force === "grok" ? 3 : GROK_MAX_ATTEMPTS;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      console.log(`[img] provider=grok-imagine model=${GROK_IMAGINE_MODEL} attempt=${attempt}/${maxAttempts}`);
+      try {
+        const buffer = await grokImagineImage(prompt);
+        console.log(`[img] generation_success=true provider=grok-imagine attempt=${attempt}`);
+        return { buffer, provider: "grok-imagine" };
+      } catch (e) {
+        console.warn(`[img] grok-imagine attempt ${attempt}/${maxAttempts} failed: ${e.message}`);
+        errors.push(`grok-imagine[${attempt}]: ${e.message}`);
+        if (attempt < maxAttempts) {
+          console.log(`[img] retrying grok-imagine in ${GROK_RETRY_DELAY / 1000}s...`);
+          await sleep(GROK_RETRY_DELAY);
+        }
       }
+    }
+    // If user forced grok and it failed all attempts, tell them clearly
+    if (force === "grok") {
+      throw new Error(`grok-imagine failed after ${maxAttempts} attempts:\n${errors.join("\n")}`);
     }
   }
 
-  // ── Priority 3: Zimage Turbo — last resort ──────────────────────────────────
+  // ── Priority 3: Zimage Turbo — last resort (never reached on forced provider) ─
   console.log("[img] switching_provider=zimage_turbo (last resort — all free providers exhausted)");
   try {
     const buffer = await zimageTurbo(prompt, options);
