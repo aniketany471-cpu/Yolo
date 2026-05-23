@@ -1509,7 +1509,8 @@ const SRC_SINGLE_REQUEST_MODE = true;
 const MAX_EXTERNAL_REQUESTS = 1;
 
 function isSourceCommand(text = "") {
-  return /^([./])(src|web)(\s|$)/i.test(String(text || "").trim());
+  const value = String(text || "").trim().toLowerCase();
+  return value.startsWith("/src") || value.startsWith(".src") || value.startsWith("/web") || value.startsWith(".web");
 }
 function extractSourceQuery(text = "") {
   return String(text || "")
@@ -1748,8 +1749,12 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
   const rawQuery = String(query || "").trim();
   if (!rawQuery) return null;
 
+  console.log("[SRC_REQUEST_START]");
+
   const cleanQuery = rawQuery;
   const finalQuery = cleanQuery.trim();
+  console.log("[SRC_SINGLE_REQUEST_MODE]", true);
+  console.log("[GROUNDING_QUERY]", finalQuery);
 
   const geminiKeys = [];
   for (let i = 1; i <= 20; i++) {
@@ -1789,13 +1794,14 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
       ],
       tools: [{ googleSearch: {} }],
       config: {
-        temperature: 0,
-        systemInstruction: "You are a realtime search assistant.\nAnswer only using verified grounded results.\nKeep answers short, factual, and current."
+        temperature: 0.2,
+        maxOutputTokens: 120
       }
     });
 
     const candidate = response?.candidates?.[0];
     const text = String(response?.text || candidate?.content?.parts?.map((p) => p?.text || "").join("\n") || "").trim();
+    console.log("[GROUNDING_SUCCESS]", !!text);
 
     const grounding = candidate?.groundingMetadata || candidate?.grounding_metadata || {};
     const chunks = grounding?.groundingChunks || [];
@@ -1813,14 +1819,6 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
       search_queries: [finalQuery]
     };
   } catch (error) {
-    if (error?.code === 429 || error?.status === "RESOURCE_EXHAUSTED") {
-      if (!globalThis.__geminiGroundingRotation) {
-        globalThis.__geminiGroundingRotation = { cooldownByKey: new Map() };
-      }
-      globalThis.__geminiGroundingRotation.cooldownByKey.set(key, Date.now() + 60 * 1000);
-      console.log("[KEY_COOLDOWN]", 0);
-      return { success: false, answer: "Realtime search is temporarily busy. Try again later." };
-    }
     console.log("[GROUNDING_FATAL_ERROR]", String(error?.message || error));
     return { success: false, answer: "Realtime search is temporarily busy. Try again later." };
   }
@@ -1929,6 +1927,24 @@ async function generateImage(prompt, apiKey, model = "flux") {
 }
 async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = false, forceDeep = false, senderUsername = null, requestId = "chat", opts = {}) {
   const rawUserMessage = String(prompt || "").trim();
+  const normalizedText = rawUserMessage.toLowerCase();
+  if (
+    normalizedText.startsWith("/src") ||
+    normalizedText.startsWith(".src") ||
+    normalizedText.startsWith("/web") ||
+    normalizedText.startsWith(".web")
+  ) {
+    const sourceQueryEarly = extractSourceQuery(rawUserMessage);
+    console.log("[SRC_BYPASS_AI]", true);
+    if (!sourceQueryEarly) return "Please provide a query after .src";
+    const grounded = await performRealtimeGrounding(sourceQueryEarly, config, `${requestId}:src`);
+    if (!grounded || !grounded.answer) return "All realtime search providers are currently busy. Try again later.";
+    const cleanSources = (grounded.sources || []).filter(Boolean).slice(0, 6);
+    const sourceBlock = cleanSources.length
+      ? `\n\nSources:\n${cleanSources.map((s, i) => `${i + 1}. ${s}`).join("\n")}`
+      : "";
+    return `${String(grounded.answer || "").trim()}${sourceBlock}`.trim();
+  }
   const sourceMode = isSourceCommand(rawUserMessage);
   const sourceQuery = sourceMode ? extractSourceQuery(rawUserMessage) : "";
   const isRealtimeQuery = /today|live|score|match|ipl|news|weather|current|now|playing/i.test(rawUserMessage);
