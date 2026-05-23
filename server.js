@@ -4665,6 +4665,39 @@ async function startServer() {
             return;
           }
           const cmdName = text.replace("/", "").replace(".", "").split(" ")[0];
+          if (isSourceCommand(textRaw)) {
+            await CommandProcessor.process(
+              client,
+              message,
+              config2,
+              myId,
+              "src",
+              textRaw,
+              async (status) => {
+                await status.update(HS.search());
+                const aiRes = await getAIResponse(
+                  textRaw,
+                  config2,
+                  message.chatId?.toString(),
+                  senderId,
+                  false,
+                  false,
+                  message.sender?.username || null,
+                  requestId
+                );
+                if (aiRes) {
+                  const formatted = formatAiMessage(aiRes);
+                  await status.finish(formatted.text, {
+                    parseMode: formatted.parseMode,
+                    replyTo: message.id
+                  });
+                } else {
+                  await status.fail("I couldn't verify live realtime information.");
+                }
+              }
+            );
+            return;
+          }
           const isPublicCommand = [
             "ans",
             "music",
