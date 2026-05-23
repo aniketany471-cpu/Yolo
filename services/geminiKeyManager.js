@@ -116,29 +116,21 @@ export async function withGeminiKeyRotation(executor, { source = "unknown", over
     : [...state.keys];
   if (!candidateKeys.length) return null;
 
-  const tried = new Set();
-  while (tried.size < candidateKeys.length) {
-    let selected = selectNextHealthyKey(candidateKeys);
-    if (!selected) {
-      const retryKey = selectOldestCooldownKey(candidateKeys);
-      if (!retryKey) return null;
-      console.log("[KEY RETRY]", retryKey.index + 1);
-      selected = { key: retryKey.key, index: retryKey.index };
-    }
-    if (tried.has(selected.index)) continue;
-    tried.add(selected.index);
-    console.log(`[ACTIVE KEY INDEX] ${selected.index + 1}`);
-    state.keyStates[selected.index].lastUsed = Date.now();
-    state.keyStates[selected.index].requests += 1;
+  const selected = selectNextHealthyKey(candidateKeys);
+  if (!selected) return null;
+  console.log(`[ACTIVE KEY INDEX] ${selected.index + 1}`);
+  state.keyStates[selected.index].lastUsed = Date.now();
+  state.keyStates[selected.index].requests += 1;
 
-    try {
-      return await executor(selected.key, selected.index);
-    } catch (error) {
-      if (!isRetriableError(error)) throw error;
-      markCooldown(selected.index, error);
-      const next = selectNextHealthyKey(candidateKeys);
-      if (next) console.log(`[KEY ROTATION] rotating_to=${next.index + 1} source=${source}`);
+  try {
+    return await executor(selected.key, selected.index);
+  } catch (error) {
+    if (!isRetriableError(error)) throw error;
+    markCooldown(selected.index, error);
+    const msg = (error?.message || String(error || "")).toLowerCase();
+    if (msg.includes("resource_exhausted") || msg.includes("quota exceeded") || msg.includes("429") || msg.includes("free tier")) {
+      return { fatal: true, retry: false, rotate: false };
     }
+    return null;
   }
-  return null;
 }
