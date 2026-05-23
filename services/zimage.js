@@ -121,7 +121,7 @@ async function openaiImage(prompt, options = {}) {
   if (!apiKey) throw new Error("BLUEMINDS_API_KEY not set in environment");
   const baseUrl = (process.env.BLUEMINDS_BASE_URL || "").replace(/\/+$/, "");
   if (!baseUrl) throw new Error("BLUEMINDS_BASE_URL not set in environment");
-  const imageGenerateUrl = `${baseUrl}/images/generations`;
+  const imageGenerateUrl = `${baseUrl}/v1/images/generations`;
 
   const body = {
     model:   OPENAI_MODEL,
