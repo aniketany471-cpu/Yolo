@@ -1878,20 +1878,8 @@ function cleanAIResponse(text, config) {
   return cleaned;
 }
 function formatAiMessage(text) {
-  if (!text) return { text: "", parseMode: "markdown" };
-  const wordCount = text.trim().split(/\s+/).length;
-  if (wordCount > 100) {
-    let htmlContent = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\*\*(.*?)\*\*/g, "<b>$1</b>").replace(/__(.*?)__/g, "<u>$1</u>").replace(/_(.*?)_/g, "<i>$1</i>").replace(/`(.*?)`/g, "<code>$1</code>").replace(/\n/g, "<br/>");
-    return {
-      text: `<blockquote expandable>${htmlContent}</blockquote>`,
-      parseMode: "html"
-    };
-  }
-  if (text.length > 300) {
-    const formatted = text.split("\n").map((line) => `> ${line}`).join("\n");
-    return { text: formatted, parseMode: "markdown" };
-  }
-  return { text, parseMode: "markdown" };
+  if (!text) return { text: "" };
+  return { text: text.trim() };
 }
 async function generateImage(prompt, apiKey, model = "flux") {
   try {
