@@ -2136,7 +2136,18 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
     systemPrompt += `\n\nMOOD DETECTION: ${detectedMood.tone}`;
   }
   if (config.formattingEnabled === 1) {
-    systemPrompt += "\n\nFORMATTING: Use standard Telegram Markdown (bold with **). Do not use headers (#). Use bullet points for lists.";
+    systemPrompt += [
+      "\n\nFORMATTING & CHAT STYLE:",
+      "- Sound like a real active Telegram user, not a formal AI assistant.",
+      "- Keep default replies very short (usually 1-3 short lines).",
+      "- Use casual, natural language and keep an emotional/reactive vibe when appropriate.",
+      "- Avoid overexplaining unless user explicitly asks for detail.",
+      "- Use open Telegram spacing: short paragraphs with blank lines between thoughts.",
+      "- Avoid dense walls of text; prioritize readability on mobile.",
+      "- For normal requests, avoid structured analysis and long essay formatting.",
+      "- For lists, keep bullets minimal and clean. No markdown headers (#).",
+      "- If user asks for detailed explanation (e.g., 'explain', 'detail me', 'long answer', 'analyze', 'kaise?', 'why?', 'full explain'), then provide a longer structured reply."
+    ].join("\n");
   }
   const isDeep = forceDeep || config.deepThinking === 1;
   if (isDeep) {
