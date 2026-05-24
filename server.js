@@ -21,10 +21,12 @@ import { getAccuWeather } from "./services/weather.js";
 // Image service — loaded dynamically so a missing/broken module never crashes the bot
 let ziGenerateImage = null;
 let ziParseImageModelKeyword = null;
+let ziBuildImagePromptFromVision = null;
 try {
   const _ziMod = await import("./services/zimage.js");
   ziGenerateImage = _ziMod.generateImage;
   ziParseImageModelKeyword = _ziMod.parseImageModelKeyword;
+  ziBuildImagePromptFromVision = _ziMod.buildImagePromptFromVision;
   console.log("[img] Image generation service loaded OK");
 } catch (_ziErr) {
   console.warn("[img] Image service unavailable:", _ziErr.message);
@@ -1381,6 +1383,12 @@ function detectVisionAnalysisIntent(text) {
   const raw = String(text || "").trim();
   if (!raw) return false;
   return /\b(what is this|what's this|whats this|explain this|solve this|read this|read text|ocr|extract text|analy[sz]e this|caption this|describe this)\b/i.test(raw);
+}
+
+function detectVisionToGenerateIntent(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return false;
+  return /\b(generate similar|make similar|create similar|similar image|similar photo|similar picture|recreate this|recreate it|regenerate this|regenerate it|make one like this|make something like this|make like this|generate like this|create like this|replicate this|reproduce this|generate a similar|create a similar|make a similar|same style|same as this|like this image|like this photo|like this picture|make another like|generate another like|create another like)\b/i.test(raw);
 }
 
 function classifyImageIntent(text) {
@@ -4039,16 +4047,72 @@ async function startServer() {
         console.log(`[intent] final_handler=${userIntent.finalHandler}`);
         const explicitGenerationRequest = userIntent.shouldGenerateImage;
         const visionAnalysisIntent = detectVisionAnalysisIntent(text);
-        const generationBlockedForAnalysis = hasVisionImage && !explicitGenerationRequest;
+        const visionToGenerateIntent = hasVisionImage && detectVisionToGenerateIntent(text);
+        const generationBlockedForAnalysis = hasVisionImage && !explicitGenerationRequest && !visionToGenerateIntent;
         console.log(`[intent] image_present=${hasVisionImage}`);
         console.log(`[intent] explicit_generation_request=${explicitGenerationRequest}`);
-        if (hasVisionImage && (visionAnalysisIntent || generationBlockedForAnalysis)) {
+        console.log(`[intent] vision_to_generate=${visionToGenerateIntent}`);
+        if (visionToGenerateIntent) {
+          console.log("[intent] detected=vision_to_generate");
+        } else if (hasVisionImage && (visionAnalysisIntent || generationBlockedForAnalysis)) {
           console.log("[intent] detected=vision_analysis");
           if (generationBlockedForAnalysis) {
             console.log("[intent] generation_blocked_for_analysis=true");
           }
         } else if (explicitGenerationRequest && !hasVisionImage) {
           console.log("[intent] detected=image_generation");
+        }
+
+        if (visionToGenerateIntent) {
+          addLog(`[img] intent=vision_to_generate`, "info");
+          const IMAGE_LIMIT = 2;
+          const quotaRow = db.prepare("SELECT count FROM user_image_counts WHERE userId = ?").get(senderId);
+          const usedCount = quotaRow?.count ?? 0;
+          if (usedCount >= IMAGE_LIMIT) {
+            const ownerInfo = (config.adminUsers || "").split(",").map(s => s.trim()).filter(Boolean)[0];
+            const ownerHint = ownerInfo ? ` Contact **${ownerInfo}** to get more.` : " Contact the bot owner to get more.";
+            await status.finish(`🖼 You've used your **${IMAGE_LIMIT} free image generations**.\n\nYou've reached your limit.${ownerHint}`);
+            addLog(`[img] Quota exceeded for ${senderId} (${usedCount}/${IMAGE_LIMIT})`, "warn");
+            return;
+          }
+          try {
+            await status.update(HS.image());
+            if (!ziGenerateImage) throw new Error("Image service not loaded — check server logs");
+            const geminiKey = (config.geminiKey || getGeminiPrimaryKey() || "").trim();
+            const visionResult = await analyzeTelegramImageWithGemini(client2, visionSourceMessage, geminiKey, message.__requestId || `msg-${message.id}`);
+            if (!visionResult) throw new Error("Could not analyze the image — vision service unavailable");
+            const visionPrompt = ziBuildImagePromptFromVision
+              ? ziBuildImagePromptFromVision(visionResult)
+              : [visionResult.summary, visionResult.detected_context].filter(Boolean).join(". ");
+            addLog(`[img] vision_prompt="${visionPrompt.slice(0, 80)}"`, "info");
+            const { forceProvider: _vImgForce } = ziParseImageModelKeyword ? ziParseImageModelKeyword(text) : { forceProvider: null };
+            await status.update(HS.imageRender());
+            const { buffer, provider } = await ziGenerateImage(visionPrompt, config, { forceProvider: _vImgForce });
+            await status.update(HS.upload());
+            const caption = `🎨 **Similar Image Generated**\n\`${visionPrompt.slice(0, 120)}\`\n\n_${usedCount + 1}/${IMAGE_LIMIT} free generations used_`;
+            const tmpImgPath = path.join(tempDir, `img_${Date.now()}.jpg`);
+            await fs.writeFile(tmpImgPath, buffer);
+            try {
+              try { await client2.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch {}
+              await client2.sendFile(targetPeer, {
+                file: tmpImgPath,
+                caption,
+                parseMode: "markdown",
+                replyTo: message.id,
+                forceDocument: false
+              });
+              db.prepare(
+                "INSERT INTO user_image_counts (userId, count, resetAt) VALUES (?, 1, ?) ON CONFLICT(userId) DO UPDATE SET count = count + 1"
+              ).run(senderId, Date.now());
+              addLog(`[img] vision_to_generate_success=true provider=${provider} (${usedCount + 1}/${IMAGE_LIMIT})`, "success");
+            } finally {
+              fs.remove(tmpImgPath).catch(() => {});
+            }
+          } catch (imgErr) {
+            console.error("[img] Vision-to-generate failed:", imgErr.message);
+            await status.finish(`❌ **Could not generate similar image:** ${imgErr.message.slice(0, 120)}`);
+          }
+          return;
         }
 
         if (explicitGenerationRequest && !hasVisionImage) {
