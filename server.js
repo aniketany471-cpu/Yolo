@@ -878,7 +878,7 @@ async function getLightningAIResponse(prompt, apiKey, model = "lightning-ai/deep
     console.warn("[LightningAI] No valid API key configured.");
     return null;
   }
-  const baseUrl = (process.env.LIGHTNING_BASE_URL || "https://api.lightning.ai/v1").replace(/\/+$/, "");
+  const baseUrl = (process.env.LIGHTNING_BASE_URL || "https://lightning.ai/api/v1").replace(/\/+$/, "");
   const messages = normalizeContextMessages(prompt, context, systemInstruction);
   const result = await fetchJsonWithRetry(
     `${baseUrl}/chat/completions`,
