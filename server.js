@@ -543,6 +543,10 @@ try {
   db.exec("ALTER TABLE config ADD COLUMN deepThinking INTEGER DEFAULT 0;");
 } catch (e) {
 }
+try {
+  db.exec("ALTER TABLE config ADD COLUMN lightningApiKey TEXT DEFAULT '';");
+} catch (e) {
+}
 db.exec(`
   CREATE TABLE IF NOT EXISTS user_nsfw_prefs (
     userId TEXT PRIMARY KEY,
@@ -624,6 +628,11 @@ if (envBluesmindsKey.length > 10) {
   db.prepare("UPDATE config SET bluesmindsApiKey = ? WHERE id = 1").run(envBluesmindsKey);
 } else if (!existingConfig?.bluesmindsApiKey || existingConfig.bluesmindsApiKey.length < 10) {
   console.warn("[startup] BLUEMINDS_API_KEY env var not set and no key in DB — BluesMinds will not work until a key is added via the dashboard or Railway Variables.");
+}
+const envLightningKey = (process.env.LIGHTNING_API_KEY || "").trim();
+if (envLightningKey.length > 10) {
+  db.prepare("UPDATE config SET lightningApiKey = ? WHERE id = 1").run(envLightningKey);
+  console.log("[startup] Lightning AI key loaded from LIGHTNING_API_KEY env var");
 }
 // Hard bootstrap: ensure auto-reply and BluesMinds are ON out of the box on every fresh deploy.
 // bluesmindsApiKey is intentionally NOT set here — it comes from env var or dashboard only.
@@ -863,6 +872,38 @@ async function getGroqResponse(prompt, apiKey, model = "llama3-8b-8192", context
     return null;
   }
 }
+async function getLightningAIResponse(prompt, apiKey, model = "lightning-ai/deepseek-v4-pro", context = [], systemInstruction) {
+  const cleanKey = (apiKey || "").trim();
+  if (!cleanKey || cleanKey.length < 10) {
+    console.warn("[LightningAI] No valid API key configured.");
+    return null;
+  }
+  const baseUrl = (process.env.LIGHTNING_BASE_URL || "https://api.lightning.ai/v1").replace(/\/+$/, "");
+  const messages = normalizeContextMessages(prompt, context, systemInstruction);
+  const result = await fetchJsonWithRetry(
+    `${baseUrl}/chat/completions`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${cleanKey}` },
+      body: JSON.stringify({ model, messages, temperature: 0.7 })
+    },
+    { provider: "LightningAI", model, endpoint: "/v1/chat/completions" }
+  );
+  if (!result.ok) {
+    console.error(`[LightningAI][Model=${model}][Status=${result.status}] Request failed: ${(result.text || "").slice(0, 200)}`);
+    return null;
+  }
+  const content = result.data?.choices?.[0]?.message?.content
+    || result.data?.choices?.[0]?.text
+    || null;
+  if (!content) {
+    console.warn(`[LightningAI][Model=${model}] Response OK but content was empty. Keys: ${Object.keys(result.data || {}).join(", ")}`);
+    return null;
+  }
+  console.log(`[LightningAI][Model=${model}] ✅ Got ${content.length} chars`);
+  return content;
+}
+
 async function getOfficialDeepSeekResponse(prompt, apiKey, model = "deepseek-chat", context = [], systemInstruction) {
   try {
     const cleanKey = apiKey?.trim();
@@ -2453,10 +2494,16 @@ User Message: ${prompt}`;
       inst
     )
   };
+  const lightningProvider = {
+    name: "LightningAI",
+    key: config.lightningApiKey || (process.env.LIGHTNING_API_KEY || "").trim(),
+    fn: (p, k, ctx, inst) => getLightningAIResponse(p, k, "lightning-ai/deepseek-v4-pro", ctx, inst)
+  };
   // Runtime execution order (hard-enforced):
-  // 1) BluesMinds → 2) Official DeepSeek → 3) Groq → 4) Optional Gemini
+  // 1) LightningAI (DeepSeek V4 Pro) → 2) BluesMinds → 3) Official DeepSeek → 4) Groq → 5) Optional Gemini
   // Additional providers are kept last as extra safety fallbacks.
   providers.push(
+    lightningProvider,
     bluesmindsProvider,
     officialDeepSeekProvider,
     groqProvider,
