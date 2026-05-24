@@ -214,6 +214,20 @@ export function parseImageModelKeyword(text) {
 }
 
 /**
+ * Build a precise image generation prompt from a vision analysis result.
+ * Combines summary, objects, style and context into a single descriptive prompt.
+ */
+export function buildImagePromptFromVision(visionResult) {
+  const parts = [];
+  if (visionResult.summary)          parts.push(visionResult.summary);
+  if (visionResult.detected_context) parts.push(visionResult.detected_context);
+  if (visionResult.objects?.length)  parts.push(`featuring ${visionResult.objects.slice(0, 8).join(", ")}`);
+  if (visionResult.type && visionResult.type !== "unknown") parts.push(`${visionResult.type} style`);
+  const raw = parts.filter(Boolean).join(". ");
+  return sanitizePrompt(raw || "similar image");
+}
+
+/**
  * Generate an image for the given prompt.
  *
  * options.forceProvider = "gpt"  → skip straight to gpt-image-1 (3 attempts)
