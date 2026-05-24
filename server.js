@@ -1389,7 +1389,11 @@ function classifyImageIntent(text) {
 
   const imageSignals = [
     { term: "wallpaper", score: 4 }, { term: "poster", score: 4 }, { term: "thumbnail", score: 4 }, { term: "logo", score: 4 },
-    { term: "generate image", score: 3 }, { term: "create image", score: 3 }, { term: "make image", score: 3 }, { term: "draw", score: 3 }, { term: "render", score: 3 },
+    { term: "generate image", score: 4 }, { term: "generate an image", score: 4 }, { term: "generate a ", score: 4 },
+    { term: "create image", score: 4 }, { term: "create an image", score: 4 }, { term: "create a ", score: 4 },
+    { term: "make image", score: 4 }, { term: "make an image", score: 4 }, { term: "make me an image", score: 4 }, { term: "make me a ", score: 4 },
+    { term: "an image of", score: 4 }, { term: "a photo of", score: 4 }, { term: "a picture of", score: 4 },
+    { term: "draw", score: 4 }, { term: "render", score: 3 },
     { term: "realistic", score: 2 }, { term: "cinematic", score: 2 }, { term: "anime", score: 2 }, { term: "cyberpunk", score: 2 }, { term: "portrait", score: 2 }, { term: "artwork", score: 2 }, { term: "illustration", score: 2 },
     { term: "photo", score: 1 }, { term: "background", score: 1 }, { term: "art", score: 1 }, { term: "scene", score: 1 }
   ];
