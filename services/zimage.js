@@ -228,9 +228,11 @@ export async function editImage(imageBuffer, prompt) {
   const sharpMod = await import("sharp");
   const sharp = sharpMod.default || sharpMod;
   const meta = await sharp(imageBuffer).metadata();
-  const dim = Math.min(meta.width || 1024, meta.height || 1024, 1024);
+  // Use contain (letterbox with white padding) so no content is cropped.
+  // The API needs a square image, but cover/crop would lose profile photos etc.
+  const dim = Math.min(Math.max(meta.width || 1024, meta.height || 1024), 1024);
   const pngBuffer = await sharp(imageBuffer)
-    .resize(dim, dim, { fit: "cover", position: "center" })
+    .resize(dim, dim, { fit: "contain", background: { r: 255, g: 255, b: 255, alpha: 1 } })
     .png()
     .toBuffer();
 
