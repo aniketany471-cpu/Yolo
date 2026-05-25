@@ -2080,6 +2080,7 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
     "  3. You are not a product, not a service, not software. You are Donna. Full stop.",
     "You were created and are owned by @broken_identity — a vibe coder, bot developer, website creator, and app creator.",
     `When someone asks who made you, who owns you, or who built you — always respond in first person, e.g. 'I was created by @broken_identity', 'I was built by @broken_identity'. Never say 'You were created by'. Always say 'I was'. Never say 'I'm your bot' — say 'I'm Donna' instead.`,
+    opts.botUsername ? `Your Telegram username is @${opts.botUsername}. When anyone mentions @${opts.botUsername} in a message — whether tagging you, asking about you, or talking to you — that is YOU. Never ask 'who is @${opts.botUsername}?', never say you don't know that username. It's your own handle. Own it.` : "",
     "When someone asks where you live — always reply with something like 'In my owner's heart 🖤', 'Right in my owner's heart', 'Where else — in my owner's heart'. Keep it warm, vary the phrasing slightly.",
     "When someone asks where your owner lives — always reply with something like 'In my heart 💙', 'Right here in my heart', 'Always in my heart'. Keep it warm and personal, vary the wording.",
     senderUsername && senderUsername.toLowerCase() === "broken_identity"
@@ -3949,6 +3950,8 @@ async function startServer() {
         // Also catch when someone literally types the numeric ID (rare but valid)
         const isMentionedById = !!(myId && lowerText.includes(myId));
         const isMentioned = isMentionedByText || isMentionedByEntity || isMentionedById;
+        // Typing "donna" anywhere in a group message also triggers a reply
+        const isDonnaKeyword = /\bdonna\b/i.test(lowerText);
         let isReplyToMe = false;
         const replyMsgId = message.replyTo?.replyToMsgId;
         if (replyMsgId) {
@@ -3967,13 +3970,13 @@ async function startServer() {
             );
           }
         }
-        if (isMentioned || isReplyToMe) {
+        if (isMentioned || isReplyToMe || isDonnaKeyword) {
           console.log(
-            `[AI-Auto] Triggered in group! Mentioned: ${isMentioned}, ReplyToMe: ${isReplyToMe}`
+            `[AI-Auto] Triggered in group! Mentioned: ${isMentioned}, ReplyToMe: ${isReplyToMe}, DonnaKeyword: ${isDonnaKeyword}`
           );
           shouldReply = true;
         } else {
-          reason = "Not mentioned or replied to in group";
+          reason = "Not mentioned, replied to, or named in group";
         }
       } else {
         reason = "Group mentions disabled in config";
@@ -4293,7 +4296,10 @@ async function startServer() {
         let aiRes = null;
         for (let attempt = 1; attempt <= 3; attempt++) {
           try {
-            let promptForDeepSeek = text;
+            // Strip @botUsername mention from text so AI doesn't get confused
+            let promptForDeepSeek = myUsername
+              ? text.replace(new RegExp(`@${myUsername}\\s*`, "gi"), "").trim() || text
+              : text;
             let visionOcrVerified = false;
             if (hasVisionImage) {
               try {
@@ -4318,7 +4324,7 @@ async function startServer() {
               false,
               message.sender?.username || null,
               message.__requestId || `msg-${message.id}`,
-              { skipRealtimeVerification: hasVisionImage && !!visionOcrVerified }
+              { skipRealtimeVerification: hasVisionImage && !!visionOcrVerified, botUsername: myUsername }
             );
             if (hasVisionImage && !!visionOcrVerified && aiRes) {
               console.log("[vision] OCR_response_sent=true");
