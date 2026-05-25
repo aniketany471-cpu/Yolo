@@ -634,12 +634,12 @@ if (envBluesmindsKey.length > 10) {
 // Hard bootstrap: ensure auto-reply and BluesMinds are ON out of the box on every fresh deploy.
 // bluesmindsApiKey is intentionally NOT set here — it comes from env var or dashboard only.
 db.prepare(
-  "UPDATE config SET aiProvider = 'bluesminds', activeModel = 'gpt-5.3', aiEnabled = 1, autoReplyDM = 1, autoReplyMention = 1 WHERE id = 1 AND (autoReplyDM = 0 OR autoReplyMention = 0 OR aiProvider = 'openrouter' OR aiProvider = 'gemini')"
+  "UPDATE config SET aiProvider = 'bluesminds', activeModel = 'gpt-5.3-chat-latest', aiEnabled = 1, autoReplyDM = 1, autoReplyMention = 1 WHERE id = 1 AND (autoReplyDM = 0 OR autoReplyMention = 0 OR aiProvider = 'openrouter' OR aiProvider = 'gemini')"
 ).run();
 // Always enforce gpt-5.3 as the active model on every startup/redeploy.
 // This runs unconditionally so even an existing DB row is corrected.
-db.prepare("UPDATE config SET activeModel = 'gpt-5.3' WHERE id = 1").run();
-console.log("[startup] Bootstrap complete — BluesMinds provider, autoReply ON, model locked to gpt-5.3");
+db.prepare("UPDATE config SET activeModel = 'gpt-5.3-chat-latest' WHERE id = 1").run();
+console.log("[startup] Bootstrap complete — BluesMinds provider, autoReply ON, model locked to gpt-5.3-chat-latest");
 
 // Bootstrap credentials from env vars so Railway redeployments don't wipe them from the UI
 {
@@ -2405,17 +2405,17 @@ User Message: ${prompt}`;
     key: userGeminiK || systemGeminiK,
     fn: (p, k, ctx, inst) => getGeminiResponse(p, k, config.activeModel, ctx, inst, requestId)
   };
-  // Provider 1: BluesMinds GPT-5.3 (primary)
+  // Provider 1: BluesMinds GPT-5.3 latest (primary)
   const bluesmindsGpt5Provider = {
     name: "BluesMinds-GPT5",
     key: config.bluesmindsApiKey,
-    fn: (p, k, ctx, inst) => getBluesMindsResponse(p, k, "gpt-5.3", ctx, inst)
+    fn: (p, k, ctx, inst) => getBluesMindsResponse(p, k, "gpt-5.3-chat-latest", ctx, inst)
   };
-  // Provider 2: BluesMinds DeepSeek V4 (first fallback)
+  // Provider 2: BluesMinds DeepSeek V4 Pro (first fallback)
   const bluesmindsDeepSeekProvider = {
     name: "BluesMinds-DeepSeek",
     key: config.bluesmindsApiKey,
-    fn: (p, k, ctx, inst) => getBluesMindsResponse(p, k, "deepseek.v4", ctx, inst)
+    fn: (p, k, ctx, inst) => getBluesMindsResponse(p, k, "accounts/fireworks/models/deepseek-v4-pro", ctx, inst)
   };
   // Provider 3: Groq llama-3.3-70b (second fallback)
   const groqProvider = {
