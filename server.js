@@ -631,20 +631,15 @@ if (envBluesmindsKey.length > 10) {
 } else if (!existingConfig?.bluesmindsApiKey || existingConfig.bluesmindsApiKey.length < 10) {
   console.warn("[startup] BLUEMINDS_API_KEY env var not set and no key in DB — BluesMinds will not work until a key is added via the dashboard or Railway Variables.");
 }
-const envLightningKey = (process.env.LIGHTNING_API_KEY || "").trim();
-if (envLightningKey.length > 10) {
-  db.prepare("UPDATE config SET lightningApiKey = ? WHERE id = 1").run(envLightningKey);
-  console.log("[startup] Lightning AI key loaded from LIGHTNING_API_KEY env var");
-}
 // Hard bootstrap: ensure auto-reply and BluesMinds are ON out of the box on every fresh deploy.
 // bluesmindsApiKey is intentionally NOT set here — it comes from env var or dashboard only.
 db.prepare(
-  "UPDATE config SET aiProvider = 'bluesminds', activeModel = 'gpt-4o-mini', aiEnabled = 1, autoReplyDM = 1, autoReplyMention = 1 WHERE id = 1 AND (autoReplyDM = 0 OR autoReplyMention = 0 OR aiProvider = 'openrouter' OR aiProvider = 'gemini')"
+  "UPDATE config SET aiProvider = 'bluesminds', activeModel = 'gpt-5.3', aiEnabled = 1, autoReplyDM = 1, autoReplyMention = 1 WHERE id = 1 AND (autoReplyDM = 0 OR autoReplyMention = 0 OR aiProvider = 'openrouter' OR aiProvider = 'gemini')"
 ).run();
-// Always enforce deepseek.v3.2 as the active model on every startup/redeploy.
+// Always enforce gpt-5.3 as the active model on every startup/redeploy.
 // This runs unconditionally so even an existing DB row is corrected.
-db.prepare("UPDATE config SET activeModel = 'deepseek.v3.2' WHERE id = 1").run();
-console.log("[startup] Bootstrap complete — BluesMinds provider, autoReply ON, model locked to deepseek.v3.2");
+db.prepare("UPDATE config SET activeModel = 'gpt-5.3' WHERE id = 1").run();
+console.log("[startup] Bootstrap complete — BluesMinds provider, autoReply ON, model locked to gpt-5.3");
 
 // Bootstrap credentials from env vars so Railway redeployments don't wipe them from the UI
 {
@@ -874,70 +869,7 @@ async function getGroqResponse(prompt, apiKey, model = "llama3-8b-8192", context
     return null;
   }
 }
-async function getLightningAIResponse(prompt, apiKey, model = "lightning-ai/deepseek-v4-pro", context = [], systemInstruction) {
-  const cleanKey = (apiKey || "").trim();
-  if (!cleanKey || cleanKey.length < 10) {
-    console.warn("[LightningAI] No valid API key configured.");
-    return null;
-  }
-  const baseUrl = (process.env.LIGHTNING_BASE_URL || "https://lightning.ai/api/v1").replace(/\/+$/, "");
-  const messages = normalizeContextMessages(prompt, context, systemInstruction);
-  const result = await fetchJsonWithRetry(
-    `${baseUrl}/chat/completions`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${cleanKey}` },
-      body: JSON.stringify({ model, messages, temperature: 0.7 })
-    },
-    { provider: "LightningAI", model, endpoint: "/v1/chat/completions" }
-  );
-  if (!result.ok) {
-    console.error(`[LightningAI][Model=${model}][Status=${result.status}] Request failed: ${(result.text || "").slice(0, 200)}`);
-    return null;
-  }
-  const content = result.data?.choices?.[0]?.message?.content
-    || result.data?.choices?.[0]?.text
-    || null;
-  if (!content) {
-    console.warn(`[LightningAI][Model=${model}] Response OK but content was empty. Keys: ${Object.keys(result.data || {}).join(", ")}`);
-    return null;
-  }
-  console.log(`[LightningAI][Model=${model}] ✅ Got ${content.length} chars`);
-  return content;
-}
-
-async function getOfficialDeepSeekResponse(prompt, apiKey, model = "deepseek-chat", context = [], systemInstruction) {
-  try {
-    const cleanKey = apiKey?.trim();
-    if (!cleanKey || cleanKey === "undefined" || cleanKey === "null") {
-      console.log("[text-ai] official_deepseek_error=missing_api_key");
-      return null;
-    }
-    const finalModel = "deepseek-chat";
-    console.log("[text-ai] official_deepseek_request_started=true");
-    const messages = normalizeContextMessages(prompt, context, systemInstruction);
-    const result = await fetchJsonWithRetry(
-      "https://api.deepseek.com/chat/completions",
-      {
-        method: "POST",
-        headers: { Authorization: `Bearer ${cleanKey}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ model: finalModel, messages })
-      },
-      { provider: "Official DeepSeek", model: finalModel, endpoint: "/chat/completions" }
-    );
-    console.log(`[text-ai] official_deepseek_status=${result?.status ?? "unknown"}`);
-    if (!result.ok) {
-      console.log(`[text-ai] official_deepseek_error=${((result?.text || "request_failed").slice(0, 180)).replace(/\s+/g, " ")}`);
-      return null;
-    }
-    console.log("[text-ai] official_deepseek_success=true");
-    return result.data?.choices?.[0]?.message?.content?.trim() || null;
-  } catch (e) {
-    console.log(`[text-ai] official_deepseek_error=${(e?.message || String(e)).replace(/\s+/g, " ").slice(0, 180)}`);
-    console.error("[Official DeepSeek] Fetch Error:", e?.message || e);
-    return null;
-  }
-}
+// Lightning AI and Official DeepSeek removed — BluesMinds → Groq chain only.
 async function getGrokResponse(prompt, apiKey, model = "grok-4", context = [], systemInstruction) {
   try {
     const cleanKey = apiKey?.trim();
@@ -2473,25 +2405,23 @@ User Message: ${prompt}`;
     key: userGeminiK || systemGeminiK,
     fn: (p, k, ctx, inst) => getGeminiResponse(p, k, config.activeModel, ctx, inst, requestId)
   };
-  const groqModels = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"];
+  // Provider 1: BluesMinds GPT-5.3 (primary)
+  const bluesmindsGpt5Provider = {
+    name: "BluesMinds-GPT5",
+    key: config.bluesmindsApiKey,
+    fn: (p, k, ctx, inst) => getBluesMindsResponse(p, k, "gpt-5.3", ctx, inst)
+  };
+  // Provider 2: BluesMinds DeepSeek V4 (first fallback)
+  const bluesmindsDeepSeekProvider = {
+    name: "BluesMinds-DeepSeek",
+    key: config.bluesmindsApiKey,
+    fn: (p, k, ctx, inst) => getBluesMindsResponse(p, k, "deepseek.v4", ctx, inst)
+  };
+  // Provider 3: Groq llama-3.3-70b (second fallback)
   const groqProvider = {
     name: "Groq",
     key: groqK,
-    fn: async (p, k, ctx, inst) => {
-      for (const m of groqModels) {
-        console.log(`[text-ai] groq_model=${m}`);
-        const out = await getGroqResponse(p, k, m, ctx, inst);
-        if (out && out.trim().length > 2) return out;
-      }
-      return null;
-    }
-  };
-  const officialDeepSeekProvider = {
-    name: "Official DeepSeek",
-    key: (process.env.DEEPSEEK_API_KEY || "").trim(),
-    fn: async (p, k, ctx, inst) => {
-      return getOfficialDeepSeekResponse(p, k, "deepseek-chat", ctx, inst);
-    }
+    fn: (p, k, ctx, inst) => getGroqResponse(p, k, "llama-3.3-70b-versatile", ctx, inst)
   };
   const grokProvider = {
     name: "xAI/Grok",
@@ -2503,44 +2433,20 @@ User Message: ${prompt}`;
     key: openRouterK,
     fn: (p, k, ctx, inst) => getOpenRouterResponse(p, k, config.activeModel, ctx, inst)
   };
-  const bluesmindsProvider = {
-    name: "BluesMinds",
-    key: config.bluesmindsApiKey,
-    fn: (p, k, ctx, inst) => getBluesMindsResponse(
-      p,
-      k,
-      config.activeModel || "gpt-4o-mini",
-      ctx,
-      inst
-    )
-  };
-  const lightningProvider = {
-    name: "LightningAI",
-    key: config.lightningApiKey || (process.env.LIGHTNING_API_KEY || "").trim(),
-    fn: (p, k, ctx, inst) => getLightningAIResponse(p, k, "lightning-ai/deepseek-v4-pro", ctx, inst)
-  };
-  // Runtime execution order (hard-enforced):
-  // 1) LightningAI (DeepSeek V4 Pro) → 2) BluesMinds → 3) Official DeepSeek → 4) Groq → 5) Optional Gemini
-  // Additional providers are kept last as extra safety fallbacks.
+  // Runtime execution order:
+  // 1) BluesMinds GPT-5.3 → 2) BluesMinds DeepSeek V4 → 3) Groq llama-3.3-70b → 4) Gemini/Grok/OR (safety nets)
   providers.push(
-    lightningProvider,
-    bluesmindsProvider,
-    officialDeepSeekProvider,
+    bluesmindsGpt5Provider,
+    bluesmindsDeepSeekProvider,
     groqProvider,
     geminiProvider,
     grokProvider,
     orProvider
   );
-  let bmRetriableFailureDetected = false;
   for (const p of providers) {
-    if (p.name === "Official DeepSeek") {
-      console.log("[text-ai] trying_provider=official_deepseek");
-    }
     if (p.key && p.key !== "undefined" && p.key !== "null" && p.key.length > 5) {
       try {
-        if (p.name === "BluesMinds") {
-          console.log("[text-ai] provider=blueminds");
-        }
+        console.log(`[text-ai] trying_provider=${p.name}`);
         const resRaw = await p.fn(
           prompt,
           p.key,
@@ -2548,8 +2454,8 @@ User Message: ${prompt}`;
           `${timeContext} ${systemPrompt} ${searchContext ? "\n\n" + searchContext : ""}`
         );
         if (resRaw && resRaw.trim().length > 2) {
-          if (p.name === "Groq") {
-            console.log("[text-ai] fallback_success=true");
+          if (p.name !== "BluesMinds-GPT5") {
+            console.log(`[text-ai] fallback_success=true provider=${p.name}`);
           }
           const res = cleanAIResponse(resRaw, config);
           if (!res || res.trim().length < 3) continue;
@@ -2563,33 +2469,16 @@ User Message: ${prompt}`;
           }
           return res;
         }
-        if (p.name === "BluesMinds") {
-          bmRetriableFailureDetected = true;
-          console.log("[text-ai] provider_failure_detected=true");
-          console.log("[text-ai] switching_provider=official_deepseek");
-        }
-        if (p.name === "Official DeepSeek" && bmRetriableFailureDetected) {
-          console.log("[text-ai] switching_provider=groq");
-        }
+        console.log(`[text-ai] provider_empty_response=${p.name} switching_to_next`);
       } catch (err) {
-        if (p.name === "BluesMinds") {
-          const em = (err?.message || String(err) || "").toLowerCase();
-          const bmRetriable = shouldFallbackFromBmMessage(em);
-          console.log(`[text-ai] provider_failure_detected=${bmRetriable ? "true" : "false"}`);
-          bmRetriableFailureDetected = bmRetriable;
-          if (bmRetriable) console.log("[text-ai] switching_provider=official_deepseek");
-          else return null;
-        }
-        if (p.name === "Official DeepSeek" && bmRetriableFailureDetected) {
-          console.log("[text-ai] switching_provider=groq");
-        }
+        const em = (err?.message || String(err) || "").toLowerCase();
+        const retriable = shouldFallbackFromBmMessage(em);
+        console.log(`[text-ai] provider_error=${p.name} retriable=${retriable}`);
         console.error(`[AI] Exception in ${p.name}:`, err.message || err);
+        if (!retriable && p.name === "BluesMinds-GPT5") return null;
       }
-    } else if (p.name === "Official DeepSeek") {
-      console.log("[text-ai] official_deepseek_error=missing_api_key");
-      if (bmRetriableFailureDetected) {
-        console.log("[text-ai] switching_provider=groq");
-      }
+    } else {
+      console.log(`[text-ai] provider_skipped=${p.name} reason=no_key`);
     }
   }
   return null;
