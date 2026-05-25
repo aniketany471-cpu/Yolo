@@ -238,7 +238,6 @@ export async function editImage(imageBuffer, prompt) {
   form.append("model", OPENAI_MODEL);
   form.append("prompt", sanitizePrompt(prompt));
   form.append("n", "1");
-  form.append("response_format", "b64_json");
   form.append("image", new File([pngBuffer], "image.png", { type: "image/png" }));
 
   const res = await fetchWithTimeout(url, {
