@@ -3826,8 +3826,15 @@ async function startServer() {
       shouldReply = true;
     }
     if (!isPrivate) {
-      if (config.autoReplyMention === 1) {
-        const lowerText = text.toLowerCase();
+      const lowerText = (text || "").toLowerCase();
+      // "donna" keyword: ALWAYS triggers in groups regardless of any config toggle.
+      // This is a direct name-call — it must never be gated.
+      const isDonnaKeyword = /\bdonna\b/i.test(lowerText);
+      if (isDonnaKeyword) {
+        console.log(`[AI-Auto] Triggered by donna keyword in group`);
+        shouldReply = true;
+      }
+      if (!shouldReply && config.autoReplyMention === 1) {
         // Text-based mention: someone typed @username
         const isMentionedByText = myUsername && lowerText.includes(`@${myUsername.toLowerCase()}`);
         // Entity-based mention: covers accounts with no username — Telegram uses
@@ -3839,8 +3846,6 @@ async function startServer() {
         // Also catch when someone literally types the numeric ID (rare but valid)
         const isMentionedById = !!(myId && lowerText.includes(myId));
         const isMentioned = isMentionedByText || isMentionedByEntity || isMentionedById;
-        // Typing "donna" anywhere in a group message also triggers a reply
-        const isDonnaKeyword = /\bdonna\b/i.test(lowerText);
         let isReplyToMe = false;
         const replyMsgId = message.replyTo?.replyToMsgId;
         if (replyMsgId) {
@@ -3859,16 +3864,16 @@ async function startServer() {
             );
           }
         }
-        if (isMentioned || isReplyToMe || isDonnaKeyword) {
+        if (isMentioned || isReplyToMe) {
           console.log(
-            `[AI-Auto] Triggered in group! Mentioned: ${isMentioned}, ReplyToMe: ${isReplyToMe}, DonnaKeyword: ${isDonnaKeyword}`
+            `[AI-Auto] Triggered in group! Mentioned: ${isMentioned}, ReplyToMe: ${isReplyToMe}`
           );
           shouldReply = true;
         } else {
-          reason = "Not mentioned, replied to, or named in group";
+          reason = "Not mentioned or replied to in group";
         }
-      } else {
-        reason = "Group mentions disabled in config";
+      } else if (!shouldReply) {
+        reason = "Group mentions disabled and no donna keyword";
       }
     }
     if (!shouldReply) {
