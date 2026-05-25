@@ -214,6 +214,55 @@ export function parseImageModelKeyword(text) {
 }
 
 /**
+ * Edit an existing image using a text instruction (OpenAI image edits API).
+ * Converts the input to a square PNG before sending — required by the API.
+ * Returns { buffer: Buffer, provider: string }
+ */
+export async function editImage(imageBuffer, prompt) {
+  const apiKey = process.env.BLUEMINDS_API_KEY;
+  if (!apiKey) throw new Error("BLUEMINDS_API_KEY not set");
+  const baseUrl = (process.env.BLUEMINDS_BASE_URL || "https://api.bluesminds.com").replace(/\/+$/, "");
+  const url = `${baseUrl}/v1/images/edits`;
+
+  // Image edit API requires a square PNG, max 4 MB
+  const sharpMod = await import("sharp");
+  const sharp = sharpMod.default || sharpMod;
+  const meta = await sharp(imageBuffer).metadata();
+  const dim = Math.min(meta.width || 1024, meta.height || 1024, 1024);
+  const pngBuffer = await sharp(imageBuffer)
+    .resize(dim, dim, { fit: "cover", position: "center" })
+    .png()
+    .toBuffer();
+
+  const form = new FormData();
+  form.append("model", OPENAI_MODEL);
+  form.append("prompt", sanitizePrompt(prompt));
+  form.append("n", "1");
+  form.append("response_format", "b64_json");
+  form.append("image", new File([pngBuffer], "image.png", { type: "image/png" }));
+
+  const res = await fetchWithTimeout(url, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}` },
+    body: form
+  }, PROVIDER_TIMEOUT_MS);
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const msg = data?.error?.message || `HTTP ${res.status}`;
+    throw new Error(`Image edit error: ${msg}`);
+  }
+
+  const b64 = data?.data?.[0]?.b64_json;
+  if (b64) return { buffer: Buffer.from(b64, "base64"), provider: "gpt-image-1-edit" };
+
+  const imageUrl = data?.data?.[0]?.url;
+  if (imageUrl) return { buffer: await downloadImageBuffer(imageUrl), provider: "gpt-image-1-edit" };
+
+  throw new Error("Image edit returned no content");
+}
+
+/**
  * Build a precise image generation prompt from a vision analysis result.
  * Combines summary, objects, style and context into a single descriptive prompt.
  */
