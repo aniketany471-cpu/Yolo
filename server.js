@@ -22,11 +22,13 @@ import { getAccuWeather } from "./services/weather.js";
 let ziGenerateImage = null;
 let ziParseImageModelKeyword = null;
 let ziBuildImagePromptFromVision = null;
+let ziEditImage = null;
 try {
   const _ziMod = await import("./services/zimage.js");
   ziGenerateImage = _ziMod.generateImage;
   ziParseImageModelKeyword = _ziMod.parseImageModelKeyword;
   ziBuildImagePromptFromVision = _ziMod.buildImagePromptFromVision;
+  ziEditImage = _ziMod.editImage;
   console.log("[img] Image generation service loaded OK");
 } catch (_ziErr) {
   console.warn("[img] Image service unavailable:", _ziErr.message);
@@ -1429,7 +1431,24 @@ function detectVisionAnalysisIntent(text) {
 function detectVisionToGenerateIntent(text) {
   const raw = String(text || "").trim();
   if (!raw) return false;
+  // Excluded: phrases that belong to detectImageEditIntent (change/replace/remove/add/edit)
   return /\b(generate similar|make similar|create similar|similar image|similar photo|similar picture|recreate this|recreate it|regenerate this|regenerate it|make one like this|make something like this|make like this|generate like this|create like this|replicate this|reproduce this|generate a similar|create a similar|make a similar|same style|same as this|like this image|like this photo|like this picture|make another like|generate another like|create another like)\b/i.test(raw);
+}
+
+function detectImageEditIntent(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return false;
+  // "change X to Y" — explicit value swap (must have "to" after "change")
+  if (/\bchange\b.{1,80}\bto\b/i.test(raw)) return true;
+  // "replace X with Y"
+  if (/\breplace\b.{1,80}\bwith\b/i.test(raw)) return true;
+  // "remove/erase/delete [thing]"
+  if (/\b(remove|erase|delete)\b.{1,60}/i.test(raw)) return true;
+  // "add/put [thing] to/on/in [image]"
+  if (/\b(add|put)\b.{1,60}\b(to|on|in|into)\b/i.test(raw)) return true;
+  // Explicit image-edit phrases
+  if (/\b(edit this image|edit this photo|edit the image|edit the photo|edit the picture|photoshop this|photoshop the|modify this image|modify this photo|modify the image|inpaint|touch up|retouch|make the background|change the background|change the color of|change the hair|change the sky|swap .{1,40} with|turn this into|turn it into)\b/i.test(raw)) return true;
+  return false;
 }
 
 function classifyImageIntent(text) {
@@ -4094,12 +4113,16 @@ async function startServer() {
         console.log(`[intent] final_handler=${userIntent.finalHandler}`);
         const explicitGenerationRequest = userIntent.shouldGenerateImage;
         const visionAnalysisIntent = detectVisionAnalysisIntent(text);
-        const visionToGenerateIntent = hasVisionImage && detectVisionToGenerateIntent(text);
-        const generationBlockedForAnalysis = hasVisionImage && !explicitGenerationRequest && !visionToGenerateIntent;
+        const imageEditIntent = hasVisionImage && detectImageEditIntent(text);
+        const visionToGenerateIntent = hasVisionImage && !imageEditIntent && detectVisionToGenerateIntent(text);
+        const generationBlockedForAnalysis = hasVisionImage && !explicitGenerationRequest && !visionToGenerateIntent && !imageEditIntent;
         console.log(`[intent] image_present=${hasVisionImage}`);
         console.log(`[intent] explicit_generation_request=${explicitGenerationRequest}`);
+        console.log(`[intent] image_edit=${imageEditIntent}`);
         console.log(`[intent] vision_to_generate=${visionToGenerateIntent}`);
-        if (visionToGenerateIntent) {
+        if (imageEditIntent) {
+          console.log("[intent] detected=image_edit");
+        } else if (visionToGenerateIntent) {
           console.log("[intent] detected=vision_to_generate");
         } else if (hasVisionImage && (visionAnalysisIntent || generationBlockedForAnalysis)) {
           console.log("[intent] detected=vision_analysis");
@@ -4108,6 +4131,55 @@ async function startServer() {
           }
         } else if (explicitGenerationRequest && !hasVisionImage) {
           console.log("[intent] detected=image_generation");
+        }
+
+        if (imageEditIntent) {
+          addLog(`[img] intent=image_edit instruction="${text.slice(0, 60)}"`, "info");
+          const IMAGE_LIMIT = 2;
+          const quotaRow = db.prepare("SELECT count FROM user_image_counts WHERE userId = ?").get(senderId);
+          const usedCount = quotaRow?.count ?? 0;
+          if (usedCount >= IMAGE_LIMIT) {
+            const ownerInfo = (config.adminUsers || "").split(",").map(s => s.trim()).filter(Boolean)[0];
+            const ownerHint = ownerInfo ? ` Contact **${ownerInfo}** to get more.` : " Contact the bot owner to get more.";
+            await status.finish(`🖼 You've used your **${IMAGE_LIMIT} free image generations**.\n\nYou've reached your limit.${ownerHint}`);
+            addLog(`[img] Quota exceeded for ${senderId} (${usedCount}/${IMAGE_LIMIT})`, "warn");
+            return;
+          }
+          try {
+            await status.update(HS.image());
+            if (!ziEditImage) throw new Error("Image edit service not loaded — check server logs");
+            const rawImageBuffer = await client2.downloadMedia(visionSourceMessage.media, {});
+            if (!rawImageBuffer || !Buffer.isBuffer(rawImageBuffer) || rawImageBuffer.length === 0) {
+              throw new Error("Could not download the image from Telegram");
+            }
+            addLog(`[img] downloaded source image (${rawImageBuffer.length} bytes)`, "info");
+            await status.update(HS.imageRender());
+            const { buffer, provider } = await ziEditImage(rawImageBuffer, text);
+            await status.update(HS.upload());
+            const caption = `✏️ **Edited Image**\n\`${text.slice(0, 120)}\`\n\n_${usedCount + 1}/${IMAGE_LIMIT} free generations used_`;
+            const tmpImgPath = path.join(tempDir, `img_edit_${Date.now()}.jpg`);
+            await fs.writeFile(tmpImgPath, buffer);
+            try {
+              try { await client2.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch {}
+              await client2.sendFile(targetPeer, {
+                file: tmpImgPath,
+                caption,
+                parseMode: "markdown",
+                replyTo: message.id,
+                forceDocument: false
+              });
+              db.prepare(
+                "INSERT INTO user_image_counts (userId, count, resetAt) VALUES (?, 1, ?) ON CONFLICT(userId) DO UPDATE SET count = count + 1"
+              ).run(senderId, Date.now());
+              addLog(`[img] edit_success=true provider=${provider} (${usedCount + 1}/${IMAGE_LIMIT})`, "success");
+            } finally {
+              fs.remove(tmpImgPath).catch(() => {});
+            }
+          } catch (editErr) {
+            console.error("[img] Image edit failed:", editErr.message);
+            await status.finish(`❌ **Image edit failed:** ${editErr.message.slice(0, 120)}`);
+          }
+          return;
         }
 
         if (visionToGenerateIntent) {
