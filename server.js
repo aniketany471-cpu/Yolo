@@ -4046,7 +4046,15 @@ async function startServer() {
             }
             addLog(`[img] downloaded source image (${rawImageBuffer.length} bytes)`, "info");
             await status.update(HS.imageRender());
-            const { buffer, provider } = await ziEditImage(rawImageBuffer, text);
+            // Wrap the user's instruction in a preservation-first prompt so the
+            // model makes only the requested change and keeps everything else intact.
+            const editInstruction = text.trim();
+            const editPrompt = `Make ONLY this specific change to the image: ${editInstruction}. ` +
+              `Preserve absolutely everything else exactly as-is — the same layout, ` +
+              `all existing text, fonts, colors, UI elements, profile photos, icons, ` +
+              `background, and overall visual style. Do not remove or alter anything ` +
+              `that was not explicitly mentioned in the instruction.`;
+            const { buffer, provider } = await ziEditImage(rawImageBuffer, editPrompt);
             await status.update(HS.upload());
             const caption = `✏️ **Edited Image**\n\`${text.slice(0, 120)}\`\n\n_${usedCount + 1}/${IMAGE_LIMIT} free generations used_`;
             const tmpImgPath = path.join(tempDir, `img_edit_${Date.now()}.jpg`);
