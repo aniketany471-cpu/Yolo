@@ -70,19 +70,25 @@ export async function buildLinkContext(messageText, maxLinks = 2) {
         `[LINK ${i + 1}: ${urls[i]}]\n${r.value}\n[END LINK ${i + 1}]`
       );
     } else {
-      const reason = r.status === "rejected" ? r.reason?.message : "empty response";
+      const reason = r.status === "rejected" ? r.reason?.message : "empty or too-short response";
       console.warn(`[link-reader] Failed to read ${urls[i]}: ${reason}`);
+      // Always include a note so the AI can relay it to the user
+      blocks.push(
+        `[LINK ${i + 1}: ${urls[i]}]\n` +
+        `STATUS: Could not fetch this link. ` +
+        `It is either a private/locked account, login-required page, or the site blocked access.\n` +
+        `[END LINK ${i + 1}]`
+      );
     }
   }
 
-  if (blocks.length === 0) return "";
-
   return (
-    `[FETCHED LINK CONTENT — treat as authoritative source for this conversation]\n` +
+    `[LINK FETCH RESULTS]\n` +
     blocks.join("\n\n") +
-    `\n[END FETCHED LINKS]\n\n` +
-    `Use the above link content to answer the user's question. ` +
-    `Summarise, quote, or analyse as requested. ` +
-    `If the user asks about the link without a specific question, give a helpful overview.`
+    `\n[END LINK FETCH RESULTS]\n\n` +
+    `INSTRUCTIONS: For each link above — if content was fetched, use it to answer the user. ` +
+    `If a link shows STATUS: Could not fetch, tell the user clearly: ` +
+    `"I couldn't read that link — it looks like a private account or the page requires login." ` +
+    `Do not guess or make up content for unfetchable links.`
   );
 }
