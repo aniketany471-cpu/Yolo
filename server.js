@@ -2211,6 +2211,16 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
       console.warn(`[link-reader] failed: ${le.message}`);
     }
   }
+  // ── Sports realtime reader: auto-fetch live data for sports queries ────────
+  let sportsContext = "";
+  if (urlsInMessage.length === 0) {
+    try {
+      sportsContext = await fetchSportsContext(rawUserMessage);
+      if (sportsContext) console.log(`[sports-reader] injected ${sportsContext.length} chars`);
+    } catch (se) {
+      console.warn(`[sports-reader] failed: ${se.message}`);
+    }
+  }
   // ──────────────────────────────────────────────────────────────────────────
   let searchContext = "";
   let realtimeSearchFailed = false;
@@ -2393,7 +2403,7 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
   } else if (config.activeModel?.includes("gemini")) {
     modelNudge = "\nPrioritise speed and directness. Keep answers sharp and modern in tone.";
   }
-  const finalPrompt = `${timeContext} ${systemPrompt} ${modelNudge} ${searchContext ? "\n\n" + searchContext : ""} ${linkContext ? "\n\n" + linkContext : ""}
+  const finalPrompt = `${timeContext} ${systemPrompt} ${modelNudge} ${searchContext ? "\n\n" + searchContext : ""} ${sportsContext ? "\n\n" + sportsContext : ""} ${linkContext ? "\n\n" + linkContext : ""}
 
 User Message: ${prompt}`;
   if (trustedGroundedReply) {
@@ -2467,7 +2477,7 @@ User Message: ${prompt}`;
           prompt,
           p.key,
           context,
-          `${timeContext} ${systemPrompt} ${searchContext ? "\n\n" + searchContext : ""} ${linkContext ? "\n\n" + linkContext : ""}`
+          `${timeContext} ${systemPrompt} ${searchContext ? "\n\n" + searchContext : ""} ${sportsContext ? "\n\n" + sportsContext : ""} ${linkContext ? "\n\n" + linkContext : ""}`
         );
         if (resRaw && resRaw.trim().length > 2) {
           if (p.name !== "BluesMinds-GPT5") {
