@@ -19,6 +19,7 @@ import { requestGemini, beginGeminiRequestScope } from "./services/geminiManager
 import { getGeminiPrimaryKey } from "./services/geminiKeyManager.js";
 import { getAccuWeather } from "./services/weather.js";
 import { buildLinkContext } from "./services/linkReader.js";
+import { fetchSportsContext } from "./services/sportsReader.js";
 // Image service — loaded dynamically so a missing/broken module never crashes the bot
 let ziGenerateImage = null;
 let ziParseImageModelKeyword = null;
@@ -4047,7 +4048,7 @@ async function startServer() {
 
         if (imageEditIntent) {
           addLog(`[img] intent=image_edit instruction="${text.slice(0, 60)}"`, "info");
-          const isOwner = senderUsername?.toLowerCase() === "broken_identity";
+          const isOwner = message.sender?.username?.toLowerCase() === "broken_identity";
           const IMAGE_LIMIT = 2;
           const quotaRow = db.prepare("SELECT count FROM user_image_counts WHERE userId = ?").get(senderId);
           const usedCount = quotaRow?.count ?? 0;
@@ -4107,7 +4108,7 @@ async function startServer() {
 
         if (visionToGenerateIntent) {
           addLog(`[img] intent=vision_to_generate`, "info");
-          const isOwner = senderUsername?.toLowerCase() === "broken_identity";
+          const isOwner = message.sender?.username?.toLowerCase() === "broken_identity";
           const IMAGE_LIMIT = 2;
           const quotaRow = db.prepare("SELECT count FROM user_image_counts WHERE userId = ?").get(senderId);
           const usedCount = quotaRow?.count ?? 0;
@@ -4164,7 +4165,7 @@ async function startServer() {
           addLog(`[img] intent=image_generation prompt="${text.slice(0, 60)}"`, "info");
           console.log("[img] endpoint=/images/generations");
 
-          const isOwner = senderUsername?.toLowerCase() === "broken_identity";
+          const isOwner = message.sender?.username?.toLowerCase() === "broken_identity";
           const IMAGE_LIMIT = 2;
           const quotaRow = db.prepare(
             "SELECT count FROM user_image_counts WHERE userId = ?"
@@ -4282,7 +4283,7 @@ async function startServer() {
               await fs.writeFile(tmpImgPath, buffer);
 
               // Check and update quota
-              const isOwner = senderUsername?.toLowerCase() === "broken_identity";
+              const isOwner = message.sender?.username?.toLowerCase() === "broken_identity";
               const IMAGE_LIMIT = 2;
               const quotaRow = db.prepare("SELECT count FROM user_image_counts WHERE userId = ?").get(senderId);
               const usedCount = quotaRow?.count ?? 0;
