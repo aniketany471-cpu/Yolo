@@ -18,6 +18,7 @@ import { analyzeTelegramImageWithGemini, buildVisionPrompt } from "./services/vi
 import { requestGemini, beginGeminiRequestScope } from "./services/geminiManager.js";
 import { getGeminiPrimaryKey } from "./services/geminiKeyManager.js";
 import { getAccuWeather } from "./services/weather.js";
+import { buildLinkContext } from "./services/linkReader.js";
 // Image service — loaded dynamically so a missing/broken module never crashes the bot
 let ziGenerateImage = null;
 let ziParseImageModelKeyword = null;
@@ -2196,6 +2197,20 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
   } else if (personality) {
     systemPrompt = `[Base Identity: ${personality}] ${systemPrompt}`;
   }
+  // ── Link reader: fetch any URLs in the message before AI sees it ──────────
+  let linkContext = "";
+  const urlsInMessage = rawUserMessage.match(/https?:\/\/[^\s)>\]"']+/gi) || [];
+  if (urlsInMessage.length > 0) {
+    try {
+      console.log(`[link-reader] detected ${urlsInMessage.length} URL(s), fetching...`);
+      linkContext = await buildLinkContext(rawUserMessage, 2);
+      if (linkContext) console.log(`[link-reader] injected ${linkContext.length} chars of link content`);
+      else console.log("[link-reader] fetch returned empty (private/blocked page)");
+    } catch (le) {
+      console.warn(`[link-reader] failed: ${le.message}`);
+    }
+  }
+  // ──────────────────────────────────────────────────────────────────────────
   let searchContext = "";
   let realtimeSearchFailed = false;
   let trustedGroundedReply = "";
@@ -2377,7 +2392,7 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
   } else if (config.activeModel?.includes("gemini")) {
     modelNudge = "\nPrioritise speed and directness. Keep answers sharp and modern in tone.";
   }
-  const finalPrompt = `${timeContext} ${systemPrompt} ${modelNudge} ${searchContext ? "\n\n" + searchContext : ""} 
+  const finalPrompt = `${timeContext} ${systemPrompt} ${modelNudge} ${searchContext ? "\n\n" + searchContext : ""} ${linkContext ? "\n\n" + linkContext : ""}
 
 User Message: ${prompt}`;
   if (trustedGroundedReply) {
@@ -2451,7 +2466,7 @@ User Message: ${prompt}`;
           prompt,
           p.key,
           context,
-          `${timeContext} ${systemPrompt} ${searchContext ? "\n\n" + searchContext : ""}`
+          `${timeContext} ${systemPrompt} ${searchContext ? "\n\n" + searchContext : ""} ${linkContext ? "\n\n" + linkContext : ""}`
         );
         if (resRaw && resRaw.trim().length > 2) {
           if (p.name !== "BluesMinds-GPT5") {
