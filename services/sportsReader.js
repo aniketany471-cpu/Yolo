@@ -10,7 +10,67 @@
 
 import { readLink } from "./linkReader.js";
 
-const MAX_CONTENT_CHARS = 3500;
+const MAX_CONTENT_CHARS = 5000;
+
+/**
+ * Smart content extractor — skips massive nav/menu sections and jumps straight
+ * to where the actual sports data lives (scores, driver names, results tables).
+ *
+ * Pages like motorsport.com have 15-20k chars of nav before real results.
+ * This finds the earliest meaningful content signal and returns:
+ *   Title block + results section (up to MAX_CONTENT_CHARS total).
+ */
+function extractSportsContent(fullText) {
+  if (!fullText || fullText.length === 0) return "";
+
+  // Always keep the title block (first ~250 chars has the page title + sport)
+  const titleEnd = Math.min(250, fullText.length);
+  const titleBlock = fullText.slice(0, titleEnd);
+
+  // Known signals that the actual results/data section has started
+  const DATA_SIGNALS = [
+    // Driver/player names that commonly appear in results
+    /\b(Verstappen|Hamilton|Norris|Leclerc|Sainz|Alonso|Russell|Perez|Piastri|Albon)\b/,
+    /\b(Djokovic|Alcaraz|Sinner|Medvedev|Federer|Nadal|Swiatek)\b/,
+    /\b(Messi|Ronaldo|Mbappé|Haaland|Salah|Neymar)\b/,
+    /\b(LeBron|Curry|Durant|Jokic|Antetokounmpo)\b/,
+    // Results table markers
+    /\|\s*\d+\s*\|/,                    // markdown table row like "| 1 |"
+    /(?:^|\n)\s*\d+\.\s+\w/m,           // "1. Driver Name"
+    /Race\s+Result|Race\s+Winner|Grand\s+Prix\s+Result/i,
+    /Final\s+Score|Full\s+Time|FT\s*:/i,
+    /\bP1\b.{0,30}\bP2\b/,              // podium positions
+    /Winner:|1st\s+Place:|Champion:/i,
+    /\bScore(?:line|card|board)?\s*:/i,
+    /\bResult\s*:\s*\w/i,
+    /\|\s*(?:W|D|L|Pts|GD|GF|GA)\s*\|/i, // football table columns
+    // Match/event info
+    /\bvs\b.{3,40}\b(?:\d{1,3}[-–]\d{1,3}|\d{1,3}:\d{1,3})\b/i,
+    /Upcoming\s+(?:Race|Match|Event|Game)/i,
+    /Next\s+(?:Race|Match|Event|Game)\s*:/i,
+  ];
+
+  let dataStart = -1;
+  for (const signal of DATA_SIGNALS) {
+    const match = fullText.search(signal);
+    if (match !== -1 && match > titleEnd) {
+      if (dataStart === -1 || match < dataStart) dataStart = match;
+    }
+  }
+
+  if (dataStart === -1) {
+    // No signal found — just return first MAX_CONTENT_CHARS
+    return fullText.slice(0, MAX_CONTENT_CHARS);
+  }
+
+  // Return title + gap marker + data window
+  const dataWindow = fullText.slice(
+    Math.max(titleEnd, dataStart - 200), // a little context before the signal
+    dataStart + (MAX_CONTENT_CHARS - titleEnd)
+  );
+
+  return titleBlock + "\n\n...[content extracted from results section]...\n\n" + dataWindow;
+}
 
 // ── Verified working sport source map ─────────────────────────────────────────
 // Each entry: { key, keywords, sites }
@@ -273,8 +333,9 @@ export async function fetchSportsContext(messageText) {
   const blocks = [];
   for (const r of results) {
     if (r.status === "fulfilled" && r.value.content && r.value.content.length > 150) {
+      const extracted = extractSportsContent(r.value.content);
       blocks.push(
-        `[SOURCE: ${r.value.url}]\n${r.value.content.slice(0, MAX_CONTENT_CHARS)}\n[END SOURCE]`
+        `[SOURCE: ${r.value.url}]\n${extracted}\n[END SOURCE]`
       );
     } else {
       const reason = r.status === "rejected" ? r.reason?.message : "empty or blocked";
