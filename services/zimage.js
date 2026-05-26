@@ -325,11 +325,39 @@ export async function editImage(imageBuffer, prompt) {
       throw new Error(`GPT-5.3 vision returned no edit prompt (raw: ${JSON.stringify(visionData).slice(0, 200)})`);
     }
 
-    console.log(`[img] gpt-5.3 edit prompt ready (${editPromptFromVision.length} chars), generating with grok...`);
+    const finalPrompt = sanitizePrompt(editPromptFromVision);
+    console.log(`[img] gpt-5.3 edit prompt ready (${finalPrompt.length} chars), generating...`);
 
-    const buffer = await grokImagineImage(sanitizePrompt(editPromptFromVision));
-    console.log("[img] vision+grok edit succeeded");
-    return { buffer, provider: "grok-vision-edit" };
+    // ── Generation chain: grok (3 attempts) → zimage-turbo last resort ────
+    const genErrors = [];
+
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        console.log(`[img] grok edit generation attempt ${attempt}/3...`);
+        const buffer = await grokImagineImage(finalPrompt);
+        console.log(`[img] vision+grok edit succeeded (attempt ${attempt})`);
+        return { buffer, provider: "grok-vision-edit" };
+      } catch (ge) {
+        console.warn(`[img] grok edit attempt ${attempt}/3 failed: ${ge.message}`);
+        genErrors.push(`grok[${attempt}]: ${ge.message}`);
+        if (attempt < 3) await sleep(3000);
+      }
+    }
+
+    // Grok exhausted — fall through to zimage-turbo with the GPT-5.3 prompt
+    if (process.env.ZIMAGE_API_KEY) {
+      try {
+        console.log("[img] grok exhausted — trying zimage-turbo with gpt-5.3 edit prompt...");
+        const buffer = await zimageTurbo(finalPrompt);
+        console.log("[img] vision+zimage edit succeeded");
+        return { buffer, provider: "zimage-vision-edit" };
+      } catch (ze) {
+        console.warn(`[img] zimage edit failed: ${ze.message}`);
+        genErrors.push(`zimage: ${ze.message}`);
+      }
+    }
+
+    throw new Error(`All generation providers failed: ${genErrors.join(" | ")}`);
   } catch (e) {
     console.warn(`[img] vision+grok edit fallback failed: ${e.message}`);
     errors.push(`grok-vision-edit: ${e.message}`);
