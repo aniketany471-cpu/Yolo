@@ -290,14 +290,14 @@ export async function editImage(imageBuffer, prompt) {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
         body: JSON.stringify({
-          model: "gpt-4o-mini",
-          max_tokens: 500,
+          model: "gpt-5.3-chat-latest",
+          max_tokens: 800,
           messages: [{
             role: "user",
             content: [
               {
                 type: "text",
-                text: "Describe this image with maximum detail for an image generation prompt. Cover: all subjects (people, objects, animals), their appearance (clothing, hair, expression, pose), exact colors, lighting, shadows, background elements, art style, composition, mood, and any text visible. Be exhaustive and specific. Output only the description with no introduction or commentary."
+                text: "Describe this image with maximum detail for an image generation prompt. Cover: all subjects (people, objects, animals), their appearance (clothing, hair, expression, pose, skin tone, age), exact colors and shades, lighting direction and quality, shadows, background elements and depth, art style, composition, camera angle, mood and atmosphere, and any text or logos visible. Be exhaustive and hyper-specific. Output only the description — no introduction, no commentary, no labels."
               },
               {
                 type: "image_url",
