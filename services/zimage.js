@@ -214,53 +214,125 @@ export function parseImageModelKeyword(text) {
 }
 
 /**
- * Edit an existing image using a text instruction (OpenAI image edits API).
- * Converts the input to a square PNG before sending — required by the API.
+ * Edit an existing image using a text instruction.
+ *
+ * Attempt 1 — gpt-image-1 native edit (/images/edits):
+ *   The real inpainting API. Works when BluesMinds has gpt-image-1 available.
+ *
+ * Attempt 2 — Vision-describe → Grok-regenerate (fallback):
+ *   When the edit endpoint is down/broken, we:
+ *     a) send the original image to a vision model (gpt-4o-mini) and get a
+ *        rich textual description of every visual detail
+ *     b) append the user's edit instruction to that description
+ *     c) feed the combined prompt to grok-imagine-image-lite to generate a
+ *        new image that matches the description with the requested change
+ *   Not true inpainting, but produces a visually consistent result.
+ *
  * Returns { buffer: Buffer, provider: string }
  */
 export async function editImage(imageBuffer, prompt) {
   const apiKey = process.env.BLUEMINDS_API_KEY;
   if (!apiKey) throw new Error("BLUEMINDS_API_KEY not set");
   const baseUrl = (process.env.BLUEMINDS_BASE_URL || "https://api.bluesminds.com").replace(/\/+$/, "");
-  const url = `${baseUrl}/v1/images/edits`;
+  const errors = [];
 
-  // Image edit API requires a square PNG, max 4 MB
-  const sharpMod = await import("sharp");
-  const sharp = sharpMod.default || sharpMod;
-  const meta = await sharp(imageBuffer).metadata();
-  // Use contain (letterbox with white padding) so no content is cropped.
-  // The API needs a square image, but cover/crop would lose profile photos etc.
-  const dim = Math.min(Math.max(meta.width || 1024, meta.height || 1024), 1024);
-  const pngBuffer = await sharp(imageBuffer)
-    .resize(dim, dim, { fit: "contain", background: { r: 255, g: 255, b: 255, alpha: 1 } })
-    .png()
-    .toBuffer();
+  // ── Attempt 1: gpt-image-1 native edit (/images/edits) ───────────────────
+  try {
+    const url = `${baseUrl}/v1/images/edits`;
 
-  const form = new FormData();
-  form.append("model", OPENAI_MODEL);
-  form.append("prompt", sanitizePrompt(prompt));
-  form.append("n", "1");
-  form.append("image", new File([pngBuffer], "image.png", { type: "image/png" }));
+    // API requires a square PNG, max 4 MB
+    const sharpMod = await import("sharp");
+    const sharp = sharpMod.default || sharpMod;
+    const meta = await sharp(imageBuffer).metadata();
+    const dim = Math.min(Math.max(meta.width || 1024, meta.height || 1024), 1024);
+    const pngBuffer = await sharp(imageBuffer)
+      .resize(dim, dim, { fit: "contain", background: { r: 255, g: 255, b: 255, alpha: 1 } })
+      .png()
+      .toBuffer();
 
-  const res = await fetchWithTimeout(url, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${apiKey}` },
-    body: form
-  }, PROVIDER_TIMEOUT_MS);
+    const form = new FormData();
+    form.append("model", OPENAI_MODEL);
+    form.append("prompt", sanitizePrompt(prompt));
+    form.append("n", "1");
+    form.append("image", new File([pngBuffer], "image.png", { type: "image/png" }));
 
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const msg = data?.error?.message || `HTTP ${res.status}`;
-    throw new Error(`Image edit error: ${msg}`);
+    const res = await fetchWithTimeout(url, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}` },
+      body: form
+    }, PROVIDER_TIMEOUT_MS);
+
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
+
+    const b64 = data?.data?.[0]?.b64_json;
+    if (b64) return { buffer: Buffer.from(b64, "base64"), provider: "gpt-image-1-edit" };
+
+    const imageUrl = data?.data?.[0]?.url;
+    if (imageUrl) return { buffer: await downloadImageBuffer(imageUrl), provider: "gpt-image-1-edit" };
+
+    throw new Error("No content in response");
+  } catch (e) {
+    console.warn(`[img] gpt-image-1 edit failed, falling back to vision+grok: ${e.message}`);
+    errors.push(`gpt-image-1-edit: ${e.message}`);
   }
 
-  const b64 = data?.data?.[0]?.b64_json;
-  if (b64) return { buffer: Buffer.from(b64, "base64"), provider: "gpt-image-1-edit" };
+  // ── Attempt 2: Vision-describe → Grok-regenerate ─────────────────────────
+  try {
+    console.log("[img] edit_fallback=vision+grok — describing image with gpt-4o-mini vision...");
 
-  const imageUrl = data?.data?.[0]?.url;
-  if (imageUrl) return { buffer: await downloadImageBuffer(imageUrl), provider: "gpt-image-1-edit" };
+    // Convert image to base64 for the vision model
+    const imgB64 = imageBuffer.toString("base64");
 
-  throw new Error("Image edit returned no content");
+    const visionRes = await fetchWithTimeout(
+      `${baseUrl}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({
+          model: "gpt-4o-mini",
+          max_tokens: 500,
+          messages: [{
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text: "Describe this image with maximum detail for an image generation prompt. Cover: all subjects (people, objects, animals), their appearance (clothing, hair, expression, pose), exact colors, lighting, shadows, background elements, art style, composition, mood, and any text visible. Be exhaustive and specific. Output only the description with no introduction or commentary."
+              },
+              {
+                type: "image_url",
+                image_url: { url: `data:image/png;base64,${imgB64}` }
+              }
+            ]
+          }]
+        })
+      },
+      35_000
+    );
+
+    const visionData = await visionRes.json().catch(() => ({}));
+    const description = visionData?.choices?.[0]?.message?.content?.trim();
+    if (!description) throw new Error(`Vision model returned no description (model: ${visionData?.model || "unknown"})`);
+
+    console.log(`[img] vision description obtained (${description.length} chars), generating with grok...`);
+
+    // Combine description with the edit instruction
+    const editGenPrompt = sanitizePrompt(
+      `${description}\n\nNow apply this specific change: ${prompt}. ` +
+      `Keep all other visual details exactly the same — same subjects, same colors, same background, same style, same composition. Only change what was explicitly requested.`
+    );
+
+    const buffer = await grokImagineImage(editGenPrompt);
+    console.log("[img] vision+grok edit succeeded");
+    return { buffer, provider: "grok-vision-edit" };
+  } catch (e) {
+    console.warn(`[img] vision+grok edit fallback failed: ${e.message}`);
+    errors.push(`grok-vision-edit: ${e.message}`);
+  }
+
+  throw new Error(
+    `Image editing failed — all providers exhausted:\n${errors.map((e, i) => `  ${i + 1}. ${e}`).join("\n")}`
+  );
 }
 
 /**
