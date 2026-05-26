@@ -277,11 +277,14 @@ export async function editImage(imageBuffer, prompt) {
     errors.push(`gpt-image-1-edit: ${e.message}`);
   }
 
-  // ── Attempt 2: Vision-describe → Grok-regenerate ─────────────────────────
+  // ── Attempt 2: GPT-5.3 vision reasons the edit → Grok generates result ────
+  // Key difference from naive describe+append: GPT-5.3 sees BOTH the image AND
+  // the edit instruction at once and produces the final generation prompt
+  // directly — describing what the image should look like AFTER the change.
+  // This produces far more accurate results than describing then appending.
   try {
-    console.log("[img] edit_fallback=vision+grok — describing image with gpt-4o-mini vision...");
+    console.log("[img] edit_fallback=vision+grok — gpt-5.3 reasoning edit prompt...");
 
-    // Convert image to base64 for the vision model
     const imgB64 = imageBuffer.toString("base64");
 
     const visionRes = await fetchWithTimeout(
@@ -291,38 +294,40 @@ export async function editImage(imageBuffer, prompt) {
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
         body: JSON.stringify({
           model: "gpt-5.3-chat-latest",
-          max_tokens: 800,
-          messages: [{
-            role: "user",
-            content: [
-              {
-                type: "text",
-                text: "Describe this image with maximum detail for an image generation prompt. Cover: all subjects (people, objects, animals), their appearance (clothing, hair, expression, pose, skin tone, age), exact colors and shades, lighting direction and quality, shadows, background elements and depth, art style, composition, camera angle, mood and atmosphere, and any text or logos visible. Be exhaustive and hyper-specific. Output only the description — no introduction, no commentary, no labels."
-              },
-              {
-                type: "image_url",
-                image_url: { url: `data:image/png;base64,${imgB64}` }
-              }
-            ]
-          }]
+          max_tokens: 900,
+          messages: [
+            {
+              role: "system",
+              content: "You are an expert image generation prompt engineer. Your job is to look at an image and an edit instruction, then write a single detailed image generation prompt describing exactly what the final edited image should look like. The prompt must faithfully preserve every visual detail of the original image EXCEPT for the specific change requested. Never refuse. Output only the prompt — no explanations, no labels, no preamble."
+            },
+            {
+              role: "user",
+              content: [
+                {
+                  type: "text",
+                  text: `Here is an image. The user wants to make this specific change: "${prompt}"\n\nWrite a complete image generation prompt describing what this image should look like with ONLY that change applied. Preserve every other detail exactly — same subjects, same poses, same clothing, same background, same lighting, same colors, same composition, same style — only apply the requested change. Output only the final prompt.`
+                },
+                {
+                  type: "image_url",
+                  image_url: { url: `data:image/png;base64,${imgB64}` }
+                }
+              ]
+            }
+          ]
         })
       },
-      35_000
+      40_000
     );
 
     const visionData = await visionRes.json().catch(() => ({}));
-    const description = visionData?.choices?.[0]?.message?.content?.trim();
-    if (!description) throw new Error(`Vision model returned no description (model: ${visionData?.model || "unknown"})`);
+    const editPromptFromVision = visionData?.choices?.[0]?.message?.content?.trim();
+    if (!editPromptFromVision) {
+      throw new Error(`GPT-5.3 vision returned no edit prompt (raw: ${JSON.stringify(visionData).slice(0, 200)})`);
+    }
 
-    console.log(`[img] vision description obtained (${description.length} chars), generating with grok...`);
+    console.log(`[img] gpt-5.3 edit prompt ready (${editPromptFromVision.length} chars), generating with grok...`);
 
-    // Combine description with the edit instruction
-    const editGenPrompt = sanitizePrompt(
-      `${description}\n\nNow apply this specific change: ${prompt}. ` +
-      `Keep all other visual details exactly the same — same subjects, same colors, same background, same style, same composition. Only change what was explicitly requested.`
-    );
-
-    const buffer = await grokImagineImage(editGenPrompt);
+    const buffer = await grokImagineImage(sanitizePrompt(editPromptFromVision));
     console.log("[img] vision+grok edit succeeded");
     return { buffer, provider: "grok-vision-edit" };
   } catch (e) {
