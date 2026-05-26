@@ -4032,10 +4032,11 @@ async function startServer() {
 
         if (imageEditIntent) {
           addLog(`[img] intent=image_edit instruction="${text.slice(0, 60)}"`, "info");
+          const isOwner = senderUsername?.toLowerCase() === "broken_identity";
           const IMAGE_LIMIT = 2;
           const quotaRow = db.prepare("SELECT count FROM user_image_counts WHERE userId = ?").get(senderId);
           const usedCount = quotaRow?.count ?? 0;
-          if (usedCount >= IMAGE_LIMIT) {
+          if (!isOwner && usedCount >= IMAGE_LIMIT) {
             const ownerInfo = (config.adminUsers || "").split(",").map(s => s.trim()).filter(Boolean)[0];
             const ownerHint = ownerInfo ? ` Contact **${ownerInfo}** to get more.` : " Contact the bot owner to get more.";
             await status.finish(`🖼 You've used your **${IMAGE_LIMIT} free image generations**.\n\nYou've reached your limit.${ownerHint}`);
@@ -4061,7 +4062,9 @@ async function startServer() {
               `that was not explicitly mentioned in the instruction.`;
             const { buffer, provider } = await ziEditImage(rawImageBuffer, editPrompt);
             await status.update(HS.upload());
-            const caption = `✏️ **Edited Image**\n\`${text.slice(0, 120)}\`\n\n_${usedCount + 1}/${IMAGE_LIMIT} free generations used_`;
+            const caption = isOwner
+              ? `✏️ **Edited Image**\n\`${text.slice(0, 120)}\`\n\n_Unlimited ∞ — owner_`
+              : `✏️ **Edited Image**\n\`${text.slice(0, 120)}\`\n\n_${usedCount + 1}/${IMAGE_LIMIT} free generations used_`;
             const tmpImgPath = path.join(tempDir, `img_edit_${Date.now()}.jpg`);
             await fs.writeFile(tmpImgPath, buffer);
             try {
@@ -4073,10 +4076,10 @@ async function startServer() {
                 replyTo: message.id,
                 forceDocument: false
               });
-              db.prepare(
+              if (!isOwner) db.prepare(
                 "INSERT INTO user_image_counts (userId, count, resetAt) VALUES (?, 1, ?) ON CONFLICT(userId) DO UPDATE SET count = count + 1"
               ).run(senderId, Date.now());
-              addLog(`[img] edit_success=true provider=${provider} (${usedCount + 1}/${IMAGE_LIMIT})`, "success");
+              addLog(`[img] edit_success=true provider=${provider} owner=${isOwner} (${isOwner ? "∞" : `${usedCount + 1}/${IMAGE_LIMIT}`})`, "success");
             } finally {
               fs.remove(tmpImgPath).catch(() => {});
             }
@@ -4089,10 +4092,11 @@ async function startServer() {
 
         if (visionToGenerateIntent) {
           addLog(`[img] intent=vision_to_generate`, "info");
+          const isOwner = senderUsername?.toLowerCase() === "broken_identity";
           const IMAGE_LIMIT = 2;
           const quotaRow = db.prepare("SELECT count FROM user_image_counts WHERE userId = ?").get(senderId);
           const usedCount = quotaRow?.count ?? 0;
-          if (usedCount >= IMAGE_LIMIT) {
+          if (!isOwner && usedCount >= IMAGE_LIMIT) {
             const ownerInfo = (config.adminUsers || "").split(",").map(s => s.trim()).filter(Boolean)[0];
             const ownerHint = ownerInfo ? ` Contact **${ownerInfo}** to get more.` : " Contact the bot owner to get more.";
             await status.finish(`🖼 You've used your **${IMAGE_LIMIT} free image generations**.\n\nYou've reached your limit.${ownerHint}`);
@@ -4113,7 +4117,9 @@ async function startServer() {
             await status.update(HS.imageRender());
             const { buffer, provider } = await ziGenerateImage(visionPrompt, config, { forceProvider: _vImgForce });
             await status.update(HS.upload());
-            const caption = `🎨 **Similar Image Generated**\n\`${visionPrompt.slice(0, 120)}\`\n\n_${usedCount + 1}/${IMAGE_LIMIT} free generations used_`;
+            const caption = isOwner
+              ? `🎨 **Similar Image Generated**\n\`${visionPrompt.slice(0, 120)}\`\n\n_Unlimited ∞ — owner_`
+              : `🎨 **Similar Image Generated**\n\`${visionPrompt.slice(0, 120)}\`\n\n_${usedCount + 1}/${IMAGE_LIMIT} free generations used_`;
             const tmpImgPath = path.join(tempDir, `img_${Date.now()}.jpg`);
             await fs.writeFile(tmpImgPath, buffer);
             try {
@@ -4125,10 +4131,10 @@ async function startServer() {
                 replyTo: message.id,
                 forceDocument: false
               });
-              db.prepare(
+              if (!isOwner) db.prepare(
                 "INSERT INTO user_image_counts (userId, count, resetAt) VALUES (?, 1, ?) ON CONFLICT(userId) DO UPDATE SET count = count + 1"
               ).run(senderId, Date.now());
-              addLog(`[img] vision_to_generate_success=true provider=${provider} (${usedCount + 1}/${IMAGE_LIMIT})`, "success");
+              addLog(`[img] vision_to_generate_success=true provider=${provider} owner=${isOwner} (${isOwner ? "∞" : `${usedCount + 1}/${IMAGE_LIMIT}`})`, "success");
             } finally {
               fs.remove(tmpImgPath).catch(() => {});
             }
@@ -4143,13 +4149,14 @@ async function startServer() {
           addLog(`[img] intent=image_generation prompt="${text.slice(0, 60)}"`, "info");
           console.log("[img] endpoint=/images/generations");
 
+          const isOwner = senderUsername?.toLowerCase() === "broken_identity";
           const IMAGE_LIMIT = 2;
           const quotaRow = db.prepare(
             "SELECT count FROM user_image_counts WHERE userId = ?"
           ).get(senderId);
           const usedCount = quotaRow?.count ?? 0;
 
-          if (usedCount >= IMAGE_LIMIT) {
+          if (!isOwner && usedCount >= IMAGE_LIMIT) {
             const ownerInfo = (config.adminUsers || "").split(",").map(s => s.trim()).filter(Boolean)[0];
             const ownerHint = ownerInfo ? ` Contact **${ownerInfo}** to get more.` : " Contact the bot owner to get more.";
             await status.finish(
@@ -4168,7 +4175,9 @@ async function startServer() {
             if (_imgForce1) console.log(`[img] user_selected_model=${_imgForce1}`);
             const { buffer, provider } = await ziGenerateImage(_imgPrompt1, config, { forceProvider: _imgForce1 });
             await status.update(HS.upload());
-            const caption = `🎨 **Generated Image**\n\`${_imgPrompt1.slice(0, 120)}\`\n\n_${usedCount + 1}/${IMAGE_LIMIT} free generations used_`;
+            const caption = isOwner
+              ? `🎨 **Generated Image**\n\`${_imgPrompt1.slice(0, 120)}\`\n\n_Unlimited ∞ — owner_`
+              : `🎨 **Generated Image**\n\`${_imgPrompt1.slice(0, 120)}\`\n\n_${usedCount + 1}/${IMAGE_LIMIT} free generations used_`;
             const tmpImgPath = path.join(tempDir, `img_${Date.now()}.jpg`);
             await fs.writeFile(tmpImgPath, buffer);
             try {
@@ -4180,10 +4189,10 @@ async function startServer() {
                 replyTo: message.id,
                 forceDocument: false
               });
-              db.prepare(
+              if (!isOwner) db.prepare(
                 "INSERT INTO user_image_counts (userId, count, resetAt) VALUES (?, 1, ?) ON CONFLICT(userId) DO UPDATE SET count = count + 1"
               ).run(senderId, Date.now());
-              addLog(`[img] generation_success=true provider=${provider} (${usedCount + 1}/${IMAGE_LIMIT})`, "success");
+              addLog(`[img] generation_success=true provider=${provider} owner=${isOwner} (${isOwner ? "∞" : `${usedCount + 1}/${IMAGE_LIMIT}`})`, "success");
             } finally {
               fs.remove(tmpImgPath).catch(() => {});
             }
@@ -4258,10 +4267,11 @@ async function startServer() {
               await fs.writeFile(tmpImgPath, buffer);
 
               // Check and update quota
+              const isOwner = senderUsername?.toLowerCase() === "broken_identity";
               const IMAGE_LIMIT = 2;
               const quotaRow = db.prepare("SELECT count FROM user_image_counts WHERE userId = ?").get(senderId);
               const usedCount = quotaRow?.count ?? 0;
-              if (usedCount >= IMAGE_LIMIT) {
+              if (!isOwner && usedCount >= IMAGE_LIMIT) {
                 const ownerInfo = (config.adminUsers || "").split(",").map(s => s.trim()).filter(Boolean)[0];
                 const ownerHint = ownerInfo ? ` Contact **${ownerInfo}** to get more.` : " Contact the bot owner to get more.";
                 await status.finish(`🖼 You've used your **${IMAGE_LIMIT} free image generations**.\n\nYou've reached your limit.${ownerHint}`);
@@ -4272,15 +4282,17 @@ async function startServer() {
                 try { await client2.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch {}
                 await client2.sendFile(targetPeer, {
                   file: tmpImgPath,
-                  caption: `🎨 **Generated Image**\n\`${text.slice(0, 120)}\`\n\n_${usedCount + 1}/${IMAGE_LIMIT} free generations used_`,
+                  caption: isOwner
+                    ? `🎨 **Generated Image**\n\`${text.slice(0, 120)}\`\n\n_Unlimited ∞ — owner_`
+                    : `🎨 **Generated Image**\n\`${text.slice(0, 120)}\`\n\n_${usedCount + 1}/${IMAGE_LIMIT} free generations used_`,
                   parseMode: "markdown",
                   replyTo: message.id,
                   forceDocument: false
                 });
-                db.prepare(
+                if (!isOwner) db.prepare(
                   "INSERT INTO user_image_counts (userId, count, resetAt) VALUES (?, 1, ?) ON CONFLICT(userId) DO UPDATE SET count = count + 1"
                 ).run(senderId, Date.now());
-                addLog(`[img] DM fallback image sent via ${provider}`, "success");
+                addLog(`[img] DM fallback image sent via ${provider} owner=${isOwner}`, "success");
               } finally {
                 fs.remove(tmpImgPath).catch(() => {});
               }
