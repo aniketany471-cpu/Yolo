@@ -3,9 +3,6 @@
  * message and fetches authoritative live-score / event pages via Jina Reader.
  *
  * All source URLs are verified working with Jina Reader as of May 2026.
- * Covers: Cricket, IPL, Football/Soccer, Basketball/NBA, NFL, Tennis, F1,
- * UFC/MMA, Boxing, MLB, NHL, Rugby, Golf, Badminton, Kabaddi, PKL, WWE,
- * Table Tennis, Volleyball, Cycling, Athletics, Olympics, Chess, Esports.
  */
 
 import { readLink } from "./linkReader.js";
@@ -13,68 +10,97 @@ import { readLink } from "./linkReader.js";
 const MAX_CONTENT_CHARS = 5000;
 
 /**
+ * Strips markdown image links and bare link wrappers so the AI gets plain text.
+ * motorsport.com embeds: [![alt](imgUrl)Driver Name Team](linkUrl)
+ * After cleaning: "Driver Name Team"
+ */
+function cleanMarkdown(text) {
+  return text
+    // Nested image+link: [![alt](imgUrl)visible text](linkUrl) → visible text
+    .replace(/\[!\[.*?\]\([^)]*\)([^\]]*)\]\([^)]*\)/g, (_, label) => label.trim())
+    // Plain images: ![alt](url) → ''
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, "")
+    // Plain links: [label](url) → label
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    // Tidy up extra blanks inside table cells
+    .replace(/\|\s{2,}/g, "| ")
+    .replace(/\s{2,}\|/g, " |")
+    // Drop lines that are just a bullet of a bare URL
+    .replace(/^\s*\*\s+https?:\/\/\S+\s*$/gm, "")
+    .trim();
+}
+
+/**
  * Smart content extractor — skips massive nav/menu sections and jumps straight
  * to where the actual sports data lives (scores, driver names, results tables).
  *
  * Pages like motorsport.com have 15-20k chars of nav before real results.
- * This finds the earliest meaningful content signal and returns:
- *   Title block + results section (up to MAX_CONTENT_CHARS total).
+ * Finds the earliest meaningful content signal and returns:
+ *   Title block + cleaned results section (up to MAX_CONTENT_CHARS total).
  */
 function extractSportsContent(fullText) {
   if (!fullText || fullText.length === 0) return "";
 
-  // Always keep the title block (first ~250 chars has the page title + sport)
-  const titleEnd = Math.min(250, fullText.length);
-  const titleBlock = fullText.slice(0, titleEnd);
+  // Clean markdown first so signals work on clean text
+  const cleaned = cleanMarkdown(fullText);
+
+  // Always keep the title block (first ~250 chars has the page title)
+  const titleEnd = Math.min(250, cleaned.length);
+  const titleBlock = cleaned.slice(0, titleEnd);
 
   // Known signals that the actual results/data section has started
   const DATA_SIGNALS = [
-    // Driver/player names that commonly appear in results
-    /\b(Verstappen|Hamilton|Norris|Leclerc|Sainz|Alonso|Russell|Perez|Piastri|Albon)\b/,
-    /\b(Djokovic|Alcaraz|Sinner|Medvedev|Federer|Nadal|Swiatek)\b/,
-    /\b(Messi|Ronaldo|Mbappé|Haaland|Salah|Neymar)\b/,
-    /\b(LeBron|Curry|Durant|Jokic|Antetokounmpo)\b/,
-    // Results table markers
-    /\|\s*\d+\s*\|/,                    // markdown table row like "| 1 |"
-    /(?:^|\n)\s*\d+\.\s+\w/m,           // "1. Driver Name"
+    // F1 / motorsport driver names
+    /\b(Verstappen|Hamilton|Norris|Leclerc|Sainz|Alonso|Russell|Perez|Piastri|Albon|Antonelli|Colapinto|Hadjar|Lawson|Gasly|Bearman|Hulkenberg|Bortoleto)\b/,
+    // Tennis
+    /\b(Djokovic|Alcaraz|Sinner|Medvedev|Federer|Nadal|Swiatek|Sabalenka|Gauff|Rybakina)\b/,
+    // Football
+    /\b(Messi|Ronaldo|Mbapp[eé]|Haaland|Salah|Neymar|Kane|De\s*Bruyne)\b/,
+    // Basketball
+    /\b(LeBron|Curry|Durant|Jokic|Antetokounmpo|Doncic|Embiid|Tatum)\b/,
+    // Cricket
+    /\b(Kohli|Rohit|Bumrah|Dhoni|Warner|Smith|Root|Stokes|Babar|Rashid)\b/,
+    // Results table markers (markdown tables)
+    /\|\s*\d+\s*\|\s*\w/,               // "| 1 | DriverName"
+    /(?:^|\n)\s*\d+\.\s+[A-Z]\w/m,      // "1. Driver Name"
+    // Score/result keywords
     /Race\s+Result|Race\s+Winner|Grand\s+Prix\s+Result/i,
-    /Final\s+Score|Full\s+Time|FT\s*:/i,
-    /\bP1\b.{0,30}\bP2\b/,              // podium positions
-    /Winner:|1st\s+Place:|Champion:/i,
-    /\bScore(?:line|card|board)?\s*:/i,
-    /\bResult\s*:\s*\w/i,
-    /\|\s*(?:W|D|L|Pts|GD|GF|GA)\s*\|/i, // football table columns
-    // Match/event info
-    /\bvs\b.{3,40}\b(?:\d{1,3}[-–]\d{1,3}|\d{1,3}:\d{1,3})\b/i,
-    /Upcoming\s+(?:Race|Match|Event|Game)/i,
+    /Final\s+Score|Full\s+Time|FT\s*\d/i,
+    /Winner\s*:|1st\s+Place:|Champion\s*:/i,
+    /\bScoreboard\b|\bLeaderboard\b|\bStandings\b/i,
+    /\|\s*(?:W|D|L|Pts|GD|GF|GA)\s*\|/i,  // football league table columns
+    // Match scores inline: "Team A 2-1 Team B"
+    /\bvs\.?\s+\w.{3,30}\b\d{1,3}[-–:]\d{1,3}\b/i,
+    // Upcoming fixtures
+    /Upcoming\s+(?:Race|Match|Event|Game|Fixture)/i,
     /Next\s+(?:Race|Match|Event|Game)\s*:/i,
   ];
 
   let dataStart = -1;
   for (const signal of DATA_SIGNALS) {
-    const match = fullText.search(signal);
+    const match = cleaned.search(signal);
     if (match !== -1 && match > titleEnd) {
       if (dataStart === -1 || match < dataStart) dataStart = match;
     }
   }
 
   if (dataStart === -1) {
-    // No signal found — just return first MAX_CONTENT_CHARS
-    return fullText.slice(0, MAX_CONTENT_CHARS);
+    // No signal found — just return first MAX_CONTENT_CHARS of cleaned text
+    return cleaned.slice(0, MAX_CONTENT_CHARS);
   }
 
-  // Return title + gap marker + data window
-  const dataWindow = fullText.slice(
-    Math.max(titleEnd, dataStart - 200), // a little context before the signal
-    dataStart + (MAX_CONTENT_CHARS - titleEnd)
-  );
+  // Return title + gap marker + data window (with some context before the match)
+  const windowStart = Math.max(titleEnd, dataStart - 300);
+  const dataWindow = cleaned.slice(windowStart, windowStart + (MAX_CONTENT_CHARS - titleEnd));
 
-  return titleBlock + "\n\n...[content extracted from results section]...\n\n" + dataWindow;
+  return (
+    titleBlock +
+    "\n\n...[skipped navigation, results section follows]...\n\n" +
+    dataWindow
+  );
 }
 
 // ── Verified working sport source map ─────────────────────────────────────────
-// Each entry: { key, keywords, sites }
-// sites: ordered list — first 2 fetched in parallel via Jina Reader
 const SPORT_SOURCES = [
   {
     key: "ipl",
@@ -158,7 +184,7 @@ const SPORT_SOURCES = [
   },
   {
     key: "ufc",
-    keywords: /\bufc\b|\bmma\b|\bmixed\s*martial\b|\boctagon\b|\bsubmission.*fight|\bknockout.*fight/i,
+    keywords: /\bufc\b|\bmma\b|\bmixed\s*martial\b|\boctagon\b/i,
     sites: [
       "https://www.ufc.com/events",
       "https://www.bbc.com/sport/mixed-martial-arts",
@@ -262,7 +288,7 @@ const SPORT_SOURCES = [
   },
   {
     key: "esports",
-    keywords: /\besports\b|\be-sports\b|\bvalorant.*tournament|\bcsgo.*tournament|\blol.*worlds|\bdota.*major|\bpubg.*championship/i,
+    keywords: /\besports\b|\be-sports\b|\bvalorant.*tournament|\bcsgo.*tournament|\blol.*worlds|\bdota.*major/i,
     sites: [
       "https://www.bbc.com/sport",
       "https://www.espn.com/esports/",
@@ -286,20 +312,18 @@ const SPORT_SOURCES = [
   },
 ];
 
-// Fallback when sport is unrecognised but message is sports-themed
 const GENERAL_SPORTS_SITES = [
   "https://www.bbc.com/sport",
   "https://www.skysports.com/results",
 ];
 
 // ── Realtime intent detection ─────────────────────────────────────────────────
-const REALTIME_SPORTS_RE = /\blive\b|\bscore[s]?\b|\bresult[s]?\b|\bupcom[i]?ng\b|\btoday\b|\btonight\b|\bright\s*now\b|\bcurrent\b|\blatest\b|\bwho\s*won\b|\bwho\s*is\s*winning\b|\bwhat.*score\b|\bhappened\b|\bwhen\s*is\b|\bwhen\s*does\b|\bfixture[s]?\b|\bschedule\b|\bkickoff\b|\bstart.*time\b|\bline[\s-]?up\b|\bstanding[s]?\b|\bpoints\s*table\b|\bleaderboard\b|\bnext\s*match\b|\blast\s*match\b|\byesterday\b|\blast\s*night\b|\blast\s*race\b|\blast\s*game\b|\blast\s*round\b|\bwinner\b|\bchampion\b/i;
+const REALTIME_SPORTS_RE =
+  /\blive\b|\bscore[s]?\b|\bresult[s]?\b|\bupcom[i]?ng\b|\btoday\b|\btonight\b|\bright\s*now\b|\bcurrent\b|\blatest\b|\bwho\s*won\b|\bwho\s*is\s*winning\b|\bwhat.*score\b|\bhappened\b|\bwhen\s*is\b|\bwhen\s*does\b|\bfixture[s]?\b|\bschedule\b|\bkickoff\b|\bstart.*time\b|\bline[\s-]?up\b|\bstanding[s]?\b|\bpoints\s*table\b|\bleaderboard\b|\bnext\s*match\b|\blast\s*match\b|\byesterday\b|\blast\s*night\b|\blast\s*race\b|\blast\s*game\b|\blast\s*round\b|\bwinner\b|\bchampion\b/i;
 
-const SPORTS_KEYWORDS_RE = /\bcricket\b|\bipl\b|\bfootball\b|\bsoccer\b|\bbasketball\b|\bnba\b|\bnfl\b|\btennis\b|\bf1\b|\bformula\s*(1|one)\b|\bgrand\s*prix\b|\bufc\b|\bmma\b|\bboxing\b|\bmlb\b|\bnhl\b|\brugby\b|\bgolf\b|\bbadminton\b|\bkabaddi\b|\bpkl\b|\bwwe\b|\bwrestling\b|\bcycling\b|\bathletics\b|\bolympics\b|\bchess\b|\besports\b|\bvolleyball\b|\btable\s*tennis\b|\bsport[s]?\b|\bmotogp\b|\bpremier\s*league\b|\bepl\b|\buchampions\s*league\b|\bla\s*liga\b|\bbundesliga\b|\bwimbledon\b|\batp\b|\bwta\b|\bt20\b|\btest\s*match\b|\bodi\b|\bgp\b/i;
+const SPORTS_KEYWORDS_RE =
+  /\bcricket\b|\bipl\b|\bfootball\b|\bsoccer\b|\bbasketball\b|\bnba\b|\bnfl\b|\btennis\b|\bf1\b|\bformula\s*(1|one)\b|\bgrand\s*prix\b|\bufc\b|\bmma\b|\bboxing\b|\bmlb\b|\bnhl\b|\brugby\b|\bgolf\b|\bbadminton\b|\bkabaddi\b|\bpkl\b|\bwwe\b|\bwrestling\b|\bcycling\b|\bathletics\b|\bolympics\b|\bchess\b|\besports\b|\bvolleyball\b|\btable\s*tennis\b|\bsport[s]?\b|\bmotogp\b|\bpremier\s*league\b|\bepl\b|\bchampions\s*league\b|\bla\s*liga\b|\bbundesliga\b|\bwimbledon\b|\batp\b|\bwta\b|\bt20\b|\btest\s*match\b|\bodi\b|\bgp\b/i;
 
-/**
- * Returns true when the message has sports + realtime intent.
- */
 export function isSportsRealtimeQuery(text) {
   const t = String(text || "");
   return SPORTS_KEYWORDS_RE.test(t) && REALTIME_SPORTS_RE.test(t);
@@ -311,18 +335,23 @@ function detectSports(text) {
 
 /**
  * Fetch sports context for a message with realtime sports intent.
- * Detects sport → picks authoritative sites → fetches via Jina → returns block.
+ * Detects sport → picks authoritative sites → fetches via Jina →
+ * cleans markdown → smart-extracts results section → returns block.
  */
 export async function fetchSportsContext(messageText) {
   if (!isSportsRealtimeQuery(messageText)) return "";
 
   const matched = detectSports(messageText);
-  const sitesToFetch = matched.length > 0
-    ? matched.flatMap((s) => s.sites).slice(0, 2)
-    : GENERAL_SPORTS_SITES.slice(0, 2);
+  const sitesToFetch =
+    matched.length > 0
+      ? matched.flatMap((s) => s.sites).slice(0, 2)
+      : GENERAL_SPORTS_SITES.slice(0, 2);
 
-  const sport = matched.length > 0 ? matched.map((s) => s.key).join(", ") : "general";
-  console.log(`[sports-reader] sport=${sport} fetching ${sitesToFetch.length} source(s)`);
+  const sport =
+    matched.length > 0 ? matched.map((s) => s.key).join(", ") : "general";
+  console.log(
+    `[sports-reader] sport=${sport} fetching ${sitesToFetch.length} source(s)`
+  );
 
   const results = await Promise.allSettled(
     sitesToFetch.map((url) =>
@@ -332,13 +361,18 @@ export async function fetchSportsContext(messageText) {
 
   const blocks = [];
   for (const r of results) {
-    if (r.status === "fulfilled" && r.value.content && r.value.content.length > 150) {
+    if (
+      r.status === "fulfilled" &&
+      r.value.content &&
+      r.value.content.length > 150
+    ) {
       const extracted = extractSportsContent(r.value.content);
       blocks.push(
         `[SOURCE: ${r.value.url}]\n${extracted}\n[END SOURCE]`
       );
     } else {
-      const reason = r.status === "rejected" ? r.reason?.message : "empty or blocked";
+      const reason =
+        r.status === "rejected" ? r.reason?.message : "empty or blocked";
       console.warn(`[sports-reader] source failed: ${reason}`);
     }
   }
@@ -357,4 +391,7 @@ export async function fetchSportsContext(messageText) {
   );
 }
 
-export const ALL_SPORTS = SPORT_SOURCES.map((s) => ({ sport: s.key, sites: s.sites }));
+export const ALL_SPORTS = SPORT_SOURCES.map((s) => ({
+  sport: s.key,
+  sites: s.sites,
+}));
