@@ -2222,9 +2222,6 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
     }
   }
   // ──────────────────────────────────────────────────────────────────────────
-  let searchContext = "";
-  let realtimeSearchFailed = false;
-  let trustedGroundedReply = "";
   const imageIntent = classifyImageIntent(prompt);
   console.log(`[intent] image_score=${imageIntent.imageScore}`);
   console.log(`[intent] security_score=${imageIntent.securityScore}`);
@@ -2238,7 +2235,7 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
     console.log("[intent] skipping_realtime=true");
     console.log("[intent] skipping_serper=true");
     console.log("[img] generation_started=true");
-  } else if (false && !skipRealtimeVerification && config.searchEnabled === 1) {
+  } else if (false) {
     // Gate 1: never search casual/short messages — saves API quota and avoids false triggers
     const promptTrimmed = prompt.trim();
     const isCasualMessage =
@@ -2403,27 +2400,9 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
   } else if (config.activeModel?.includes("gemini")) {
     modelNudge = "\nPrioritise speed and directness. Keep answers sharp and modern in tone.";
   }
-  const finalPrompt = `${timeContext} ${systemPrompt} ${modelNudge} ${searchContext ? "\n\n" + searchContext : ""} ${sportsContext ? "\n\n" + sportsContext : ""} ${linkContext ? "\n\n" + linkContext : ""}
+  const finalPrompt = `${timeContext} ${systemPrompt} ${modelNudge} ${sportsContext ? "\n\n" + sportsContext : ""} ${linkContext ? "\n\n" + linkContext : ""}
 
 User Message: ${prompt}`;
-  if (trustedGroundedReply) {
-    console.log("[grounding] sending_grounded_reply=true");
-    return trustedGroundedReply;
-  }
-
-  // ── Realtime query + search failed: bypass AI entirely — prevent training-data hallucination ──
-  if (realtimeSearchFailed) {
-    console.log("[AI bypass] Returning realtime verification failure message");
-    if (/\bipl\b/i.test(rawUserMessage)) {
-      const isResultQuery = /\bwho won\b|\bresult\b|\bwinner\b|\byesterday\b|\blast match\b/i.test(rawUserMessage);
-      const isLiveQuery   = /\blive\b|\bscore\b|\bscores\b/i.test(rawUserMessage);
-      console.log("[DYNAMIC SPORTS RESPONSE] ipl_fallback");
-      if (isResultQuery) return "I couldn't fetch the latest IPL result right now. Please check Cricbuzz or ESPNcricinfo for the latest match result.";
-      if (isLiveQuery)   return "There are currently no live IPL matches happening right now.";
-      return "I couldn't fetch the latest IPL data right now. Please check Cricbuzz or ESPNcricinfo for live scores and results.";
-    }
-    return "All realtime search providers are currently busy. Try again later.";
-  }
 
   const providers = [];
   const geminiProvider = {

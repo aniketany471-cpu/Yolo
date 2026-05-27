@@ -379,15 +379,29 @@ export async function fetchSportsContext(messageText) {
 
   if (blocks.length === 0) return "";
 
-  const now = new Date().toUTCString();
+  const now = new Date();
+  const fetchedAt = now.toUTCString();
+  const todayDate = now.toLocaleDateString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric", timeZone: "UTC" });
+
   return (
-    `[REALTIME SPORTS DATA — fetched ${now}]\n` +
-    `Sport detected: ${sport}\n\n` +
+    `════════════════════════════════════════\n` +
+    `LIVE SPORTS DATA — fetched RIGHT NOW\n` +
+    `Today: ${todayDate}\n` +
+    `Fetched at: ${fetchedAt}\n` +
+    `Sport: ${sport}\n` +
+    `════════════════════════════════════════\n\n` +
     blocks.join("\n\n") +
-    `\n[END SPORTS DATA]\n\n` +
-    `Use the above live data to answer the user's sports question. ` +
-    `Extract scores, results, race winners, fixtures, standings, or upcoming events as relevant. ` +
-    `Cite the source URL and the fetch timestamp. Do NOT add information beyond what is in the data above.`
+    `\n════════════════════════════════════════\n` +
+    `END LIVE SPORTS DATA\n` +
+    `════════════════════════════════════════\n\n` +
+    `CRITICAL RULES — follow exactly, no exceptions:\n` +
+    `1. The data above was fetched LIVE just now on ${todayDate}. It is current and authoritative.\n` +
+    `2. COMPLETELY IGNORE your training-data knowledge about this sport for this reply. The live data above overrides everything you were trained on.\n` +
+    `3. Read the data carefully — driver names, player names, teams, and scores are embedded in the table rows above.\n` +
+    `4. State the winner, scores, and results EXACTLY as they appear in the data. Never say the winner is unknown if a name appears in the data.\n` +
+    `5. Do NOT add facts, scores, or names that are not in the data blocks above.\n` +
+    `6. Reply naturally as Donna — brief, direct, no bullet points unless listing standings.\n` +
+    `7. Mention the source site and today's date in your reply so the user knows this is live.`
   );
 }
 
