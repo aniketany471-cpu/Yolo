@@ -1417,9 +1417,16 @@ function classifyImageIntent(text) {
   return { imageScore, securityScore, hasSecuritySignal, shouldGenerateImage, finalHandler };
 }
 
+function normalizeMessageText(messageOrText) {
+  if (messageOrText === undefined || messageOrText === null) return "";
+  if (typeof messageOrText === "string") return messageOrText.trim();
+  const raw = messageOrText.message ?? messageOrText.text ?? "";
+  return String(raw ?? "").trim();
+}
+
 function detectTTSIntent(text) {
-  if (!text) return false;
-  const t = String(text).trim();
+  const t = normalizeMessageText(text);
+  if (!t) return false;
   return /\b(tts|text.?to.?speech)\b/i.test(t)
     || /\b(say|speak|read)\s+(this|it|that)\s+(as|in|to)?\s*(voice|audio|aloud|out\s*loud)\b/i.test(t)
     || /\b(convert|turn|change|make)\s+(this|it|that|the)?\s*(message|text)?\s*(to|into|as)\s*(voice|audio|tts|speech)\b/i.test(t)
@@ -1431,7 +1438,9 @@ function detectTTSIntent(text) {
 }
 
 function extractInlineSpeakText(text) {
-  const m = String(text).match(/^(?:tts|say|speak|voice)\s*:\s*(.+)/i);
+  const safeText = normalizeMessageText(text);
+  if (!safeText) return null;
+  const m = safeText.match(/^(?:tts|say|speak|voice)\s*:\s*(.+)/i);
   if (m) return m[1].trim();
   return null;
 }
@@ -2855,7 +2864,8 @@ ${aiRes}`);
   }
 }
 async function handleTTS(client, message, status, textRaw) {
-  let ttsText = textRaw.split(/\s+/).slice(1).join(" ").trim();
+  const safeTextRaw = normalizeMessageText(textRaw);
+  let ttsText = safeTextRaw.split(/\s+/).slice(1).join(" ").trim();
 
   if (!ttsText && message.replyToMsgId) {
     const replied = await client.getMessages(message.chatId, { ids: [message.replyToMsgId] });
@@ -3943,9 +3953,10 @@ async function startServer() {
     if (config.aiEnabled !== 1) {
       return;
     }
-    const text = (message.message || "").trim();
-    const hasPhoto = !!message.media?.photo;
-    const hasImageDoc = !!(message.media?.document?.mimeType || "").startsWith("image/");
+    const textRaw = normalizeMessageText(message);
+    const text = textRaw;
+    const hasPhoto = !!message?.media?.photo;
+    const hasImageDoc = !!(message?.media?.document?.mimeType || "").startsWith("image/");
     const hasImage = hasPhoto || hasImageDoc;
     if (!text && !hasImage) return;
     if (text && (text.startsWith("/") || text.startsWith("."))) return;
@@ -4643,10 +4654,10 @@ async function startServer() {
         try {
           if (!client) return;
           const message = event.message;
-          if (!message || !message.message) return;
-          const textRaw = (message.message || "").trim();
+          const textRaw = normalizeMessageText(message);
+          if (!message || (!textRaw && !message.media)) return;
           const text = textRaw.toLowerCase();
-          const rawText = String(message?.text || message?.message || "").trim();
+          const rawText = textRaw;
           const isSrcCommand = /^([./])(src|web)(\s|$)/i.test(rawText);
           const senderId = message.senderId?.toString();
           const chatIdStr = message.chatId?.toString();
