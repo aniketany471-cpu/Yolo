@@ -20,7 +20,7 @@ import { getGeminiPrimaryKey } from "./services/geminiKeyManager.js";
 import { getAccuWeather } from "./services/weather.js";
 import { buildLinkContext } from "./services/linkReader.js";
 import { fetchSportsContext } from "./services/sportsReader.js";
-import { generateTTSFile } from "./services/tts.js";
+import { DEFAULT_TTS_CONFIG, generateTTSFile } from "./services/tts.js";
 // Image service — loaded dynamically so a missing/broken module never crashes the bot
 let ziGenerateImage = null;
 let ziParseImageModelKeyword = null;
@@ -297,7 +297,8 @@ db.exec(`
     deepThinking INTEGER DEFAULT 0,
     publicCommandsEnabled INTEGER DEFAULT 1,
     blacklistedUsers TEXT DEFAULT '',
-    whitelistedUsers TEXT DEFAULT ''
+    whitelistedUsers TEXT DEFAULT '',
+    tts TEXT DEFAULT '{"primaryProvider":"elevenlabs","voiceId":"ibbx9zDYGvLgtYzRbqqG","model":"eleven_multilingual_v2"}'
   );
 
   CREATE TABLE IF NOT EXISTS group_settings (
@@ -552,6 +553,10 @@ try {
   db.exec("ALTER TABLE config ADD COLUMN lightningApiKey TEXT DEFAULT '';");
 } catch (e) {
 }
+try {
+  db.exec(`ALTER TABLE config ADD COLUMN tts TEXT DEFAULT '{"primaryProvider":"elevenlabs","voiceId":"ibbx9zDYGvLgtYzRbqqG","model":"eleven_multilingual_v2"}';`);
+} catch (e) {
+}
 db.exec(`
   CREATE TABLE IF NOT EXISTS user_nsfw_prefs (
     userId TEXT PRIMARY KEY,
@@ -617,10 +622,11 @@ db.exec(`
     formattingEnabled = COALESCE(formattingEnabled, 1),
     cleanupEnabled = COALESCE(cleanupEnabled, 1),
     bluesmindsApiKey = COALESCE(bluesmindsApiKey, ''),
-    activeModel = COALESCE(activeModel, 'deepseek.v3.2')
+    activeModel = COALESCE(activeModel, 'deepseek.v3.2'),
+    tts = COALESCE(tts, '{"primaryProvider":"elevenlabs","voiceId":"ibbx9zDYGvLgtYzRbqqG","model":"eleven_multilingual_v2"}')
   WHERE id = 1;
 `);
-const existingConfig = db.prepare("SELECT openRouterKey, aiProvider, bluesmindsApiKey FROM config WHERE id = 1").get();
+const existingConfig = db.prepare("SELECT openRouterKey, aiProvider, bluesmindsApiKey, tts FROM config WHERE id = 1").get();
 if (!existingConfig?.openRouterKey || existingConfig.openRouterKey.length < 10) {
   db.prepare("UPDATE config SET openRouterKey = ? WHERE id = 1").run(
     "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"
@@ -665,6 +671,48 @@ console.log("[startup] Bootstrap complete — BluesMinds provider, autoReply ON,
     console.log("[startup] Bootstrapped missing credentials from environment variables:", Object.keys(envUpdates).join(", "));
   }
 }
+
+function getTTSRuntimeConfig(config = {}) {
+  let tts = DEFAULT_TTS_CONFIG;
+  if (typeof config.tts === "string" && config.tts.trim()) {
+    try {
+      tts = { ...DEFAULT_TTS_CONFIG, ...JSON.parse(config.tts) };
+    } catch (e) {
+      console.warn("[tts] Invalid TTS config JSON; using defaults:", e.message || e);
+    }
+  } else if (config.tts && typeof config.tts === "object") {
+    tts = { ...DEFAULT_TTS_CONFIG, ...config.tts };
+  }
+  return { ...config, tts };
+}
+
+async function sendTTSVoiceOrText({ client, targetPeer, message, status, text, config = {}, logPrefix = "[tts]" }) {
+  const safeText = String(text || "").slice(0, 1000).trim();
+  if (!safeText) return false;
+
+  const tmpPath = path.join(tempDir, `tts_${Date.now()}.mp3`);
+  try {
+    const { provider } = await generateTTSFile(safeText, tmpPath, null, getTTSRuntimeConfig(config));
+    try { await client.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch {}
+    await client.sendFile(targetPeer, {
+      file: tmpPath,
+      voiceNote: true,
+      replyTo: message.id,
+      forceDocument: false,
+    });
+    addLog(`${logPrefix} voice sent via ${provider}: "${safeText.slice(0, 60)}"`, "success");
+    return true;
+  } catch (e) {
+    console.error("[tts] voice generation failed; falling back to text:", e.message || e);
+    addLog(`[tts] voice generation failed; sent text fallback: ${String(e.message || e).slice(0, 120)}`, "warn");
+    const formatted = formatAiMessage(safeText);
+    await status.update(formatted.text, { parseMode: formatted.parseMode });
+    return false;
+  } finally {
+    fs.remove(tmpPath).catch(() => {});
+  }
+}
+
 // ─── Robust request infrastructure ────────────────────────────────────────────
 const REQUEST_TIMEOUT_MS = 15000;  // 15s per attempt — fails fast before fallback
 const MAX_RETRIES = 1;             // 1 retry = max 30s total before giving up
@@ -2877,20 +2925,16 @@ async function handleTTS(client, message, status, textRaw) {
 
   await status.update(HS.tts());
 
-  const tmpPath = path.join(tempDir, `tts_${Date.now()}.mp3`);
-  try {
-    await generateTTSFile(ttsText, tmpPath);
-    try { await client.deleteMessages(message.chatId, [status.messageId], { revoke: true }); } catch {}
-    await client.sendFile(message.chatId, {
-      file: tmpPath,
-      voiceNote: true,
-      replyTo: message.id,
-      forceDocument: false,
-    });
-    addLog(`[tts] voice generated: "${ttsText.slice(0, 60)}"`, "success");
-  } finally {
-    fs.remove(tmpPath).catch(() => {});
-  }
+  const config = db.prepare("SELECT * FROM config WHERE id = 1").get();
+  await sendTTSVoiceOrText({
+    client,
+    targetPeer: message.chatId,
+    message,
+    status,
+    text: ttsText,
+    config,
+    logPrefix: "[tts] command",
+  });
 }
 async function handleGif(client, message, config, status, query) {
   if (!query) return status.fail("Usage: /gif <search term>");
@@ -3085,7 +3129,8 @@ async function startServer() {
     try {
       const messages = db.prepare("SELECT * FROM messages ORDER BY createdAt DESC LIMIT 50").all();
       const targets = db.prepare("SELECT * FROM targets").all();
-      const config = db.prepare("SELECT * FROM config WHERE id = 1").get();
+      const rawConfig = db.prepare("SELECT * FROM config WHERE id = 1").get();
+      const config = getTTSRuntimeConfig(rawConfig || {});
       const logs = db.prepare("SELECT * FROM logs ORDER BY timestamp DESC LIMIT 100").all();
       const sudoUsers = db.prepare("SELECT * FROM sudo_users").all();
       const payload = {
@@ -3154,7 +3199,8 @@ async function startServer() {
       "telegramApiId",
       "telegramApiHash",
       "telegramStringSession",
-      "maintenanceMode"
+      "maintenanceMode",
+      "tts"
     ];
     // Read current creds BEFORE saving so we can detect actual changes
     const prevCreds = db.prepare(
@@ -4163,20 +4209,15 @@ async function startServer() {
           }
           if (speakText) {
             await status.update(HS.tts());
-            const tmpPath = path.join(tempDir, `tts_${Date.now()}.mp3`);
-            try {
-              await generateTTSFile(speakText.slice(0, 1000), tmpPath);
-              try { await client2.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch {}
-              await client2.sendFile(targetPeer, {
-                file: tmpPath,
-                voiceNote: true,
-                replyTo: message.id,
-                forceDocument: false,
-              });
-              addLog(`[tts] voice sent: "${speakText.slice(0, 60)}"`, "success");
-            } finally {
-              fs.remove(tmpPath).catch(() => {});
-            }
+            await sendTTSVoiceOrText({
+              client: client2,
+              targetPeer,
+              message,
+              status,
+              text: speakText,
+              config,
+              logPrefix: "[tts] inline",
+            });
             return;
           }
         }
@@ -4552,20 +4593,15 @@ async function startServer() {
           if (ttsIntent) {
             const cleanText = aiRes.replace(/\*\*/g, "").replace(/[*_`#]/g, "").trim();
             await status.update(HS.tts());
-            const tmpPath = path.join(tempDir, `tts_${Date.now()}.mp3`);
-            try {
-              await generateTTSFile(cleanText.slice(0, 1000), tmpPath);
-              try { await client2.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch {}
-              await client2.sendFile(targetPeer, {
-                file: tmpPath,
-                voiceNote: true,
-                replyTo: message.id,
-                forceDocument: false,
-              });
-              addLog(`[tts] AI response voiced to ${chatIdStr}: "${cleanText.slice(0, 40)}"`, "success");
-            } finally {
-              fs.remove(tmpPath).catch(() => {});
-            }
+            await sendTTSVoiceOrText({
+              client: client2,
+              targetPeer,
+              message,
+              status,
+              text: cleanText,
+              config,
+              logPrefix: `[tts] AI response to ${chatIdStr}`,
+            });
           } else {
             const formatted = formatAiMessage(aiRes);
             await status.update(formatted.text, {

@@ -1,5 +1,11 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
 
+export interface TTSConfig {
+  primaryProvider: string;
+  voiceId: string;
+  model: string;
+}
+
 export interface AppConfig {
   minDelaySeconds: number;
   maxDelaySeconds: number;
@@ -45,6 +51,7 @@ export interface AppConfig {
   blacklistedUsers?: string;
   whitelistedUsers?: string;
   maintenanceMode?: number;
+  tts?: TTSConfig;
 }
 
 export interface LogEntry {
@@ -132,6 +139,11 @@ const defaultConfig: AppConfig = {
   blacklistedUsers: '',
   whitelistedUsers: '',
   maintenanceMode: 0,
+  tts: {
+    primaryProvider: 'elevenlabs',
+    voiceId: 'ibbx9zDYGvLgtYzRbqqG',
+    model: 'eleven_multilingual_v2',
+  },
 };
 
 const defaultContext: AppContextType = {
@@ -182,9 +194,20 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             aiMode, formattingEnabled, cleanupEnabled,
             bluesmindsApiKey, activeModel,
             deepThinking, sudoUsers, publicCommandsEnabled, blacklistedUsers, whitelistedUsers,
-            maintenanceMode,
+            maintenanceMode, tts,
             ...restConfig
           } = data.config;
+
+          let parsedTts = defaultConfig.tts;
+          if (typeof tts === 'string') {
+            try {
+              parsedTts = { ...defaultConfig.tts!, ...JSON.parse(tts || '{}') };
+            } catch {
+              parsedTts = defaultConfig.tts;
+            }
+          } else {
+            parsedTts = { ...defaultConfig.tts!, ...(tts || {}) };
+          }
 
           const nextConfig: AppConfig = {
             ...restConfig,
@@ -229,6 +252,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             blacklistedUsers: blacklistedUsers || '',
             whitelistedUsers: whitelistedUsers || '',
             maintenanceMode: maintenanceMode ?? 0,
+            tts: parsedTts,
           };
 
           setConfig(prev => JSON.stringify(prev) === JSON.stringify(nextConfig) ? prev : nextConfig);
