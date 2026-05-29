@@ -298,7 +298,7 @@ db.exec(`
     publicCommandsEnabled INTEGER DEFAULT 1,
     blacklistedUsers TEXT DEFAULT '',
     whitelistedUsers TEXT DEFAULT '',
-    tts TEXT DEFAULT '{"primaryProvider":"elevenlabs","voiceId":"ibbx9zDYGvLgtYzRbqqG","model":"eleven_multilingual_v2"}'
+    tts TEXT DEFAULT '{"primaryProvider":"elevenlabs","model":"eleven_multilingual_v2"}'
   );
 
   CREATE TABLE IF NOT EXISTS group_settings (
@@ -554,7 +554,7 @@ try {
 } catch (e) {
 }
 try {
-  db.exec(`ALTER TABLE config ADD COLUMN tts TEXT DEFAULT '{"primaryProvider":"elevenlabs","voiceId":"ibbx9zDYGvLgtYzRbqqG","model":"eleven_multilingual_v2"}';`);
+  db.exec(`ALTER TABLE config ADD COLUMN tts TEXT DEFAULT '{"primaryProvider":"elevenlabs","model":"eleven_multilingual_v2"}';`);
 } catch (e) {
 }
 db.exec(`
@@ -623,9 +623,21 @@ db.exec(`
     cleanupEnabled = COALESCE(cleanupEnabled, 1),
     bluesmindsApiKey = COALESCE(bluesmindsApiKey, ''),
     activeModel = COALESCE(activeModel, 'deepseek.v3.2'),
-    tts = COALESCE(tts, '{"primaryProvider":"elevenlabs","voiceId":"ibbx9zDYGvLgtYzRbqqG","model":"eleven_multilingual_v2"}')
+    tts = COALESCE(tts, '{"primaryProvider":"elevenlabs","model":"eleven_multilingual_v2"}')
   WHERE id = 1;
 `);
+
+function addLog(message, type = "info") {
+  try {
+    const id = Math.random().toString(36).substring(2);
+    db.prepare(
+      "INSERT INTO logs (id, timestamp, message, type) VALUES (?, ?, ?, ?)"
+    ).run(id, Date.now(), message, type);
+  } catch (e) {
+    console.error("[Log Error]:", e);
+  }
+}
+
 const existingConfig = db.prepare("SELECT openRouterKey, aiProvider, bluesmindsApiKey, tts FROM config WHERE id = 1").get();
 if (!existingConfig?.openRouterKey || existingConfig.openRouterKey.length < 10) {
   db.prepare("UPDATE config SET openRouterKey = ? WHERE id = 1").run(
@@ -3619,16 +3631,6 @@ async function startServer() {
   let lastConnectFailTime = 0;
   let authDupRetries = 0;
   let retryTimer = null;
-  const addLog = (message, type = "info") => {
-    try {
-      const id = Math.random().toString(36).substring(2);
-      db.prepare(
-        "INSERT INTO logs (id, timestamp, message, type) VALUES (?, ?, ?, ?)"
-      ).run(id, Date.now(), message, type);
-    } catch (e) {
-      console.error("[Log Error]:", e);
-    }
-  };
   // ─── yt-dlp standalone binary — download/verify at startup ───────────────
   // We bypass youtube-dl-exec's bundled binary entirely (it requires Python 3).
   // Instead we download the official standalone Linux binary once and keep it

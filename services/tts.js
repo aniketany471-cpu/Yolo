@@ -4,7 +4,6 @@ import { franc } from 'franc';
 
 export const DEFAULT_TTS_CONFIG = {
   primaryProvider: 'elevenlabs',
-  voiceId: 'ibbx9zDYGvLgtYzRbqqG',
   model: 'eleven_multilingual_v2',
 };
 
@@ -27,6 +26,140 @@ const FRANC_TO_GTTS = {
 };
 
 const normalizeProviderName = (provider) => String(provider || '').trim().toLowerCase();
+
+const truncateForLog = (value, maxLength = 4000) => {
+  const normalized = String(value ?? '');
+  return normalized.length > maxLength ? `${normalized.slice(0, maxLength)}…[truncated]` : normalized;
+};
+
+const getResponseHeadersForLog = (response) => ({
+  contentType: response.headers.get('content-type') || '',
+  contentLength: response.headers.get('content-length') || '',
+  requestId: response.headers.get('request-id') || response.headers.get('x-request-id') || '',
+});
+
+const describeError = (error) => ({
+  name: error?.name || 'Error',
+  message: error?.message || String(error),
+  stack: error?.stack ? truncateForLog(error.stack, 1200) : '',
+});
+
+function logElevenLabsRequest(event, details = {}, level = 'info') {
+  const logPayload = {
+    event,
+    provider: 'elevenlabs',
+    ...details,
+  };
+  const message = `[tts][elevenlabs] ${JSON.stringify(logPayload)}`;
+  if (level === 'error') console.error(message);
+  else if (level === 'warn') console.warn(message);
+  else console.log(message);
+}
+
+function pickFirstUsableElevenLabsVoice(voices = []) {
+  return voices.find((voice) => voice?.voice_id || voice?.voiceId || voice?.id) || null;
+}
+
+async function fetchElevenLabsVoices(config) {
+  logElevenLabsRequest('voices_request_start');
+
+  let res;
+  try {
+    res = await fetch('https://api.elevenlabs.io/v1/voices', {
+      method: 'GET',
+      headers: {
+        'xi-api-key': config.elevenLabsApiKey,
+      },
+    });
+  } catch (error) {
+    logElevenLabsRequest('voices_request_error', {
+      error: describeError(error),
+    }, 'error');
+    throw error;
+  }
+
+  const responseDetails = {
+    status: res.status,
+    statusText: res.statusText,
+    headers: getResponseHeadersForLog(res),
+  };
+
+  let responseBody = '';
+  try {
+    responseBody = await res.text();
+  } catch (error) {
+    responseBody = `[failed to read response body: ${error.message || error}]`;
+  }
+
+  if (!res.ok) {
+    logElevenLabsRequest('voices_response_error', {
+      ...responseDetails,
+      responseBody,
+      error: `HTTP ${res.status}`,
+    }, 'error');
+    throw new Error(`ElevenLabs voices fetch failed: HTTP ${res.status}${responseBody ? ` - ${truncateForLog(responseBody, 500)}` : ''}`);
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(responseBody || '{}');
+  } catch (error) {
+    logElevenLabsRequest('voices_parse_error', {
+      ...responseDetails,
+      responseBody: truncateForLog(responseBody),
+      error: describeError(error),
+    }, 'error');
+    throw error;
+  }
+
+  return {
+    voices: Array.isArray(payload?.voices) ? payload.voices : [],
+    responseDetails,
+    responseBody,
+  };
+}
+
+function normalizeElevenLabsVoice(voice) {
+  const voiceId = voice?.voice_id || voice?.voiceId || voice?.id || '';
+  return {
+    voiceId,
+    voiceName: voice?.name || 'Unnamed ElevenLabs voice',
+  };
+}
+
+async function resolveElevenLabsVoice(config) {
+  const configuredVoiceId = String(config.voiceId || '').trim();
+  const { voices, responseDetails, responseBody } = await fetchElevenLabsVoices(config);
+  const selectedVoice = configuredVoiceId
+    ? voices.find((voice) => normalizeElevenLabsVoice(voice).voiceId === configuredVoiceId)
+    : pickFirstUsableElevenLabsVoice(voices);
+
+  if (!selectedVoice) {
+    const reason = configuredVoiceId
+      ? 'Configured ElevenLabs voice is not available to this account'
+      : 'No usable ElevenLabs voices are available for this account';
+    logElevenLabsRequest('voices_empty', {
+      ...responseDetails,
+      voiceCount: voices.length,
+      configuredVoice: Boolean(configuredVoiceId),
+      configuredVoiceId,
+      responseBody: truncateForLog(responseBody),
+      error: reason,
+    }, 'warn');
+    throw new Error(reason);
+  }
+
+  const selected = normalizeElevenLabsVoice(selectedVoice);
+  logElevenLabsRequest('voice_selected', {
+    ...responseDetails,
+    selectedVoiceName: selected.voiceName,
+    selectedVoiceId: selected.voiceId,
+    voiceCount: voices.length,
+    configuredVoice: Boolean(configuredVoiceId),
+  });
+
+  return selected;
+}
 
 function safeParseJSON(value) {
   if (!value || typeof value !== 'string') return null;
@@ -55,7 +188,7 @@ export function resolveTTSConfig(config = {}) {
       || config.primaryProvider
       || DEFAULT_TTS_CONFIG.primaryProvider
     ),
-    voiceId: nestedConfig?.voiceId || config.ttsVoiceId || config.voiceId || DEFAULT_TTS_CONFIG.voiceId,
+    voiceId: nestedConfig?.voiceId || config.ttsVoiceId || config.voiceId || '',
     model: nestedConfig?.model || config.ttsModel || config.model || DEFAULT_TTS_CONFIG.model,
     elevenLabsApiKey: nestedConfig?.elevenLabsApiKey || config.elevenLabsApiKey || process.env.ELEVENLABS_API_KEY || '',
     backupProviders: Array.isArray(nestedConfig?.backupProviders)
@@ -95,35 +228,93 @@ async function generateGoogleTTSBuffer(text, lang, config) {
 }
 
 async function generateElevenLabsTTSBuffer(text, lang, config) {
+  const textLength = text.trim().length;
+  const requestDetails = {
+    voiceId: config.voiceId || '',
+    voiceName: '',
+    model: config.model,
+    textLength,
+  };
+
   if (!config.elevenLabsApiKey) {
+    logElevenLabsRequest('configuration_error', {
+      ...requestDetails,
+      error: 'ELEVENLABS_API_KEY is not configured',
+    }, 'error');
     throw new Error('ELEVENLABS_API_KEY is not configured');
   }
 
-  const res = await fetch(
-    `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(config.voiceId)}?output_format=mp3_44100_128`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'xi-api-key': config.elevenLabsApiKey,
-      },
-      body: JSON.stringify({
-        text: text.trim(),
-        model_id: config.model,
-      }),
-    }
-  );
+  const selectedVoice = await resolveElevenLabsVoice(config);
+  requestDetails.voiceId = selectedVoice.voiceId;
+  requestDetails.voiceName = selectedVoice.voiceName;
 
-  if (!res.ok) {
-    let detail = '';
-    try {
-      detail = await res.text();
-    } catch {}
-    throw new Error(`ElevenLabs TTS failed: HTTP ${res.status}${detail ? ` - ${detail.slice(0, 200)}` : ''}`);
+  logElevenLabsRequest('request_start', requestDetails);
+
+  let res;
+  try {
+    res = await fetch(
+      `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(selectedVoice.voiceId)}?output_format=mp3_44100_128`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'xi-api-key': config.elevenLabsApiKey,
+        },
+        body: JSON.stringify({
+          text: text.trim(),
+          model_id: config.model,
+        }),
+      }
+    );
+  } catch (error) {
+    logElevenLabsRequest('request_error', {
+      ...requestDetails,
+      error: describeError(error),
+    }, 'error');
+    throw error;
   }
 
+  const responseDetails = {
+    ...requestDetails,
+    status: res.status,
+    statusText: res.statusText,
+    headers: getResponseHeadersForLog(res),
+  };
+
+  if (!res.ok) {
+    let responseBody = '';
+    try {
+      responseBody = await res.text();
+    } catch (error) {
+      responseBody = `[failed to read response body: ${error.message || error}]`;
+    }
+    logElevenLabsRequest('response_error', {
+      ...responseDetails,
+      responseBody,
+      error: `HTTP ${res.status}`,
+    }, 'error');
+    throw new Error(`ElevenLabs TTS failed: HTTP ${res.status}${responseBody ? ` - ${truncateForLog(responseBody, 500)}` : ''}`);
+  }
+
+  let audioBuffer;
+  try {
+    audioBuffer = Buffer.from(await res.arrayBuffer());
+  } catch (error) {
+    logElevenLabsRequest('response_body_error', {
+      ...responseDetails,
+      responseBody: '[binary audio body could not be read]',
+      error: describeError(error),
+    }, 'error');
+    throw error;
+  }
+
+  logElevenLabsRequest('response_success', {
+    ...responseDetails,
+    responseBody: `[binary audio omitted; bytes=${audioBuffer.length}]`,
+  });
+
   return {
-    buffer: Buffer.from(await res.arrayBuffer()),
+    buffer: audioBuffer,
     lang: lang || detectLang(text),
     provider: 'elevenlabs',
     config,

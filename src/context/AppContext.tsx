@@ -2,7 +2,7 @@ import React, { createContext, useContext, useState, useEffect } from 'react';
 
 export interface TTSConfig {
   primaryProvider: string;
-  voiceId: string;
+  voiceId?: string;
   model: string;
 }
 
@@ -141,7 +141,6 @@ const defaultConfig: AppConfig = {
   maintenanceMode: 0,
   tts: {
     primaryProvider: 'elevenlabs',
-    voiceId: 'ibbx9zDYGvLgtYzRbqqG',
     model: 'eleven_multilingual_v2',
   },
 };
