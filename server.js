@@ -20,6 +20,7 @@ import { getGeminiPrimaryKey } from "./services/geminiKeyManager.js";
 import { getAccuWeather } from "./services/weather.js";
 import { buildLinkContext } from "./services/linkReader.js";
 import { fetchSportsContext } from "./services/sportsReader.js";
+import { generateTTSFile } from "./services/tts.js";
 // Image service — loaded dynamically so a missing/broken module never crashes the bot
 let ziGenerateImage = null;
 let ziParseImageModelKeyword = null;
@@ -1414,6 +1415,25 @@ function classifyImageIntent(text) {
   const shouldGenerateImage = !hasSecuritySignal && imageScore >= 4;
   const finalHandler = hasSecuritySignal ? "security_text" : (shouldGenerateImage ? "image_generation" : "text_or_other");
   return { imageScore, securityScore, hasSecuritySignal, shouldGenerateImage, finalHandler };
+}
+
+function detectTTSIntent(text) {
+  if (!text) return false;
+  const t = String(text).trim();
+  return /\b(tts|text.?to.?speech)\b/i.test(t)
+    || /\b(say|speak|read)\s+(this|it|that)\s+(as|in|to)?\s*(voice|audio|aloud|out\s*loud)\b/i.test(t)
+    || /\b(convert|turn|change|make)\s+(this|it|that|the)?\s*(message|text)?\s*(to|into|as)\s*(voice|audio|tts|speech)\b/i.test(t)
+    || /\b(voice|audio)\s*(note|message|reply)\s*(this|it|please)?\b/i.test(t)
+    || /\bread\s+(this|it|that)\s*(out|aloud|loud)?\b/i.test(t)
+    || /\bspeak\s+(this|it|that)\b/i.test(t)
+    || /\bsay\s+(this|it|that)\s*(out\s*loud|aloud)\b/i.test(t)
+    || /^(tts|say|speak|voice)\s*:/i.test(t);
+}
+
+function extractInlineSpeakText(text) {
+  const m = String(text).match(/^(?:tts|say|speak|voice)\s*:\s*(.+)/i);
+  if (m) return m[1].trim();
+  return null;
 }
 
 function getISTDate() {
@@ -2834,6 +2854,34 @@ ${aiRes}`);
     await status.fail("Translation failed.");
   }
 }
+async function handleTTS(client, message, status, textRaw) {
+  let ttsText = textRaw.split(/\s+/).slice(1).join(" ").trim();
+
+  if (!ttsText && message.replyToMsgId) {
+    const replied = await client.getMessages(message.chatId, { ids: [message.replyToMsgId] });
+    ttsText = (replied[0]?.message || "").trim();
+  }
+
+  if (!ttsText) return status.fail("Usage: /tts <text>  or reply to a message with /tts");
+  if (ttsText.length > 1000) ttsText = ttsText.slice(0, 1000);
+
+  await status.update(HS.tts());
+
+  const tmpPath = path.join(tempDir, `tts_${Date.now()}.mp3`);
+  try {
+    await generateTTSFile(ttsText, tmpPath);
+    try { await client.deleteMessages(message.chatId, [status.messageId], { revoke: true }); } catch {}
+    await client.sendFile(message.chatId, {
+      file: tmpPath,
+      voiceNote: true,
+      replyTo: message.id,
+      forceDocument: false,
+    });
+    addLog(`[tts] voice generated: "${ttsText.slice(0, 60)}"`, "success");
+  } finally {
+    fs.remove(tmpPath).catch(() => {});
+  }
+}
 async function handleGif(client, message, config, status, query) {
   if (!query) return status.fail("Usage: /gif <search term>");
   await status.update(HS.search());
@@ -2886,6 +2934,7 @@ const HS = {
   pdfUpload:    () => _pick(["Uploading it now...", "Done, sending it over..."]),
   translate:    () => _pick(["On it...", "Translating that now...", "Give me a sec with this..."]),
   summarize:    () => _pick(["Reading through it...", "Give me a sec...", "Okay, going through this..."]),
+  tts:          () => _pick(["Converting to voice...", "Generating audio now...", "Give me a sec with this..."]),
   models:       () => _pick(["Pulling the list...", "One sec...", "Grabbing that for you..."]),
   export:       () => _pick(["Fetching those messages...", "Give me a sec...", "On it..."]),
   exportBuild:  () => _pick(["Building the PDF...", "Almost done with the export...", "Putting it all together..."]),
@@ -4091,6 +4140,36 @@ async function startServer() {
           }
         }
 
+        const ttsIntent = detectTTSIntent(textRaw);
+        if (ttsIntent && !hasVisionImage) {
+          const inlineText = extractInlineSpeakText(textRaw);
+          let speakText = inlineText;
+          if (!speakText && message.replyTo?.replyToMsgId) {
+            try {
+              const repliedMsgs = await client2.getMessages(message.inputChat || message.chatId, { ids: [message.replyTo.replyToMsgId] });
+              speakText = (repliedMsgs?.[0]?.message || "").trim();
+            } catch {}
+          }
+          if (speakText) {
+            await status.update(HS.tts());
+            const tmpPath = path.join(tempDir, `tts_${Date.now()}.mp3`);
+            try {
+              await generateTTSFile(speakText.slice(0, 1000), tmpPath);
+              try { await client2.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch {}
+              await client2.sendFile(targetPeer, {
+                file: tmpPath,
+                voiceNote: true,
+                replyTo: message.id,
+                forceDocument: false,
+              });
+              addLog(`[tts] voice sent: "${speakText.slice(0, 60)}"`, "success");
+            } finally {
+              fs.remove(tmpPath).catch(() => {});
+            }
+            return;
+          }
+        }
+
         const userIntent = classifyImageIntent(text);
         console.log(`[intent] image_score=${userIntent.imageScore}`);
         console.log(`[intent] security_score=${userIntent.securityScore}`);
@@ -4458,17 +4537,34 @@ async function startServer() {
             return;
           }
 
-          // ── Normal text reply ────────────────────────────────────────────
-          // The AI system prompt already handles jailbreaks, harmful content, and
-          // security naturally — no robotic post-processing filter needed.
-          const formatted = formatAiMessage(aiRes);
-          await status.update(formatted.text, {
-            parseMode: formatted.parseMode
-          });
-          addLog(
-            `Auto-replied to ${chatIdStr}: ${formatted.text.substring(0, 30)}...`,
-            "success"
-          );
+          // ── Normal text reply (or TTS voice note if intent detected) ────
+          if (ttsIntent) {
+            const cleanText = aiRes.replace(/\*\*/g, "").replace(/[*_`#]/g, "").trim();
+            await status.update(HS.tts());
+            const tmpPath = path.join(tempDir, `tts_${Date.now()}.mp3`);
+            try {
+              await generateTTSFile(cleanText.slice(0, 1000), tmpPath);
+              try { await client2.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch {}
+              await client2.sendFile(targetPeer, {
+                file: tmpPath,
+                voiceNote: true,
+                replyTo: message.id,
+                forceDocument: false,
+              });
+              addLog(`[tts] AI response voiced to ${chatIdStr}: "${cleanText.slice(0, 40)}"`, "success");
+            } finally {
+              fs.remove(tmpPath).catch(() => {});
+            }
+          } else {
+            const formatted = formatAiMessage(aiRes);
+            await status.update(formatted.text, {
+              parseMode: formatted.parseMode
+            });
+            addLog(
+              `Auto-replied to ${chatIdStr}: ${formatted.text.substring(0, 30)}...`,
+              "success"
+            );
+          }
         } else {
           // All retries failed — delete the thinking indicator silently, no error shown
           console.error(`[AI-Auto] All retries failed for ${chatIdStr}, dropping silently.`);
