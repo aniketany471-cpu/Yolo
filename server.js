@@ -1505,6 +1505,147 @@ function extractInlineSpeakText(text) {
   return null;
 }
 
+
+const CODE_FILE_TRIGGER_RE = /\b(?:write\s+(?:a\s+)?(?:(?:python|javascript|typescript|java|c\+\+|cpp|c#|csharp|go|rust|php|ruby|bash|shell|html|css|sql)\s+)?(?:code|script|program|file|scraper|bot|api|app|website|web\s*app)|make\s+(?:a\s+)?(?:script|program|bot|api|app|website|web\s*app)|create\s+(?:a\s+)?(?:bot|script|program|api|app|website|web\s*app)|build\s+(?:a\s+)?(?:api|bot|app|website|web\s*app|react\s*app|node\s*api)|generate\s+(?:python|javascript|typescript|java|go|rust|php|ruby|bash|shell|html|css)\s+code|give\s+(?:me\s+)?full\s+source\s+code|write\s+javascript|programming\s+request)\b/i;
+const CODE_EXPLAIN_ONLY_RE = /\b(what\s+is|explain|how\s+does|define|meaning\s+of|difference\s+between|why\s+does)\b/i;
+const CODE_LANGUAGE_EXTENSIONS = [
+  [/\bpython\b|\bpy\b/i, ".py"],
+  [/\b(?:node|javascript|js|telegram\s+bot)\b/i, ".js"],
+  [/\btypescript|\bts\b/i, ".ts"],
+  [/\bhtml\b|\bweb\s?page\b|\bwebsite\b/i, ".html"],
+  [/\bcss\b/i, ".css"],
+  [/\bjson\b/i, ".json"],
+  [/\bbash\b|\bshell\b/i, ".sh"],
+  [/\bgo\b|\bgolang\b/i, ".go"],
+  [/\brust\b/i, ".rs"],
+  [/\bphp\b/i, ".php"],
+  [/\bruby\b/i, ".rb"],
+  [/\bjava\b/i, ".java"],
+  [/\bc\+\+\b|\bcpp\b/i, ".cpp"],
+  [/\bc#\b|\bcsharp\b/i, ".cs"],
+  [/\bsql\b/i, ".sql"]
+];
+
+function detectCodeFileIntent(text) {
+  const t = normalizeMessageText(text);
+  if (!t) return false;
+  if (CODE_EXPLAIN_ONLY_RE.test(t) && !CODE_FILE_TRIGGER_RE.test(t)) return false;
+  return CODE_FILE_TRIGGER_RE.test(t);
+}
+
+function inferCodeFileName(text) {
+  const t = normalizeMessageText(text);
+  const explicit = t.match(/(?:file\s+named|save\s+(?:it\s+)?as|filename\s*:?)\s+([a-z0-9._-]+\.[a-z0-9]+)/i)?.[1];
+  if (explicit) return sanitizeGeneratedPath(explicit);
+  const ext = CODE_LANGUAGE_EXTENSIONS.find(([re]) => re.test(t))?.[1] || ".txt";
+  if (/\bscraper\b/i.test(t)) return `scraper${ext}`;
+  if (/\btelegram\s+bot\b|\bbot\b/i.test(t)) return `bot${ext}`;
+  if (/\bapi\b|\bserver\b/i.test(t)) return ext === ".py" ? "api.py" : `server${ext === ".txt" ? ".js" : ext}`;
+  if (/\breact\b/i.test(t)) return "project.zip";
+  if (/\bwebsite\b|\bweb\s?page\b/i.test(t)) return "index.html";
+  if (/\bscript\b/i.test(t)) return ext === ".txt" ? "script.py" : `script${ext}`;
+  return `source${ext}`;
+}
+
+function sanitizeGeneratedPath(filePath) {
+  const cleaned = String(filePath || "source.txt")
+    .replace(/\\/g, "/")
+    .split("/")
+    .filter((part) => part && part !== "." && part !== "..")
+    .join("/");
+  return cleaned.replace(/[^a-zA-Z0-9._/-]/g, "_") || "source.txt";
+}
+
+function buildCodeFilePrompt(userText) {
+  const fallbackName = inferCodeFileName(userText);
+  return [
+    "FILE GENERATION MODE is active.",
+    "The user's primary intent is to create code. Generate complete source code files instead of a chat answer.",
+    "Return ONLY file blocks using this exact format, with no explanations before or after:",
+    '<file path="relative/path.ext">',
+    "complete file contents here",
+    "</file>",
+    `For a single-file solution, prefer path: ${fallbackName === "project.zip" ? "index.html" : fallbackName}`,
+    "If multiple files are truly needed, return one <file> block per file. Do not include markdown fences.",
+    "User request:",
+    userText
+  ].join("\n");
+}
+
+function extractGeneratedFiles(aiText, fallbackName) {
+  const text = String(aiText || "");
+  const files = [];
+  const tagRe = /<file\s+path=["']([^"']+)["']\s*>\n?([\s\S]*?)\n?<\/file>/gi;
+  let match;
+  while ((match = tagRe.exec(text)) !== null) {
+    const content = match[2].replace(/^\n+|\n+$/g, "");
+    if (content.trim()) files.push({ relativePath: sanitizeGeneratedPath(match[1]), content });
+  }
+  if (files.length > 0) return files;
+
+  const fenceRe = /```(?:[a-z0-9#+.-]+)?\n([\s\S]*?)```/gi;
+  const fences = [];
+  while ((match = fenceRe.exec(text)) !== null) {
+    if (match[1].trim()) fences.push(match[1].replace(/^\n+|\n+$/g, ""));
+  }
+  if (fences.length > 0) return [{ relativePath: sanitizeGeneratedPath(fallbackName), content: fences.join("\n\n") }];
+  if (text.trim()) return [{ relativePath: sanitizeGeneratedPath(fallbackName), content: text.trim() + "\n" }];
+  return [];
+}
+
+async function zipDirectory(sourceDir, zipPath) {
+  await new Promise((resolve, reject) => {
+    const proc = spawn("zip", ["-qr", zipPath, "."], { cwd: sourceDir, stdio: ["ignore", "pipe", "pipe"] });
+    let stderr = "";
+    proc.stderr.on("data", (d) => { stderr += d.toString(); });
+    proc.on("close", (code) => code === 0 ? resolve() : reject(new Error(stderr.trim() || `zip exited with code ${code}`)));
+    proc.on("error", reject);
+  });
+}
+
+async function sendGeneratedCodeDocument({ client, targetPeer, message, status, aiText, originalPrompt }) {
+  const fallbackName = inferCodeFileName(originalPrompt);
+  const files = extractGeneratedFiles(aiText, fallbackName === "project.zip" ? "index.html" : fallbackName);
+  if (files.length === 0) return false;
+  const jobId = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  const workDir = path.join(tempDir, `codegen_${jobId}`);
+  await fs.ensureDir(workDir);
+  let outputPath = null;
+  let outputName = null;
+  try {
+    for (const file of files) {
+      const safeRel = sanitizeGeneratedPath(file.relativePath);
+      const fullPath = path.join(workDir, safeRel);
+      if (!fullPath.startsWith(workDir + path.sep)) throw new Error(`Unsafe generated path: ${safeRel}`);
+      await fs.ensureDir(path.dirname(fullPath));
+      await fs.writeFile(fullPath, file.content, "utf8");
+    }
+    if (files.length === 1 && fallbackName !== "project.zip") {
+      outputName = path.basename(files[0].relativePath);
+      outputPath = path.join(workDir, files[0].relativePath);
+    } else {
+      outputName = fallbackName.endsWith(".zip") ? fallbackName : "project.zip";
+      outputPath = path.join(tempDir, `codegen_${jobId}_${outputName}`);
+      await zipDirectory(workDir, outputPath);
+    }
+    await status.update(HS.upload());
+    try { await client.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch {}
+    await client.sendFile(targetPeer, {
+      file: outputPath,
+      caption: `📎 ${outputName}`,
+      replyTo: message.id,
+      forceDocument: true
+    });
+    addLog(`[codegen] Sent generated code document ${outputName} (${files.length} file${files.length === 1 ? "" : "s"})`, "success");
+    return true;
+  } finally {
+    setTimeout(() => {
+      fs.remove(workDir).catch(() => {});
+      if (outputPath && !outputPath.startsWith(workDir + path.sep)) fs.remove(outputPath).catch(() => {});
+    }, 15000);
+  }
+}
+
 function getISTDate() {
   return new Date(
     new Date().toLocaleString("en-US", {
@@ -4200,6 +4341,10 @@ async function startServer() {
         }
 
         const ttsIntent = detectTTSIntent(textRaw);
+        const codeFileIntent = detectCodeFileIntent(textRaw);
+        if (codeFileIntent) {
+          addLog(`[codegen] File generation mode triggered for: "${textRaw.slice(0, 80)}"`, "info");
+        }
         if (ttsIntent && !hasVisionImage) {
           const inlineText = extractInlineSpeakText(textRaw);
           let speakText = inlineText;
@@ -4432,6 +4577,9 @@ async function startServer() {
               ? text.replace(new RegExp(`@${myUsername}\\s*`, "gi"), "").trim() || text
               : text;
             let visionOcrVerified = false;
+            if (codeFileIntent && !hasVisionImage) {
+              promptForDeepSeek = buildCodeFilePrompt(promptForDeepSeek);
+            }
             if (hasVisionImage) {
               try {
                 const geminiKey = (config.geminiKey || getGeminiPrimaryKey() || "").trim();
@@ -4472,7 +4620,7 @@ async function startServer() {
         // request but the AI didn't produce a [IMAGE_GENERATION] tag (refused
         // or returned plain text), inject the user's own message as the prompt.
         const imageKeywords = /\b(create|generate|make|draw|design|render|show|paint|produce|visualize|imagine|sketch|depict|give me|send me)\b.{0,60}\b(image|photo|pic|picture|wallpaper|artwork|illustration|anime|drawing|portrait|logo|banner|poster|render|nude|naked|sexy|nsfw|explicit|hentai|girl|boy|woman|man|character|scene)\b/i;
-        if (isPrivate && imageKeywords.test(text)) {
+        if (!codeFileIntent && isPrivate && imageKeywords.test(text)) {
           const hasTag = aiRes && /\[IMAGE_GENERATION\]/i.test(aiRes);
           if (!hasTag) {
             // AI refused or missed — use the user's original message as the prompt directly
@@ -4525,6 +4673,18 @@ async function startServer() {
         // ─────────────────────────────────────────────────────────────────
 
         if (aiRes && client2) {
+          if (codeFileIntent && !hasVisionImage) {
+            const sentCodeDoc = await sendGeneratedCodeDocument({
+              client: client2,
+              targetPeer,
+              message,
+              status,
+              aiText: aiRes,
+              originalPrompt: textRaw
+            });
+            if (sentCodeDoc) return;
+          }
+
           // ── Image generation routing ─────────────────────────────────────
           // Strip any [IMAGE_GENERATION] tags the AI hallucinated without the user asking
           const userActuallyWantsImage = classifyImageIntent(text).shouldGenerateImage && !hasVisionImage;
