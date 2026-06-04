@@ -655,12 +655,11 @@ if (envBluesmindsKey.length > 10) {
 // Hard bootstrap: ensure auto-reply and BluesMinds are ON out of the box on every fresh deploy.
 // bluesmindsApiKey is intentionally NOT set here — it comes from env var or dashboard only.
 db.prepare(
-  "UPDATE config SET aiProvider = 'bluesminds', activeModel = 'gpt-5.3-chat-latest', aiEnabled = 1, autoReplyDM = 1, autoReplyMention = 1 WHERE id = 1 AND (autoReplyDM = 0 OR autoReplyMention = 0 OR aiProvider = 'openrouter' OR aiProvider = 'gemini')"
+  "UPDATE config SET aiProvider = 'bluesminds', activeModel = 'accounts/fireworks/models/deepseek-v4-pro', aiEnabled = 1, autoReplyDM = 1, autoReplyMention = 1 WHERE id = 1 AND (autoReplyDM = 0 OR autoReplyMention = 0 OR aiProvider = 'openrouter' OR aiProvider = 'gemini')"
 ).run();
-// Always enforce gpt-5.3 as the active model on every startup/redeploy.
-// This runs unconditionally so even an existing DB row is corrected.
-db.prepare("UPDATE config SET activeModel = 'gpt-5.3-chat-latest' WHERE id = 1").run();
-console.log("[startup] Bootstrap complete — BluesMinds provider, autoReply ON, model locked to gpt-5.3-chat-latest");
+// Always enforce DeepSeek V4 Pro as the active model on every startup/redeploy.
+db.prepare("UPDATE config SET activeModel = 'accounts/fireworks/models/deepseek-v4-pro' WHERE id = 1").run();
+console.log("[startup] Bootstrap complete — BluesMinds provider, autoReply ON, model locked to deepseek-v4-pro");
 
 // Bootstrap credentials from env vars so Railway redeployments don't wipe them from the UI
 {
@@ -740,25 +739,16 @@ const KNOWN_BAD_MODELS = new Set([
   "blackbox",               // permanent timeout
   "kimi-k2.5",              // permanent timeout
   "deepseek-v4-flash",      // 403 Tier Restriction
-  "deepseek-v4-pro",        // 412 Account Suspended
   "deepseek-ai/deepseek-v4-flash",  // 403 Tier Restriction
-  "deepseek-ai/deepseek-v4-pro",    // 412 Account Suspended
   "claude-sonnet-4-6",      // 403 Tier Restriction
   "gemini-3.1-flash-lite-preview",  // 404 Not Found
   "mistralai/mistral-large",        // 404 Function not found
   "gpt-4o",                 // 500 upstream "Extra data" — malformed response
 ]);
 
-// Fallback chain of verified-working models (confirmed in live audit May 2026).
-// Ordered: fastest/most reliable first.
+// Fallback chain — only GPT-5 remains as safety net.
 const BM_FALLBACK_CHAIN = [
-  "deepseek.v3.1",             //  942ms ✅
-  "gpt-5-chat",                // 1796ms ✅
-  "gpt-4o-mini",               // 2779ms ✅
-  "gpt-3.5-turbo-0613",        // 2770ms ✅
-  "gemini-3-flash-preview",    // 1339ms ✅
-  "meta/llama-3.3-70b-instruct", // 583ms ✅
-  "meta/llama-3.1-8b-instruct",  // 3006ms ✅
+  "gpt-5-chat",
 ];
 
 function sleep(ms) {
@@ -1093,6 +1083,23 @@ async function _bmFallback(prompt, cleanKey, failedModel, context, systemInstruc
   const nextModel = chain[0];
   console.log(`[BluesMinds] Falling back from ${failedModel} → ${nextModel}`);
   return getBluesMindsResponse(prompt, cleanKey, nextModel, context, systemInstruction, _visited);
+}
+
+/**
+ * Try a BluesMinds model up to maxTries times before returning null.
+ * Each attempt gets a fresh _visited set so retries are independent.
+ */
+async function getBluesMindsWithRetries(prompt, apiKey, model, context, systemInstruction, maxTries = 3) {
+  for (let i = 0; i < maxTries; i++) {
+    const result = await getBluesMindsResponse(prompt, apiKey, model, context, systemInstruction, new Set());
+    if (result && result.trim().length > 2) return result;
+    if (i < maxTries - 1) {
+      console.warn(`[BluesMinds][Model=${model}] Attempt ${i + 1}/${maxTries} failed — retrying in 1s...`);
+      await sleep(1000);
+    }
+  }
+  console.warn(`[BluesMinds][Model=${model}] All ${maxTries} attempts exhausted.`);
+  return null;
 }
 
 /**
@@ -2717,49 +2724,20 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
 User Message: ${prompt}`;
 
   const providers = [];
-  const geminiProvider = {
-    name: "Gemini",
-    key: userGeminiK || systemGeminiK,
-    fn: (p, k, ctx, inst) => getGeminiResponse(p, k, config.activeModel, ctx, inst, requestId)
+  // Provider 1: DeepSeek V4 Pro — primary, 3 attempts before giving up
+  const deepSeekV4Provider = {
+    name: "BluesMinds-DeepSeek-V4-Pro",
+    key: config.bluesmindsApiKey,
+    fn: (p, k, ctx, inst) => getBluesMindsWithRetries(p, k, "accounts/fireworks/models/deepseek-v4-pro", ctx, inst, 3)
   };
-  // Provider 1: BluesMinds GPT-5.3 latest (primary)
-  const bluesmindsGpt5Provider = {
+  // Provider 2: GPT-5 — fallback only, used when DeepSeek V4 Pro exhausts all 3 tries
+  const gpt5FallbackProvider = {
     name: "BluesMinds-GPT5",
     key: config.bluesmindsApiKey,
-    fn: (p, k, ctx, inst) => getBluesMindsResponse(p, k, "gpt-5.3-chat-latest", ctx, inst)
+    fn: (p, k, ctx, inst) => getBluesMindsResponse(p, k, "gpt-5-chat", ctx, inst, new Set())
   };
-  // Provider 2: BluesMinds DeepSeek V4 Pro (first fallback)
-  const bluesmindsDeepSeekProvider = {
-    name: "BluesMinds-DeepSeek",
-    key: config.bluesmindsApiKey,
-    fn: (p, k, ctx, inst) => getBluesMindsResponse(p, k, "accounts/fireworks/models/deepseek-v4-pro", ctx, inst)
-  };
-  // Provider 3: Groq llama-3.3-70b (second fallback)
-  const groqProvider = {
-    name: "Groq",
-    key: groqK,
-    fn: (p, k, ctx, inst) => getGroqResponse(p, k, "llama-3.3-70b-versatile", ctx, inst)
-  };
-  const grokProvider = {
-    name: "xAI/Grok",
-    key: config.xaiKey,
-    fn: (p, k, ctx, inst) => getGrokResponse(p, k, config.activeModel, ctx, inst)
-  };
-  const orProvider = {
-    name: "OpenRouter",
-    key: openRouterK,
-    fn: (p, k, ctx, inst) => getOpenRouterResponse(p, k, config.activeModel, ctx, inst)
-  };
-  // Runtime execution order:
-  // 1) BluesMinds GPT-5.3 → 2) BluesMinds DeepSeek V4 → 3) Groq llama-3.3-70b → 4) Gemini/Grok/OR (safety nets)
-  providers.push(
-    bluesmindsGpt5Provider,
-    bluesmindsDeepSeekProvider,
-    groqProvider,
-    geminiProvider,
-    grokProvider,
-    orProvider
-  );
+  // Runtime execution order: DeepSeek V4 Pro (3 tries) → GPT-5 (fallback)
+  providers.push(deepSeekV4Provider, gpt5FallbackProvider);
   for (const p of providers) {
     if (p.key && p.key !== "undefined" && p.key !== "null" && p.key.length > 5) {
       try {
