@@ -1,22 +1,18 @@
 /**
  * Image generation service
- * Priority 1: OpenAI GPT-Image-1     — 3 attempts (via Bluesminds API) — most reliable
- * Priority 2: Grok Imagine Image Lite — 2 attempts (via Bluesminds API)
- * Priority 3: Zimage Turbo           — last resort only
+ * Priority 1: Grok Imagine Image Lite — default (via Bluesminds API)
+ * Priority 2: Zimage Turbo           — automatic fallback if Grok fails
+ * DISABLED:   OpenAI GPT-Image-1     — never used under any circumstances
  */
 
 const ZIMAGE_GENERATE_URL = "https://zimageturbo.ai/api/generate";
 
 const PROVIDER_TIMEOUT_MS  = 90_000;
 const DOWNLOAD_TIMEOUT_MS  = 30_000;
-const OPENAI_MODEL         = "gpt-image-1";
 const GROK_IMAGINE_MODEL   = "grok-imagine-image-lite";
 
-// Retry config — exhaust free providers before touching paid zimage-turbo
-const OPENAI_MAX_ATTEMPTS = 3;    // gpt-image-1: attempt 1 + 2 retries (most reliable)
-const OPENAI_RETRY_DELAY  = 4000; // ms between openai retries
-const GROK_MAX_ATTEMPTS   = 2;    // grok: attempt 1 + 1 retry (backup)
-const GROK_RETRY_DELAY    = 3000; // ms between grok retries
+const GROK_MAX_ATTEMPTS  = 3;    // grok: 3 attempts before falling back to zimage
+const GROK_RETRY_DELAY   = 3000; // ms between grok retries
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -27,25 +23,6 @@ function sanitizePrompt(prompt) {
     .replace(/[<>{}|\\^`[\]]/g, "")
     .trim()
     .slice(0, 1000);
-}
-
-function pickOpenAISize(options = {}) {
-  const width  = Number(options.width)  || null;
-  const height = Number(options.height) || null;
-
-  if (width && height) {
-    if (width > height) return "1536x1024";
-    if (height > width) return "1024x1536";
-  }
-
-  if (options.aspect_ratio === "16:9" || options.aspect_ratio === "3:2" || options.aspect_ratio === "4:3") {
-    return "1536x1024";
-  }
-  if (options.aspect_ratio === "9:16" || options.aspect_ratio === "2:3" || options.aspect_ratio === "3:4") {
-    return "1024x1536";
-  }
-
-  return "1024x1024";
 }
 
 async function fetchWithTimeout(url, options, timeoutMs) {
@@ -115,47 +92,7 @@ async function grokImagineImage(prompt) {
   throw new Error("Grok Imagine returned no image content");
 }
 
-// ── Provider 2: OpenAI GPT-Image-1 via Bluesminds ────────────────────────────
-async function openaiImage(prompt, options = {}) {
-  const apiKey  = process.env.BLUEMINDS_API_KEY;
-  if (!apiKey) throw new Error("BLUEMINDS_API_KEY not set in environment");
-  const baseUrl = (process.env.BLUEMINDS_BASE_URL || "").replace(/\/+$/, "");
-  if (!baseUrl) throw new Error("BLUEMINDS_BASE_URL not set in environment");
-  const imageGenerateUrl = `${baseUrl}/v1/images/generations`;
-
-  const body = {
-    model:   OPENAI_MODEL,
-    prompt:  sanitizePrompt(prompt),
-    size:    pickOpenAISize(options),
-    quality: "high",
-    n:       1,
-  };
-
-  const res = await fetchWithTimeout(
-    imageGenerateUrl,
-    {
-      method:  "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body:    JSON.stringify(body),
-    },
-    PROVIDER_TIMEOUT_MS
-  );
-
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const msg = data?.error?.message || `HTTP ${res.status}`;
-    throw new Error(`OpenAI image error: ${msg}`);
-  }
-
-  const imageB64 = data?.data?.[0]?.b64_json;
-  const imageUrl = data?.data?.[0]?.url;
-  if (imageB64) return Buffer.from(imageB64, "base64");
-  if (imageUrl) return downloadImageBuffer(imageUrl);
-
-  throw new Error("OpenAI returned no image content");
-}
-
-// ── Provider 3: Zimage Turbo ──────────────────────────────────────────────────
+// ── Provider 2: Zimage Turbo ──────────────────────────────────────────────────
 async function zimageTurbo(prompt, options = {}) {
   const apiKey = process.env.ZIMAGE_API_KEY;
   if (!apiKey) throw new Error("ZIMAGE_API_KEY not set in environment");
@@ -194,21 +131,22 @@ async function zimageTurbo(prompt, options = {}) {
 
 /**
  * Parse model preference keyword from a user prompt.
- * Keywords: "grok:", "using grok", "with grok" → "grok"
- *           "gpt:", "using gpt", "with gpt"   → "gpt"
- * Returns { cleanPrompt, forceProvider: "gpt"|"grok"|null }
+ * Keywords: "use/using/with/via grok"   → forceProvider: "grok"
+ *           "use/using/with/via zimage" → forceProvider: "zimage"
+ * GPT-Image-1 is disabled and will never be used.
+ * Returns { cleanPrompt, forceProvider: "grok"|"zimage"|null }
  */
 export function parseImageModelKeyword(text) {
   const t = String(text || "");
 
-  const grokRe = /^grok\s*:\s*|(?:^|\s)(?:using|with|via)\s+grok\b/i;
-  const gptRe  = /^gpt\s*:\s*|(?:^|\s)(?:using|with|via)\s+gpt(?:[- ]?(?:1|image[- ]?1))?\b/i;
+  const grokRe   = /^grok\s*:\s*|(?:^|\s)(?:use|using|with|via)\s+grok\b/i;
+  const zimageRe = /^zimage\s*:\s*|(?:^|\s)(?:use|using|with|via)\s+zimage\b/i;
 
   if (grokRe.test(t)) {
     return { cleanPrompt: t.replace(grokRe, " ").trim(), forceProvider: "grok" };
   }
-  if (gptRe.test(t)) {
-    return { cleanPrompt: t.replace(gptRe, " ").trim(), forceProvider: "gpt" };
+  if (zimageRe.test(t)) {
+    return { cleanPrompt: t.replace(zimageRe, " ").trim(), forceProvider: "zimage" };
   }
   return { cleanPrompt: t, forceProvider: null };
 }
@@ -216,17 +154,8 @@ export function parseImageModelKeyword(text) {
 /**
  * Edit an existing image using a text instruction.
  *
- * Attempt 1 — gpt-image-1 native edit (/images/edits):
- *   The real inpainting API. Works when BluesMinds has gpt-image-1 available.
- *
- * Attempt 2 — Vision-describe → Grok-regenerate (fallback):
- *   When the edit endpoint is down/broken, we:
- *     a) send the original image to a vision model (gpt-4o-mini) and get a
- *        rich textual description of every visual detail
- *     b) append the user's edit instruction to that description
- *     c) feed the combined prompt to grok-imagine-image-lite to generate a
- *        new image that matches the description with the requested change
- *   Not true inpainting, but produces a visually consistent result.
+ * GPT-Image-1 edit is disabled. Uses vision-describe → Grok-regenerate,
+ * with Zimage as fallback if Grok is exhausted.
  *
  * Returns { buffer: Buffer, provider: string }
  */
@@ -236,54 +165,12 @@ export async function editImage(imageBuffer, prompt) {
   const baseUrl = (process.env.BLUEMINDS_BASE_URL || "https://api.bluesminds.com").replace(/\/+$/, "");
   const errors = [];
 
-  // ── Attempt 1: gpt-image-1 native edit (/images/edits) ───────────────────
+  // ── GPT-5.3 vision reasons the edit → Grok generates → Zimage fallback ───
+  // GPT-5.3 sees BOTH the image AND the edit instruction at once and produces
+  // the final generation prompt directly — describing what the image should
+  // look like AFTER the change.
   try {
-    const url = `${baseUrl}/v1/images/edits`;
-
-    // API requires a square PNG, max 4 MB
-    const sharpMod = await import("sharp");
-    const sharp = sharpMod.default || sharpMod;
-    const meta = await sharp(imageBuffer).metadata();
-    const dim = Math.min(Math.max(meta.width || 1024, meta.height || 1024), 1024);
-    const pngBuffer = await sharp(imageBuffer)
-      .resize(dim, dim, { fit: "contain", background: { r: 255, g: 255, b: 255, alpha: 1 } })
-      .png()
-      .toBuffer();
-
-    const form = new FormData();
-    form.append("model", OPENAI_MODEL);
-    form.append("prompt", sanitizePrompt(prompt));
-    form.append("n", "1");
-    form.append("image", new File([pngBuffer], "image.png", { type: "image/png" }));
-
-    const res = await fetchWithTimeout(url, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${apiKey}` },
-      body: form
-    }, PROVIDER_TIMEOUT_MS);
-
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
-
-    const b64 = data?.data?.[0]?.b64_json;
-    if (b64) return { buffer: Buffer.from(b64, "base64"), provider: "gpt-image-1-edit" };
-
-    const imageUrl = data?.data?.[0]?.url;
-    if (imageUrl) return { buffer: await downloadImageBuffer(imageUrl), provider: "gpt-image-1-edit" };
-
-    throw new Error("No content in response");
-  } catch (e) {
-    console.warn(`[img] gpt-image-1 edit failed, falling back to vision+grok: ${e.message}`);
-    errors.push(`gpt-image-1-edit: ${e.message}`);
-  }
-
-  // ── Attempt 2: GPT-5.3 vision reasons the edit → Grok generates result ────
-  // Key difference from naive describe+append: GPT-5.3 sees BOTH the image AND
-  // the edit instruction at once and produces the final generation prompt
-  // directly — describing what the image should look like AFTER the change.
-  // This produces far more accurate results than describing then appending.
-  try {
-    console.log("[img] edit_fallback=vision+grok — gpt-5.3 reasoning edit prompt...");
+    console.log("[img] edit=vision+grok — gpt-5.3 reasoning edit prompt...");
 
     const imgB64 = imageBuffer.toString("base64");
 
@@ -326,9 +213,9 @@ export async function editImage(imageBuffer, prompt) {
     }
 
     const finalPrompt = sanitizePrompt(editPromptFromVision);
-    console.log(`[img] gpt-5.3 edit prompt ready (${finalPrompt.length} chars), generating...`);
+    console.log(`[img] gpt-5.3 edit prompt ready (${finalPrompt.length} chars), generating with grok...`);
 
-    // ── Generation chain: grok (3 attempts) → zimage-turbo last resort ────
+    // ── Generation chain: grok (3 attempts) → zimage fallback ────────────
     const genErrors = [];
 
     for (let attempt = 1; attempt <= 3; attempt++) {
@@ -344,10 +231,10 @@ export async function editImage(imageBuffer, prompt) {
       }
     }
 
-    // Grok exhausted — fall through to zimage-turbo with the GPT-5.3 prompt
+    // Grok exhausted — fall back to zimage-turbo
     if (process.env.ZIMAGE_API_KEY) {
       try {
-        console.log("[img] grok exhausted — trying zimage-turbo with gpt-5.3 edit prompt...");
+        console.log("[img] grok exhausted — falling back to zimage-turbo...");
         const buffer = await zimageTurbo(finalPrompt);
         console.log("[img] vision+zimage edit succeeded");
         return { buffer, provider: "zimage-vision-edit" };
@@ -359,7 +246,7 @@ export async function editImage(imageBuffer, prompt) {
 
     throw new Error(`All generation providers failed: ${genErrors.join(" | ")}`);
   } catch (e) {
-    console.warn(`[img] vision+grok edit fallback failed: ${e.message}`);
+    console.warn(`[img] vision+grok edit failed: ${e.message}`);
     errors.push(`grok-vision-edit: ${e.message}`);
   }
 
@@ -385,9 +272,13 @@ export function buildImagePromptFromVision(visionResult) {
 /**
  * Generate an image for the given prompt.
  *
- * options.forceProvider = "gpt"  → skip straight to gpt-image-1 (3 attempts)
- * options.forceProvider = "grok" → skip straight to grok-imagine (3 attempts)
- * (no forceProvider)             → gpt-image-1 first, grok backup, zimage-turbo last resort
+ * Priority order:
+ *   1. User-specified model (options.forceProvider = "grok" | "zimage")
+ *   2. Grok (default)
+ *   3. Zimage (automatic fallback if Grok fails)
+ *
+ * GPT-Image-1 is disabled and will never be called.
+ * The user's prompt is sent exactly as provided — never modified or enhanced.
  *
  * Returns { buffer: Buffer, provider: string }
  */
@@ -396,39 +287,19 @@ export async function generateImage(prompt, config = {}, options = {}) {
   const errors = [];
   const force = options.forceProvider || null;
 
+  // GPT-Image-1 is permanently disabled — reject immediately if forced
+  if (force === "gpt") {
+    throw new Error("GPT-Image-1 is disabled and cannot be used.");
+  }
+
   if (force) {
     console.log(`[img] forceProvider=${force} (user-selected model)`);
   }
 
-  // ── Priority 1: OpenAI GPT-Image-1 ─────────────────────────────────────────
-  // Run if: no force, or user forced "gpt"
-  if (!force || force === "gpt") {
-    const maxAttempts = force === "gpt" ? 3 : OPENAI_MAX_ATTEMPTS;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      console.log(`[img] provider=gpt-image-1 model=${OPENAI_MODEL} attempt=${attempt}/${maxAttempts}`);
-      try {
-        const buffer = await openaiImage(prompt, options);
-        console.log(`[img] generation_success=true provider=gpt-image-1 attempt=${attempt}`);
-        return { buffer, provider: "gpt-image-1" };
-      } catch (e) {
-        console.warn(`[img] gpt-image-1 attempt ${attempt}/${maxAttempts} failed: ${e.message}`);
-        errors.push(`gpt-image-1[${attempt}]: ${e.message}`);
-        if (attempt < maxAttempts) {
-          console.log(`[img] retrying gpt-image-1 in ${OPENAI_RETRY_DELAY / 1000}s...`);
-          await sleep(OPENAI_RETRY_DELAY);
-        }
-      }
-    }
-    // If user forced gpt and it failed all attempts, tell them clearly
-    if (force === "gpt") {
-      throw new Error(`gpt-image-1 failed after ${maxAttempts} attempts:\n${errors.join("\n")}`);
-    }
-  }
-
-  // ── Priority 2: Grok Imagine Image Lite ────────────────────────────────────
-  // Run if: no force, or user forced "grok"
+  // ── Priority 1 / Default: Grok Imagine Image Lite ──────────────────────────
+  // Run if: no force (default), or user explicitly forced "grok"
   if (!force || force === "grok") {
-    const maxAttempts = force === "grok" ? 3 : GROK_MAX_ATTEMPTS;
+    const maxAttempts = GROK_MAX_ATTEMPTS;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       console.log(`[img] provider=grok-imagine model=${GROK_IMAGINE_MODEL} attempt=${attempt}/${maxAttempts}`);
       try {
@@ -444,14 +315,17 @@ export async function generateImage(prompt, config = {}, options = {}) {
         }
       }
     }
-    // If user forced grok and it failed all attempts, tell them clearly
+    // If user explicitly forced grok and it failed, tell them clearly
     if (force === "grok") {
-      throw new Error(`grok-imagine failed after ${maxAttempts} attempts:\n${errors.join("\n")}`);
+      throw new Error(`Grok image generation failed after ${maxAttempts} attempts:\n${errors.join("\n")}`);
     }
+    // Otherwise fall through to zimage
+    console.log("[img] grok exhausted — switching to zimage fallback...");
   }
 
-  // ── Priority 3: Zimage Turbo — last resort (never reached on forced provider) ─
-  console.log("[img] switching_provider=zimage_turbo (last resort — all free providers exhausted)");
+  // ── Priority 2 / Fallback: Zimage Turbo ────────────────────────────────────
+  // Run if: user forced "zimage", or grok failed on default path
+  console.log("[img] provider=zimage-turbo");
   try {
     const buffer = await zimageTurbo(prompt, options);
     console.log("[img] generation_success=true provider=zimage-turbo");
