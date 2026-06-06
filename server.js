@@ -2681,6 +2681,8 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
   console.log(`[intent] final_handler=${imageIntent.finalHandler}`);
   const imageGenerationIntent = imageIntent.shouldGenerateImage;
   let searchContext = opts?.searchContext ?? null;
+  let trustedGroundedReply = null;
+  let realtimeSearchFailed = false;
   const skipRealtimeVerification = !!opts?.skipRealtimeVerification;
   if (skipRealtimeVerification) {
     console.log("[vision] skipping_realtime_verification=true");
