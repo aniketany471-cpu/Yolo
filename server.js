@@ -2116,6 +2116,81 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
     return { success: false, answer: "Realtime search is temporarily busy. Try again later." };
   }
 }
+async function performBluesmindsWebGrounding(query, bluesmindsKey, config) {
+  if (!bluesmindsKey || bluesmindsKey.length < 5) return null;
+
+  console.log("[GROUNDING_PRIMARY] Gemini-3.5-Flash");
+  console.log("[GROUNDING_PROVIDER] BluesMinds");
+  console.log("[GROUNDING_REQUEST]", query.slice(0, 100));
+
+  // Step 1: Fetch live search results via Serper (primary data source)
+  let searchResults = "";
+  if (serperSearch && (config?.serperKey || process.env.SERPER_API_KEY)) {
+    try {
+      const sr = await serperSearch(query, config);
+      if (sr?.summary) searchResults = sr.summary;
+    } catch (e) {
+      console.warn("[GROUNDING_ERROR] Serper fetch failed:", e?.message || e);
+    }
+  }
+
+  // Step 2: Detect query intent for adaptive response length
+  const isDetailedQuery = /\b(explain|detailed|full report|analysis|compare|deep dive|breakdown|comprehensive|analyze)\b/i.test(query);
+  const isShortQuery = !isDetailedQuery && (
+    /^(who won|score\??|next race|next match|weather|price|result|standings|live|winner|podium)[?!.]?\s*$/i.test(query.trim()) ||
+    query.trim().split(/\s+/).length <= 6
+  );
+  const isSportsQuery = /\b(f1|formula.?1|grand prix|race|circuit|cricket|ipl|t20|odi|football|soccer|nba|nfl|ufc|mma|match|score|standings|podium|winner|league|tournament)\b/i.test(query);
+
+  const lengthRule = isDetailedQuery
+    ? "Provide a comprehensive, structured answer with all relevant details and sources when available."
+    : isShortQuery
+    ? "Answer in 1–5 lines. Key facts only. No filler, no unnecessary explanation."
+    : "Concise summary in 1–3 short paragraphs. Include the most important details only.";
+
+  const sportsRule = isSportsQuery
+    ? "\n\nSports Response Rules:\n- 'who won' → winner + key highlight only\n- 'next race/match' → event name + venue/circuit + date + local time\n- 'standings' → top 3–5 positions only\n- 'analyze / explain' → detailed answer only when explicitly asked\nDefault: short and factual. No essays unless the user requests detail."
+    : "";
+
+  // Step 3: Build grounding prompt
+  const groundingPrompt = searchResults
+    ? `You are a precise web grounding assistant for a Telegram AI bot.\n\nLive Search Results:\n${searchResults}\n\nUser Question: ${query}\n\n${lengthRule}${sportsRule}\n\nStrict Rules:\n- Answer ONLY from the search results above — do not add, guess, or infer anything not present.\n- Quote exact scores, prices, dates, or times if present in the results.\n- If a key fact is missing from the results, say so honestly.\n- Keep Telegram readability in mind — avoid walls of text.\n- Priority: accuracy > relevance > detail.`
+    : `You are a precise web grounding assistant for a Telegram AI bot.\n\nUser Question: ${query}\n\n${lengthRule}${sportsRule}\n\nBe factual and direct. If you are uncertain about real-time data, acknowledge it clearly.`;
+
+  const maxTokens = isDetailedQuery ? 600 : isShortQuery ? 150 : 350;
+
+  try {
+    const result = await fetchJsonWithRetry(
+      `${BLUEMINDS_BASE_URL}/chat/completions`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${bluesmindsKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "gemini-3.5-flash",
+          messages: [{ role: "user", content: groundingPrompt }],
+          temperature: 0.1,
+          max_tokens: maxTokens
+        })
+      },
+      { provider: "BluesMinds-Grounding", model: "gemini-3.5-flash", endpoint: "/chat/completions" }
+    );
+    if (!result.ok) {
+      console.warn(`[GROUNDING_ERROR] gemini-3.5-flash status=${result.status}`);
+      return null;
+    }
+    const text = (result.data?.choices?.[0]?.message?.content || "").trim();
+    if (text.length > 10) {
+      console.log(`[GROUNDING_SUCCESS] gemini-3.5-flash via BluesMinds — ${text.length} chars`);
+      return text;
+    }
+    console.warn("[GROUNDING_ERROR] gemini-3.5-flash returned empty response");
+    return null;
+  } catch (e) {
+    console.warn("[GROUNDING_ERROR] gemini-3.5-flash:", e?.message || e);
+    return null;
+  }
+}
+
 async function performWeatherGrounding(query, config, geminiKey) {
   try {
     console.log("[weather] provider=accuweather");
@@ -2614,7 +2689,7 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
     console.log("[intent] skipping_realtime=true");
     console.log("[intent] skipping_serper=true");
     console.log("[img] generation_started=true");
-  } else if (false) {
+  } else {
     // Gate 1: never search casual/short messages — saves API quota and avoids false triggers
     const promptTrimmed = prompt.trim();
     const isCasualMessage =
@@ -2644,58 +2719,72 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
       console.log(`[search] Skipped — casual/short message: "${promptTrimmed.slice(0, 40)}"`);
     }
     if (shouldSearch) {
-      const groundingInput = rawUserMessage;
-      console.log("[FINAL GROUNDING INPUT]", groundingInput);
-      const grounded = await performRealtimeGrounding(groundingInput, config, requestId);
-      console.log("[GROUNDING SEARCHES]", grounded?.search_queries || []);
-      if (grounded) {
-        const srcText = grounded.sources.map((s) => typeof s === "string" ? s : (s?.url || s?.domain || JSON.stringify(s))).slice(0, 5).join(", ");
-        searchContext =
-          '[VERIFIED REALTIME FACTS]\n' +
-          `Type: ${grounded.query_type}\n` +
-          `Subject: ${grounded.subject}\n` +
-          `Answer: ${grounded.answer}\n` +
-          `Timestamp: ${grounded.timestamp}\n` +
-          `Confidence: ${grounded.confidence}\n` +
-          `Sources: ${srcText}\n` +
-          '[END VERIFIED FACTS]\n\n' +
-          'STRICT RULES:\n' +
-          '1. Rephrase only. Do not add new facts.\n' +
-          '2. Do not infer missing scores/winners/dates/weather/news details.\n' +
-          '3. If asked beyond facts above, say you could not verify more right now.';
+      // ── PRIMARY: Bluesminds gemini-3.5-flash ─────────────────────────────
+      const bmKey = (config.bluesmindsApiKey || process.env.BLUEMINDS_API_KEY || "").trim();
+      let bmPrimaryAnswer = null;
+      if (bmKey && bmKey.length > 5) {
+        bmPrimaryAnswer = await performBluesmindsWebGrounding(rawUserMessage, bmKey, config);
+      }
 
-        const groundedAnswer = String(grounded.answer || "").trim();
-        const groundingSuccess = grounded.grounding_success === true;
-        const responseValid = grounded.response_valid === true || grounded.verified === true;
-        const noExplicitHallucination = !/\b(i (might|may) be wrong|not sure|cannot verify|can't verify|unverified|guess)\b/i.test(groundedAnswer);
-        const groundedResponseTrusted = groundingSuccess && responseValid && groundedAnswer.length > 0 && noExplicitHallucination;
-        console.log(`[grounding] grounding_success=${groundingSuccess}`);
-        console.log(`[grounding] response_valid=${responseValid}`);
-        console.log(`[grounding] no_explicit_hallucination=${noExplicitHallucination}`);
-        console.log(`[grounding] grounded_response_trusted=${groundedResponseTrusted}`);
-        if (groundedResponseTrusted) {
-          const cleanSources = (grounded.sources || []).filter(Boolean).slice(0, 4);
-          const sourceBlock = cleanSources.length
-            ? `\n\nSources:\n${cleanSources.map((s, i) => `${i + 1}. ${s}`).join("\n")}`
-            : "";
-          // Only apply live-match normalization when the user is asking for live scores,
-          // never when asking for results or schedule — it would destroy correct answers.
-          const isLiveScoreQuery = /\blive\b|\blive score\b|\bscore now\b/i.test(rawUserMessage) && !/\bwho won\b|\bresult\b|\bwinner\b|\blast race\b|\blast match\b/i.test(rawUserMessage);
-          trustedGroundedReply = isLiveScoreQuery
-            ? normalizeNoLiveIplResponse(groundedAnswer, rawUserMessage) + sourceBlock
-            : (groundedAnswer || '') + sourceBlock;
-          console.log(`[DYNAMIC SPORTS RESPONSE] ${/\bipl|cricket|match|score\b/i.test(rawUserMessage) ? "enabled" : "not_applicable"}`);
-          realtimeSearchFailed = false;
-        } else if (isRealtimeQuery) {
+      if (bmPrimaryAnswer) {
+        trustedGroundedReply = bmPrimaryAnswer;
+        realtimeSearchFailed = false;
+      } else {
+        // ── FALLBACK: existing grounding chain ──────────────────────────────
+        if (bmKey && bmKey.length > 5) {
+          console.log("[GROUNDING_FALLBACK] gemini-3.5-flash failed — using existing fallback chain");
+        }
+        const groundingInput = rawUserMessage;
+        console.log("[FINAL GROUNDING INPUT]", groundingInput);
+        const grounded = await performRealtimeGrounding(groundingInput, config, requestId);
+        console.log("[GROUNDING SEARCHES]", grounded?.search_queries || []);
+        if (grounded) {
+          const srcText = grounded.sources.map((s) => typeof s === "string" ? s : (s?.url || s?.domain || JSON.stringify(s))).slice(0, 5).join(", ");
+          searchContext =
+            '[VERIFIED REALTIME FACTS]\n' +
+            `Type: ${grounded.query_type}\n` +
+            `Subject: ${grounded.subject}\n` +
+            `Answer: ${grounded.answer}\n` +
+            `Timestamp: ${grounded.timestamp}\n` +
+            `Confidence: ${grounded.confidence}\n` +
+            `Sources: ${srcText}\n` +
+            '[END VERIFIED FACTS]\n\n' +
+            'STRICT RULES:\n' +
+            '1. Rephrase only. Do not add new facts.\n' +
+            '2. Do not infer missing scores/winners/dates/weather/news details.\n' +
+            '3. If asked beyond facts above, say you could not verify more right now.';
+
+          const groundedAnswer = String(grounded.answer || "").trim();
+          const groundingSuccess = grounded.grounding_success === true;
+          const responseValid = grounded.response_valid === true || grounded.verified === true;
+          const noExplicitHallucination = !/\b(i (might|may) be wrong|not sure|cannot verify|can't verify|unverified|guess)\b/i.test(groundedAnswer);
+          const groundedResponseTrusted = groundingSuccess && responseValid && groundedAnswer.length > 0 && noExplicitHallucination;
+          console.log(`[grounding] grounding_success=${groundingSuccess}`);
+          console.log(`[grounding] response_valid=${responseValid}`);
+          console.log(`[grounding] no_explicit_hallucination=${noExplicitHallucination}`);
+          console.log(`[grounding] grounded_response_trusted=${groundedResponseTrusted}`);
+          if (groundedResponseTrusted) {
+            const cleanSources = (grounded.sources || []).filter(Boolean).slice(0, 4);
+            const sourceBlock = cleanSources.length
+              ? `\n\nSources:\n${cleanSources.map((s, i) => `${i + 1}. ${s}`).join("\n")}`
+              : "";
+            const isLiveScoreQuery = /\blive\b|\blive score\b|\bscore now\b/i.test(rawUserMessage) && !/\bwho won\b|\bresult\b|\bwinner\b|\blast race\b|\blast match\b/i.test(rawUserMessage);
+            trustedGroundedReply = isLiveScoreQuery
+              ? normalizeNoLiveIplResponse(groundedAnswer, rawUserMessage) + sourceBlock
+              : (groundedAnswer || '') + sourceBlock;
+            console.log(`[DYNAMIC SPORTS RESPONSE] ${/\bipl|cricket|match|score\b/i.test(rawUserMessage) ? "enabled" : "not_applicable"}`);
+            realtimeSearchFailed = false;
+          } else if (isRealtimeQuery) {
+            realtimeSearchFailed = true;
+          }
+        }
+        const results = grounded ? "" : await performWebSearch(rawUserMessage, config, isDeep);
+        const hasResults = results && results.trim().length > 30;
+
+        if (!grounded && isRealtimeQuery) {
           realtimeSearchFailed = true;
         }
-      }
-      const results = grounded ? "" : await performWebSearch(rawUserMessage, config, isDeep);
-      const hasResults = results && results.trim().length > 30;
-      if (!grounded && isRealtimeQuery) {
-        realtimeSearchFailed = true;
-      }
-      const isVerifiedSports  = hasResults && results.startsWith('[VERIFIED:sports_result]');
+        const isVerifiedSports  = hasResults && results.startsWith('[VERIFIED:sports_result]');
       const isVerifiedWeather = hasResults && results.startsWith('[VERIFIED:weather]');
       const isVerifiedUpcoming = hasResults && results.startsWith('[VERIFIED:sports_upcoming]');
 
@@ -2767,6 +2856,7 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
           'Suggest where to check (Cricbuzz, ESPN, Google). Tone: "Couldn\'t grab the live score rn — Cricbuzz will have it though."',
         ].join('\n');
       }
+      } // end fallback chain
     }
   }
   let modelNudge = "";
