@@ -2868,6 +2868,21 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
       } // end fallback chain
     }
   }
+
+  // ── Primary grounding produced a complete answer — return it directly ──────
+  // Skip all AI providers; the grounded answer is already verified and final.
+  if (trustedGroundedReply) {
+    if (memoryKey && config.conversationMemory === 1) {
+      db.prepare(
+        "INSERT INTO conversations (chatId, role, content, timestamp) VALUES (?, ?, ?, ?)"
+      ).run(memoryKey, "user", prompt, Date.now());
+      db.prepare(
+        "INSERT INTO conversations (chatId, role, content, timestamp) VALUES (?, ?, ?, ?)"
+      ).run(memoryKey, "model", trustedGroundedReply, Date.now());
+    }
+    return trustedGroundedReply;
+  }
+
   let modelNudge = "";
   if (config.activeModel?.includes("gpt-4") || config.activeModel?.includes("gpt4")) {
     modelNudge = "\nPrioritise depth and nuance. Reason through complex questions carefully before answering.";
