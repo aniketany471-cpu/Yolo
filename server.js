@@ -2692,9 +2692,13 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
   } else {
     // Gate 1: never search casual/short messages — saves API quota and avoids false triggers
     const promptTrimmed = prompt.trim();
+    // Exempt short messages that contain known realtime/search keywords — these must always be grounded
+    const isKnownSearchQuery = /\b(f1|formula.?1|grand prix|race|cricket|ipl|t20|odi|football|soccer|nba|nfl|ufc|match|score|scores|result|results|standings|winner|podium|weather|temperature|forecast|price|bitcoin|btc|eth|crypto|stock|nifty|sensex|news|today|tonight|latest|current|breaking|live|who won|next race|next match|election|launch)\b/i.test(promptTrimmed);
     const isCasualMessage =
-      promptTrimmed.length < 15 ||
-      /^(hi|hey|hello|yo|sup|hii|hlo|hl|ok|okay|k|lol|haha|hehe|😂|😊|👍|thanks|thank you|thx|ty|sure|nice|cool|great|good|wow|oh|hmm|yes|no|nope|yep|yup|bye|later|brb|np|fine|got it|noted|understood|same|lmao|omg|wtf|bro|dude|😅|🙏|❤️|🔥)s*[!?.,😂😊👍🙏❤️🔥]*$/i.test(promptTrimmed);
+      !isKnownSearchQuery && (
+        promptTrimmed.length < 15 ||
+        /^(hi|hey|hello|yo|sup|hii|hlo|hl|ok|okay|k|lol|haha|hehe|😂|😊|👍|thanks|thank you|thx|ty|sure|nice|cool|great|good|wow|oh|hmm|yes|no|nope|yep|yup|bye|later|brb|np|fine|got it|noted|understood|same|lmao|omg|wtf|bro|dude|😅|🙏|❤️|🔥)s*[!?.,😂😊👍🙏❤️🔥]*$/i.test(promptTrimmed)
+      );
 
     let shouldSearch = isDeep && !isCasualMessage;
 
