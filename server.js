@@ -114,17 +114,42 @@ function getFfmpegVersion(binary = detectFfmpegPath()) {
   return match ? match[1] : line;
 }
 
-function downloadYtdlpBinary(targetPath) {
-  const targetDir = path.dirname(targetPath);
-  fs.ensureDirSync(targetDir);
-  console.log(`[ytdlp] Installing official standalone binary: ${YTDLP_DOWNLOAD_URL} -> ${targetPath}`);
-  execSync(
-    `curl --retry 3 --retry-delay 2 -fL -A ${shellQuote("SkyeBot/yt-dlp-installer")} ${shellQuote(YTDLP_DOWNLOAD_URL)} -o ${shellQuote(targetPath)} && chmod +x ${shellQuote(targetPath)}`,
-    { stdio: "pipe", timeout: 120000 }
-  );
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function installYtdlpIfMissing() {
+async function downloadYtdlpBinary(targetPath) {
+  const targetDir = path.dirname(targetPath);
+  const tmpPath = `${targetPath}.download`;
+  await fs.ensureDir(targetDir);
+  console.log(`[ytdlp] Installing official standalone binary: ${YTDLP_DOWNLOAD_URL} -> ${targetPath}`);
+
+  let lastError = null;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const response = await fetch(YTDLP_DOWNLOAD_URL, {
+        headers: { "User-Agent": "SkyeBot/yt-dlp-installer" },
+      });
+      if (!response.ok) throw new Error(`download failed with HTTP ${response.status}`);
+
+      const buffer = Buffer.from(await response.arrayBuffer());
+      if (!buffer.length) throw new Error("downloaded yt-dlp binary is empty");
+
+      await fs.writeFile(tmpPath, buffer, { mode: 0o755 });
+      await fs.chmod(tmpPath, 0o755);
+      await fs.move(tmpPath, targetPath, { overwrite: true });
+      return;
+    } catch (e) {
+      lastError = e;
+      await fs.remove(tmpPath).catch(() => {});
+      if (attempt < 3) await wait(2000);
+    }
+  }
+
+  throw lastError || new Error("yt-dlp download failed");
+}
+
+async function installYtdlpIfMissing() {
   const existing = resolveExecutablePath(YTDLP_BIN, YTDLP_INSTALL_PATHS);
   if (existing) {
     YTDLP_BIN = existing;
@@ -134,7 +159,7 @@ function installYtdlpIfMissing() {
   let lastError = null;
   for (const targetPath of YTDLP_INSTALL_PATHS) {
     try {
-      downloadYtdlpBinary(targetPath);
+      await downloadYtdlpBinary(targetPath);
       const installed = resolveExecutablePath(targetPath);
       if (!installed) throw new Error(`installed file not found at ${targetPath}`);
       const version = getYtdlpVersion(installed);
@@ -149,8 +174,8 @@ function installYtdlpIfMissing() {
   throw lastError || new Error("yt-dlp is missing and automatic installation failed");
 }
 
-function verifyVideoDownloaderRuntime({ installIfMissing = true } = {}) {
-  const ytdlpPath = installIfMissing ? installYtdlpIfMissing() : resolveExecutablePath(YTDLP_BIN, YTDLP_INSTALL_PATHS);
+async function verifyVideoDownloaderRuntime({ installIfMissing = true } = {}) {
+  const ytdlpPath = installIfMissing ? await installYtdlpIfMissing() : resolveExecutablePath(YTDLP_BIN, YTDLP_INSTALL_PATHS);
   if (!ytdlpPath) throw new Error("yt-dlp binary is missing");
   YTDLP_BIN = ytdlpPath;
   const ytdlpVersion = getYtdlpVersion(YTDLP_BIN);
@@ -180,7 +205,7 @@ function getVideoDownloaderRuntimeStatus() {
     ytdlp: { ...ytdlpStartupStatus },
     ffmpeg: { ...ffmpegStartupStatus },
     installation: {
-      method: "official standalone binary downloaded with curl from GitHub releases when PATH lookup fails",
+      method: "official standalone binary downloaded with Node fetch from GitHub releases when PATH lookup fails",
       url: YTDLP_DOWNLOAD_URL,
       targets: YTDLP_INSTALL_PATHS,
     },
@@ -282,7 +307,7 @@ try {
 // installed and verified, stop booting so downloader initialization cannot run
 // with a missing binary and later fail with spawn ENOENT.
 try {
-  verifyVideoDownloaderRuntime({ installIfMissing: true });
+  await verifyVideoDownloaderRuntime({ installIfMissing: true });
 } catch (e) {
   ytdlpStartupStatus = { found: false, path: YTDLP_BIN, version: null, error: e?.message || String(e) };
   console.error(`[YT_DLP_FOUND] false`);
@@ -910,7 +935,7 @@ async function maybeHandleVideoDownloader({ client, message, config }) {
   const status = new SmartStatus(client, message.chatId, false, message.id);
   let workDir = null;
   try {
-    verifyVideoDownloaderRuntime({ installIfMissing: true });
+    await verifyVideoDownloaderRuntime({ installIfMissing: true });
     await status.update(VIDEO_DOWNLOADER_MESSAGES.downloading, { parseMode: undefined });
     const limits = getVideoDownloaderLimits(config);
     const result = await downloadVideoWithYtDlp({
@@ -4174,7 +4199,7 @@ async function startServer() {
   });
   app.get("/api/youtubedl/check", async (req, res) => {
     try {
-      verifyVideoDownloaderRuntime({ installIfMissing: false });
+      await verifyVideoDownloaderRuntime({ installIfMissing: false });
     } catch (e) {
       ytdlpStartupStatus = { found: false, path: YTDLP_BIN, version: null, error: e?.message || String(e) };
     }
@@ -4194,9 +4219,9 @@ async function startServer() {
   app.post("/api/youtubedl/update", async (req, res) => {
     try {
       const before = ytdlpStartupStatus.version || null;
-      downloadYtdlpBinary(YTDLP_INSTALL_PATHS[0]);
+      await downloadYtdlpBinary(YTDLP_INSTALL_PATHS[0]);
       YTDLP_BIN = resolveExecutablePath(YTDLP_INSTALL_PATHS[0]) || YTDLP_INSTALL_PATHS[0];
-      verifyVideoDownloaderRuntime({ installIfMissing: false });
+      await verifyVideoDownloaderRuntime({ installIfMissing: false });
       const after = ytdlpStartupStatus.version;
       const updated = after !== before;
       addLog(`yt-dlp ${updated ? `updated ${before || "unknown"} → ${after}` : `already up-to-date (${after})`} at ${YTDLP_BIN}`, "success");
@@ -5681,7 +5706,7 @@ _Visit the dashboard for advanced configuration._`;
                 textRaw,
                 async (status) => {
                   try {
-                    verifyVideoDownloaderRuntime({ installIfMissing: true });
+                    await verifyVideoDownloaderRuntime({ installIfMissing: true });
                     await status.finish(formatVideoDownloaderTestMessage(), { parseMode: "markdown", replyTo: message.id });
                   } catch (e) {
                     await status.finish(`${formatVideoDownloaderTestMessage()}\n\nerror: ${e?.message || e}`, { parseMode: "markdown", replyTo: message.id });
