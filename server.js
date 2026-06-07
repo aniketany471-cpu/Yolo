@@ -59,18 +59,150 @@ try {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 // ── Standalone yt-dlp binary (downloaded at startup, no Python needed) ───────
-// Prefer /usr/local/bin/yt-dlp (installed by Railway build command) over app-dir copy
-  const YTDLP_BIN = (() => {
-    const candidates = [
-      "/usr/local/bin/yt-dlp",
-      "/usr/bin/yt-dlp",
-      path.join(__dirname, "yt-dlp"),
-    ];
-    for (const p of candidates) {
-      try { if (fs.existsSync(p)) return p; } catch {}
+// Prefer the system PATH command installed by the Railway/Nixpacks build. If it
+// is missing at runtime, install the official standalone binary into a writable
+// PATH directory before any downloader flow is allowed to run.
+const YTDLP_DOWNLOAD_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp";
+const YTDLP_INSTALL_PATHS = [
+  process.env.YTDLP_INSTALL_PATH,
+  "/usr/local/bin/yt-dlp",
+  path.join(__dirname, ".bin", "yt-dlp"),
+].filter(Boolean);
+let YTDLP_BIN = process.env.YTDLP_PATH || process.env.YTDL_PATH || "yt-dlp";
+let ytdlpStartupStatus = { found: false, path: null, version: null, error: null };
+let ffmpegStartupStatus = { found: false, path: null, version: null, error: null };
+
+function shellQuote(value) {
+  return "'" + String(value).replace(/'/g, "'\\''") + "'";
+}
+
+function commandPath(command) {
+  try {
+    return execSync(`command -v ${shellQuote(command)}`, { stdio: "pipe", timeout: 5000 }).toString().trim() || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function resolveExecutablePath(command, fallbackPaths = []) {
+  if (!command) return null;
+  if (command.includes(path.sep)) {
+    try { if (fs.existsSync(command)) return command; } catch (_) {}
+  } else {
+    const resolved = commandPath(command);
+    if (resolved) return resolved;
+  }
+  for (const candidate of fallbackPaths.filter(Boolean)) {
+    try { if (fs.existsSync(candidate)) return candidate; } catch (_) {}
+  }
+  return null;
+}
+
+function getFirstOutputLine(cmd, args = [], timeout = 8000) {
+  const out = execSync([shellQuote(cmd), ...args.map(shellQuote)].join(" "), { stdio: "pipe", timeout }).toString().trim();
+  return out.split(/\r?\n/)[0]?.trim() || out;
+}
+
+function getYtdlpVersion(binary = YTDLP_BIN) {
+  return getFirstOutputLine(binary, ["--version"], 10000);
+}
+
+function getFfmpegVersion(binary = detectFfmpegPath()) {
+  if (!binary) return null;
+  const line = getFirstOutputLine(binary, ["-version"], 5000);
+  const match = line.match(/ffmpeg version ([^\s]+)/i);
+  return match ? match[1] : line;
+}
+
+function downloadYtdlpBinary(targetPath) {
+  const targetDir = path.dirname(targetPath);
+  fs.ensureDirSync(targetDir);
+  console.log(`[ytdlp] Installing official standalone binary: ${YTDLP_DOWNLOAD_URL} -> ${targetPath}`);
+  execSync(
+    `curl --retry 3 --retry-delay 2 -fL -A ${shellQuote("SkyeBot/yt-dlp-installer")} ${shellQuote(YTDLP_DOWNLOAD_URL)} -o ${shellQuote(targetPath)} && chmod +x ${shellQuote(targetPath)}`,
+    { stdio: "pipe", timeout: 120000 }
+  );
+}
+
+function installYtdlpIfMissing() {
+  const existing = resolveExecutablePath(YTDLP_BIN, YTDLP_INSTALL_PATHS);
+  if (existing) {
+    YTDLP_BIN = existing;
+    return existing;
+  }
+
+  let lastError = null;
+  for (const targetPath of YTDLP_INSTALL_PATHS) {
+    try {
+      downloadYtdlpBinary(targetPath);
+      const installed = resolveExecutablePath(targetPath);
+      if (!installed) throw new Error(`installed file not found at ${targetPath}`);
+      const version = getYtdlpVersion(installed);
+      YTDLP_BIN = installed;
+      console.log(`[ytdlp] Automatic install verified: ${installed} (${version})`);
+      return installed;
+    } catch (e) {
+      lastError = e;
+      console.warn(`[ytdlp] Install target failed (${targetPath}): ${e?.message || e}`);
     }
-    return path.join(__dirname, "yt-dlp"); // fallback (will be downloaded at startup)
-  })();
+  }
+  throw lastError || new Error("yt-dlp is missing and automatic installation failed");
+}
+
+function verifyVideoDownloaderRuntime({ installIfMissing = true } = {}) {
+  const ytdlpPath = installIfMissing ? installYtdlpIfMissing() : resolveExecutablePath(YTDLP_BIN, YTDLP_INSTALL_PATHS);
+  if (!ytdlpPath) throw new Error("yt-dlp binary is missing");
+  YTDLP_BIN = ytdlpPath;
+  const ytdlpVersion = getYtdlpVersion(YTDLP_BIN);
+  ytdlpStartupStatus = { found: true, path: YTDLP_BIN, version: ytdlpVersion, error: null };
+
+  const ffmpegPath = detectFfmpegPath();
+  const ffmpegVersion = getFfmpegVersion(ffmpegPath);
+  ffmpegStartupStatus = {
+    found: !!ffmpegPath,
+    path: ffmpegPath,
+    version: ffmpegVersion,
+    error: ffmpegPath ? null : "ffmpeg binary is missing",
+  };
+
+  console.log(`[YT_DLP_FOUND] ${ytdlpStartupStatus.found}`);
+  console.log(`[YT_DLP_VERSION] ${ytdlpStartupStatus.version}`);
+  console.log(`[YT_DLP_PATH] ${ytdlpStartupStatus.path}`);
+  console.log(`[FFMPEG_FOUND] ${ffmpegStartupStatus.found}`);
+  if (ffmpegStartupStatus.version) console.log(`[FFMPEG_VERSION] ${ffmpegStartupStatus.version}`);
+  if (ffmpegStartupStatus.path) console.log(`[FFMPEG_PATH] ${ffmpegStartupStatus.path}`);
+
+  return getVideoDownloaderRuntimeStatus();
+}
+
+function getVideoDownloaderRuntimeStatus() {
+  return {
+    ytdlp: { ...ytdlpStartupStatus },
+    ffmpeg: { ...ffmpegStartupStatus },
+    installation: {
+      method: "official standalone binary downloaded with curl from GitHub releases when PATH lookup fails",
+      url: YTDLP_DOWNLOAD_URL,
+      targets: YTDLP_INSTALL_PATHS,
+    },
+  };
+}
+
+function formatVideoDownloaderTestMessage() {
+  const status = getVideoDownloaderRuntimeStatus();
+  return [
+    "**Downloader runtime test**",
+    "",
+    `yt-dlp status: ${status.ytdlp.found ? "found" : "missing"}`,
+    `yt-dlp version: ${status.ytdlp.version || "not available"}`,
+    `yt-dlp path: ${status.ytdlp.path || YTDLP_BIN || "not available"}`,
+    "",
+    `ffmpeg status: ${status.ffmpeg.found ? "found" : "missing"}`,
+    `ffmpeg version: ${status.ffmpeg.version || "not available"}`,
+    `ffmpeg path: ${status.ffmpeg.path || "not available"}`,
+    "",
+    `install method: ${status.installation.method}`,
+  ].join("\n");
+}
 function buildYtdlpArgs(url, opts) {
   const args = [];
   if (opts.extractAudio) args.push("--extract-audio");
@@ -101,13 +233,6 @@ function runYtdlpDirect(url, opts) {
     });
     proc.on("error", (err) => reject(new Error(`yt-dlp spawn error: ${err.message}`)));
   });
-}
-function downloadYtdlpBinary() {
-  console.log("[ytdlp] Downloading standalone yt-dlp binary...");
-  execSync(
-    `curl -fsSL "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp" -o "${YTDLP_BIN}" && chmod +x "${YTDLP_BIN}"`,
-    { stdio: "pipe", timeout: 60000 }
-  );
 }
 const exportsDir = path.join(__dirname, "exports");
 fs.ensureDirSync(exportsDir);
@@ -153,6 +278,18 @@ try {
 } catch (e) {
   console.warn("[cookies] Could not write hardcoded cookies:", e?.message);
 }
+// Verify/download downloader dependencies once at startup. If yt-dlp cannot be
+// installed and verified, stop booting so downloader initialization cannot run
+// with a missing binary and later fail with spawn ENOENT.
+try {
+  verifyVideoDownloaderRuntime({ installIfMissing: true });
+} catch (e) {
+  ytdlpStartupStatus = { found: false, path: YTDLP_BIN, version: null, error: e?.message || String(e) };
+  console.error(`[YT_DLP_FOUND] false`);
+  console.error(`[ytdlp] Startup verification failed: ${e?.message || e}`);
+  process.exit(1);
+}
+
 const upload = multer({ dest: tempDir });
 process.on("uncaughtException", (err) => {
   console.error("UNCAUGHT: " + err.stack);
@@ -714,12 +851,17 @@ function getTTSRuntimeConfig(config = {}) {
 
 
 function detectFfmpegPath() {
+  const envPath = process.env.FFMPEG_PATH;
+  if (envPath) {
+    try { if (fs.existsSync(envPath)) return envPath; } catch (_) {}
+  }
+  const pathFfmpeg = commandPath("ffmpeg");
+  if (pathFfmpeg) return pathFfmpeg;
   const candidates = [
-    process.env.FFMPEG_PATH,
     "/usr/local/bin/ffmpeg",
     "/usr/bin/ffmpeg",
     "/bin/ffmpeg",
-  ].filter(Boolean);
+  ];
   for (const p of candidates) {
     try { if (fs.existsSync(p)) return p; } catch (_) {}
   }
@@ -768,6 +910,7 @@ async function maybeHandleVideoDownloader({ client, message, config }) {
   const status = new SmartStatus(client, message.chatId, false, message.id);
   let workDir = null;
   try {
+    verifyVideoDownloaderRuntime({ installIfMissing: true });
     await status.update(VIDEO_DOWNLOADER_MESSAGES.downloading, { parseMode: undefined });
     const limits = getVideoDownloaderLimits(config);
     const result = await downloadVideoWithYtDlp({
@@ -3257,7 +3400,7 @@ class PermissionManager {
     // These commands are always open to everyone — no toggle can block them
     // nsfw/confirmage MUST be here so DM users can always enable/disable mature mode
     // regardless of the global publicCommandsEnabled setting.
-    const alwaysPublicCommands = ["ans", "music", "song", "pdf", "stcr", "nsfw", "confirmage"];
+    const alwaysPublicCommands = ["ans", "music", "song", "pdf", "stcr", "dltest", "nsfw", "confirmage"];
     const publicCommands = [
       "ans",
       "music",
@@ -3268,6 +3411,7 @@ class PermissionManager {
       "pdf",
       "summarize",
       "translate",
+      "dltest",
       "ping",
       "commands",
       "help",
@@ -4029,34 +4173,34 @@ async function startServer() {
     res.json({ success: true });
   });
   app.get("/api/youtubedl/check", async (req, res) => {
-    const info = { ytdlp: null, ffmpeg: null, cookiesFile: false };
     try {
-      info.ytdlp = fs.existsSync(YTDLP_BIN)
-        ? execSync(`"${YTDLP_BIN}" --version`, { stdio: "pipe", timeout: 8000 }).toString().trim()
-        : "not found";
-    } catch { info.ytdlp = "not found"; }
-    try {
-      const ffver = execSync("ffmpeg -version 2>&1", { timeout: 5000 }).toString();
-      const match = ffver.match(/ffmpeg version ([^\s]+)/);
-      info.ffmpeg = match ? match[1] : "found";
-    } catch {
-      info.ffmpeg = "not found";
+      verifyVideoDownloaderRuntime({ installIfMissing: false });
+    } catch (e) {
+      ytdlpStartupStatus = { found: false, path: YTDLP_BIN, version: null, error: e?.message || String(e) };
     }
-    info.cookiesFile = fs.existsSync(youtubeCookiesPath);
-    const ok = info.ytdlp !== "not found" && info.ytdlp !== null;
-    res.status(ok ? 200 : 500).json({ ok, ...info });
+    const runtime = getVideoDownloaderRuntimeStatus();
+    const ok = runtime.ytdlp.found;
+    res.status(ok ? 200 : 500).json({
+      ok,
+      ytdlp: runtime.ytdlp.version || "not found",
+      ytdlpPath: runtime.ytdlp.path,
+      ffmpeg: runtime.ffmpeg.version || (runtime.ffmpeg.found ? "found" : "not found"),
+      ffmpegPath: runtime.ffmpeg.path,
+      cookiesFile: fs.existsSync(youtubeCookiesPath),
+      runtime,
+    });
   });
 
   app.post("/api/youtubedl/update", async (req, res) => {
     try {
-      const before = fs.existsSync(YTDLP_BIN)
-        ? execSync(`"${YTDLP_BIN}" --version`, { stdio: "pipe", timeout: 8000 }).toString().trim()
-        : "not found";
-      downloadYtdlpBinary();
-      const after = execSync(`"${YTDLP_BIN}" --version`, { stdio: "pipe", timeout: 8000 }).toString().trim();
+      const before = ytdlpStartupStatus.version || null;
+      downloadYtdlpBinary(YTDLP_INSTALL_PATHS[0]);
+      YTDLP_BIN = resolveExecutablePath(YTDLP_INSTALL_PATHS[0]) || YTDLP_INSTALL_PATHS[0];
+      verifyVideoDownloaderRuntime({ installIfMissing: false });
+      const after = ytdlpStartupStatus.version;
       const updated = after !== before;
-      addLog(`yt-dlp ${updated ? `updated ${before} → ${after}` : `already up-to-date (${after})`}`, "success");
-      res.json({ ok: true, before, after, updated });
+      addLog(`yt-dlp ${updated ? `updated ${before || "unknown"} → ${after}` : `already up-to-date (${after})`} at ${YTDLP_BIN}`, "success");
+      res.json({ ok: true, before, after, updated, path: YTDLP_BIN });
     } catch (e) {
       res.status(500).json({ ok: false, error: e?.message });
     }
@@ -4113,34 +4257,6 @@ async function startServer() {
   let lastConnectFailTime = 0;
   let authDupRetries = 0;
   let retryTimer = null;
-  // ─── yt-dlp standalone binary — download/verify at startup ───────────────
-  // We bypass youtube-dl-exec's bundled binary entirely (it requires Python 3).
-  // Instead we download the official standalone Linux binary once and keep it
-  // inside the project directory so it persists across Railway restarts.
-  (async () => {
-    try {
-      let needsDownload = !fs.existsSync(YTDLP_BIN);
-      if (!needsDownload) {
-        // Verify it actually runs (not a broken/wrong-arch file)
-        try {
-          execSync(`"${YTDLP_BIN}" --version`, { stdio: "pipe", timeout: 10000 });
-          const ver = execSync(`"${YTDLP_BIN}" --version`, { stdio: "pipe", timeout: 10000 }).toString().trim();
-          console.log(`[ytdlp] Standalone binary OK: ${ver}`);
-          // Self-update
-          try { execSync(`"${YTDLP_BIN}" -U`, { stdio: "pipe", timeout: 30000 }); } catch {}
-          return;
-        } catch {
-          needsDownload = true;
-        }
-      }
-      downloadYtdlpBinary();
-      const ver = execSync(`"${YTDLP_BIN}" --version`, { stdio: "pipe", timeout: 10000 }).toString().trim();
-      console.log(`[ytdlp] Binary ready: ${ver}`);
-    } catch (e) {
-      console.warn(`[ytdlp] Startup binary setup failed: ${e?.message}`);
-    }
-  })();
-
   /**
    * Download a YouTube video as MP3 audio using yt-dlp.
    *
@@ -5448,6 +5564,7 @@ async function startServer() {
             "pdf",
             "summarize",
             "translate",
+            "dltest",
             "help",
             "commands",
             "info"
@@ -5489,6 +5606,7 @@ async function startServer() {
 **Public Commands** \u{1F464}
 \u2022 \`/ans\` - Reply to get AI answer
 \u2022 \`/music\` - Search & download song
+\u2022 \`/dltest\` - Check yt-dlp/ffmpeg runtime
 \u2022 \`/gif <query>\` - Search & send GIF
 \u2022 \`/sticker\` - Reply to photo for sticker
 \u2022 \`/pdf\` - Reply to text for PDF
@@ -5549,6 +5667,25 @@ _Visit the dashboard for advanced configuration._`;
                       await status.fail("AI failed to respond.");
                     }
                   });
+                }
+              );
+              return;
+            }
+            if (text === "/dltest" || text === ".dltest") {
+              await CommandProcessor.process(
+                client,
+                message,
+                config2,
+                myId,
+                "dltest",
+                textRaw,
+                async (status) => {
+                  try {
+                    verifyVideoDownloaderRuntime({ installIfMissing: true });
+                    await status.finish(formatVideoDownloaderTestMessage(), { parseMode: "markdown", replyTo: message.id });
+                  } catch (e) {
+                    await status.finish(`${formatVideoDownloaderTestMessage()}\n\nerror: ${e?.message || e}`, { parseMode: "markdown", replyTo: message.id });
+                  }
                 }
               );
               return;
