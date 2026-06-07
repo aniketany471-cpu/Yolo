@@ -2702,7 +2702,7 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
 
     const hasNewsKeyword = /\b(breaking news|latest news|just in|top news|headlines|today news|current news|live news|reportedly|sources say|election result|election 2024|election 2025|election 2026|exit poll|verdict|judgment|acquitted|convicted|sentenced|arrested|detained|jailbreak|terror attack|terrorist|explosion|blast|bombing|shooting|gunfire|plane crash|train crash|car crash|earthquake|natural disaster|eruption|volcano|landslide|tsunami|product launch|unveiled|prime minister|vice president|cabinet|parliament|congress|senate|government policy|legislation|economy|gdp|inflation|deflation|rate cut|rate hike|rbi|sebi|federal reserve|ecb|imf|world bank|modi|trump|biden|harris|putin|zelensky|zelenskyy|nato|united nations|g20|g7|brics|bilateral|ceasefire|peace talks|invasion|offensive|airstrike|drone strike|military operation|trade war|sanctions|embargo|tariff|protest|riot|demonstration|coup|emergency|lockdown|curfew|merger|acquisition|takeover|buyout|ipo|stock market|sensex|nifty|dow jones|nasdaq|s&p 500|bitcoin|btc|ethereum|eth|crypto)\b/i.test(msgLower);
 
-    const hasUrl = /https?:\/\/\S+|www\.\S+\.\S+/i.test(rawUserMessage);
+    const hasUrl = /https?:\/\/\S+|www\.\S+\.\S+|\b(bit\.ly|tinyurl\.com|t\.co|goo\.gl|ow\.ly|youtu\.be|rb\.gy|cutt\.ly|short\.io|tiny\.cc|is\.gd|buff\.ly|dlvr\.it|ift\.tt|wp\.me|fb\.me|lnkd\.in|amzn\.to|adf\.ly|clck\.ru|shorturl\.at|t\.me|telegram\.me)\/\S+/i.test(rawUserMessage);
 
     let shouldSearch = hasSportsKeyword || hasWeatherKeyword || hasNewsKeyword || hasUrl;
 
