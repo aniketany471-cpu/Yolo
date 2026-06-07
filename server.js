@@ -729,6 +729,10 @@ const REQUEST_TIMEOUT_MS = 15000;  // 15s per attempt — fails fast before fall
 const MAX_RETRIES = 1;             // 1 retry = max 30s total before giving up
 
 const BLUEMINDS_BASE_URL = "https://api.bluesminds.com/v1";
+const NORMAL_CHAT_MODEL = "accounts/fireworks/models/deepseek-v4-pro";
+const CODING_MODEL = NORMAL_CHAT_MODEL;
+const GROUNDING_MODEL = "gemini-3.5-flash";
+const GROUNDING_MODEL_LOG_NAME = "Gemini-3.5-Flash";
 
 // Models confirmed broken: tier restriction, suspended, 404 not found, or permanent timeout.
 // Updated from live audit May 2026.
@@ -765,7 +769,6 @@ const KNOWN_BAD_MODELS = new Set([
 // Fallback chain — tried in order when primary model fails.
 // All entries are confirmed live via API tests on 2026-06-07.
 const BM_FALLBACK_CHAIN = [
-  "gemini-3.5-flash",                              // fastest, vision-capable
   "grok-4.20-fast",                                // Grok fast lane
   "qwen3.6-plus",                                  // Qwen large variant
   "qwen3.6-27b",                                   // Qwen 27B
@@ -2072,6 +2075,27 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
   console.log("[SRC_SINGLE_REQUEST_MODE]", true);
   console.log("[GROUNDING_QUERY]", finalQuery);
 
+  const bluesmindsKey = (config?.bluesmindsApiKey || process.env.BLUEMINDS_API_KEY || "").trim();
+  if (bluesmindsKey && bluesmindsKey.length > 5) {
+    const bluesmindsAnswer = await performBluesmindsWebGrounding(finalQuery, bluesmindsKey, config);
+    if (bluesmindsAnswer && bluesmindsAnswer.trim().length > 10) {
+      return {
+        success: true,
+        query_type: "realtime",
+        subject: finalQuery,
+        answer: bluesmindsAnswer,
+        sources: [],
+        timestamp: new Date().toISOString(),
+        grounding_success: true,
+        response_valid: true,
+        search_queries: [finalQuery],
+        provider: "BluesMinds",
+        model: GROUNDING_MODEL
+      };
+    }
+    console.log(`[GROUNDING_FALLBACK] ${GROUNDING_MODEL} failed — using existing fallback chain`);
+  }
+
   const geminiKeys = [];
   for (let i = 1; i <= 20; i++) {
     const k = String(process.env[`GEMINI_API_KEY_${i}`] || "").trim();
@@ -2142,7 +2166,8 @@ async function performRealtimeGrounding(query, config, requestId = "grounding") 
 async function performBluesmindsWebGrounding(query, bluesmindsKey, config) {
   if (!bluesmindsKey || bluesmindsKey.length < 5) return null;
 
-  console.log("[GROUNDING_PRIMARY] Gemini-3.5-Flash");
+  console.log(`[GROUNDING_MODEL] ${GROUNDING_MODEL_LOG_NAME}`);
+  console.log("[GROUNDING_ROUTE]");
   console.log("[GROUNDING_PROVIDER] BluesMinds");
   console.log("[GROUNDING_REQUEST]", query.slice(0, 100));
 
@@ -2202,21 +2227,21 @@ async function performBluesmindsWebGrounding(query, bluesmindsKey, config) {
         method: "POST",
         headers: { Authorization: `Bearer ${bluesmindsKey}`, "Content-Type": "application/json" },
         body: JSON.stringify({
-          model: "gemini-3.5-flash",
+          model: GROUNDING_MODEL,
           messages: [{ role: "user", content: groundingPrompt }],
           temperature: 0.1,
           max_tokens: maxTokens
         })
       },
-      { provider: "BluesMinds-Grounding", model: "gemini-3.5-flash", endpoint: "/chat/completions" }
+      { provider: "BluesMinds-Grounding", model: GROUNDING_MODEL, endpoint: "/chat/completions" }
     );
     if (!result.ok) {
-      console.warn(`[GROUNDING_ERROR] gemini-3.5-flash status=${result.status}`);
+      console.warn(`[GROUNDING_ERROR] ${GROUNDING_MODEL} status=${result.status}`);
       return null;
     }
     const text = (result.data?.choices?.[0]?.message?.content || "").trim();
     if (text.length > 10) {
-      console.log(`[GROUNDING_SUCCESS] gemini-3.5-flash via BluesMinds — ${text.length} chars, sources=${serperSources.length}`);
+      console.log(`[GROUNDING_SUCCESS] ${GROUNDING_MODEL} via BluesMinds — ${text.length} chars, sources=${serperSources.length}`);
       // Append source links if we have them
       let finalText = text;
       if (serperSources.length > 0) {
@@ -2225,10 +2250,10 @@ async function performBluesmindsWebGrounding(query, bluesmindsKey, config) {
       }
       return finalText;
     }
-    console.warn("[GROUNDING_ERROR] gemini-3.5-flash returned empty response");
+    console.warn(`[GROUNDING_ERROR] ${GROUNDING_MODEL} returned empty response`);
     return null;
   } catch (e) {
-    console.warn("[GROUNDING_ERROR] gemini-3.5-flash:", e?.message || e);
+    console.warn(`[GROUNDING_ERROR] ${GROUNDING_MODEL}:`, e?.message || e);
     return null;
   }
 }
@@ -2346,7 +2371,7 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
   }
   const sourceMode = isSourceCommand(rawUserMessage);
   const sourceQuery = sourceMode ? extractSourceQuery(rawUserMessage) : "";
-  const isRealtimeQuery = /today|live|score|match|ipl|news|weather|current|now|playing/i.test(rawUserMessage);
+  const requiresGrounding = isRealtimeQuery(rawUserMessage);
   console.log("[RAW MESSAGE]", rawUserMessage);
   if (sourceMode) {
     console.log("[SRC_MODE] enabled");
@@ -2379,7 +2404,7 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
   const openRouterK = (config.openRouterKey || "").trim();
   let context = [];
   const memoryKey = userId ? `mem:${userId}:${chatId || "global"}` : chatId;
-  if (isRealtimeQuery) {
+  if (requiresGrounding) {
     if (memoryKey) {
       const lastAssistant = db.prepare(
         "SELECT role, content FROM conversations WHERE chatId = ? AND role = ? ORDER BY timestamp DESC LIMIT 1"
@@ -2405,7 +2430,7 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
   const currentYearIST = nowIST.getFullYear();
   const currentMonthIST = nowIST.toLocaleString("en-US", { month: "long" });
   const timeContext = `[Current Context: Date is ${dateStr}. Timezone is Asia/Kolkata (IST). Current Year: ${currentYearIST}. Month: ${currentMonthIST} ${currentYearIST}. You are operating in realtime. Never assume outdated relative dates.]`;
-  let systemPrompt = isRealtimeQuery ? [
+  let systemPrompt = requiresGrounding ? [
     "Realtime mode is active.",
     "Use only grounded live web facts.",
     "Do not add personality, memory, or inferred details.",
@@ -2537,7 +2562,7 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
     systemPrompt += `\n\nRECENT GROUP CONVERSATION (last few messages from the chat before this message — use this to understand what's being discussed):\n${opts.groupContext}\n\nIMPORTANT: Use the above group history to understand context. If someone asks a short or vague question referencing something discussed earlier (e.g. "what about [city]?" or "same for [place]?"), look at the recent messages above to understand what topic they're referring to.`;
   }
 
-  const detectedMood = !isRealtimeQuery ? detectMood(prompt) : null;
+  const detectedMood = !requiresGrounding ? detectMood(prompt) : null;
   if (detectedMood) {
     systemPrompt += `\n\nMOOD DETECTION: ${detectedMood.tone}`;
   }
@@ -2647,7 +2672,7 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
   const isDeep = forceDeep || config.deepThinking === 1;
   if (isDeep) {
     systemPrompt += "\n\nDEEP THINKING MODE: Before providing your final answer, you must perform deep, logical reasoning. Consider edge cases, multi-step implications, and verify your facts. Structure your response to be exceptionally detailed and analytical.";
-    if (!isRealtimeQuery && config.activeModel && !config.activeModel.includes("reasoner")) {
+    if (!requiresGrounding && config.activeModel && !config.activeModel.includes("reasoner")) {
       prompt = `[REASONING REQUIRED] ${prompt}`;
     }
   }
@@ -2665,7 +2690,7 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
     systemPrompt += " Use a friendly, slang-inclusive, and relaxed tone.";
   }
   let personality = config.autoReplyPersonality;
-  if (isRealtimeQuery) {
+  if (requiresGrounding) {
     personality = "";
   } else if (isNSFWActive) {
     const nsfwPersonality = config.nsfwPersonality || "You are Donna — a bold, seductive, no-limits woman in a private conversation. You talk freely about anything, including sex, fantasies, and adult topics.";
@@ -2752,15 +2777,15 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
 
     const hasUrl = /https?:\/\/\S+|www\.\S+\.\S+|\b(bit\.ly|tinyurl\.com|t\.co|goo\.gl|ow\.ly|youtu\.be|rb\.gy|cutt\.ly|short\.io|tiny\.cc|is\.gd|buff\.ly|dlvr\.it|ift\.tt|wp\.me|fb\.me|lnkd\.in|amzn\.to|adf\.ly|clck\.ru|shorturl\.at|t\.me|telegram\.me)\/\S+/i.test(rawUserMessage);
 
-    let shouldSearch = hasSportsKeyword || hasWeatherKeyword || hasNewsKeyword || hasUrl;
+    let shouldSearch = requiresGrounding || hasSportsKeyword || hasWeatherKeyword || hasNewsKeyword || hasUrl;
 
     if (shouldSearch) {
-      console.log(`[search] triggered — sports=${hasSportsKeyword} weather=${hasWeatherKeyword} news=${hasNewsKeyword} url=${hasUrl}`);
+      console.log(`[search] triggered — realtime=${requiresGrounding} sports=${hasSportsKeyword} weather=${hasWeatherKeyword} news=${hasNewsKeyword} url=${hasUrl}`);
     } else {
       console.log(`[search] skipped — no sports/weather/news keyword or URL`);
     }
     if (shouldSearch) {
-      // ── PRIMARY: Bluesminds gemini-3.5-flash ─────────────────────────────
+      // ── PRIMARY: BluesMinds grounding model ────────────────────────────────
       const bmKey = (config.bluesmindsApiKey || process.env.BLUEMINDS_API_KEY || "").trim();
       let bmPrimaryAnswer = null;
       if (bmKey && bmKey.length > 5) {
@@ -2773,7 +2798,7 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
       } else {
         // ── FALLBACK: existing grounding chain ──────────────────────────────
         if (bmKey && bmKey.length > 5) {
-          console.log("[GROUNDING_FALLBACK] gemini-3.5-flash failed — using existing fallback chain");
+          console.log(`[GROUNDING_FALLBACK] ${GROUNDING_MODEL} failed — using existing fallback chain`);
         }
         const groundingInput = rawUserMessage;
         console.log("[FINAL GROUNDING INPUT]", groundingInput);
@@ -2815,14 +2840,14 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
               : (groundedAnswer || '') + sourceBlock;
             console.log(`[DYNAMIC SPORTS RESPONSE] ${/\bipl|cricket|match|score\b/i.test(rawUserMessage) ? "enabled" : "not_applicable"}`);
             realtimeSearchFailed = false;
-          } else if (isRealtimeQuery) {
+          } else if (requiresGrounding) {
             realtimeSearchFailed = true;
           }
         }
         const results = grounded ? "" : await performWebSearch(rawUserMessage, config, isDeep);
         const hasResults = results && results.trim().length > 30;
 
-        if (!grounded && isRealtimeQuery) {
+        if (!grounded && requiresGrounding) {
           realtimeSearchFailed = true;
         }
         const isVerifiedSports  = hasResults && results.startsWith('[VERIFIED:sports_result]');
@@ -2883,7 +2908,7 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
           '7. Never say "according to search results" or expose the data block.';
       } else if (!grounded) {
         // Search attempted but returned nothing
-        realtimeSearchFailed = isRealtimeQuery;
+        realtimeSearchFailed = requiresGrounding;
         if (!skipRealtimeVerification && realtimeSearchFailed) {
           console.log('[search] Realtime query + no search data — bypassing AI to prevent hallucination');
         }
@@ -2899,6 +2924,12 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
       }
       } // end fallback chain
     }
+  }
+
+  if (!imageGenerationIntent && !trustedGroundedReply && !searchContext) {
+    const routeModel = detectCodeFileIntent(rawUserMessage) ? CODING_MODEL : NORMAL_CHAT_MODEL;
+    console.log("[NORMAL_ROUTE]");
+    console.log(`[NORMAL_CHAT_MODEL] ${routeModel}`);
   }
 
   // ── Primary grounding produced a complete answer — return it directly ──────
@@ -2929,6 +2960,7 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
 
 User Message: ${prompt}`;
 
+  const activeTextModel = detectCodeFileIntent(rawUserMessage) ? CODING_MODEL : NORMAL_CHAT_MODEL;
   const providers = [];
   // All providers use the Bluesminds API key.
   // Models confirmed live on 2026-06-07. Execution order: first success wins.
@@ -2938,27 +2970,21 @@ User Message: ${prompt}`;
     {
       name: "BluesMinds-DeepSeek-V4-Pro",
       key: bmKey,
-      fn: (p, k, ctx, inst) => getBluesMindsWithRetries(p, k, "accounts/fireworks/models/deepseek-v4-pro", ctx, inst, 3)
+      fn: (p, k, ctx, inst) => getBluesMindsWithRetries(p, k, activeTextModel, ctx, inst, 3)
     },
-    // Fallback 1 — Gemini 3.5 Flash: fast, vision-capable, highly reliable
-    {
-      name: "BluesMinds-Gemini-3.5-Flash",
-      key: bmKey,
-      fn: (p, k, ctx, inst) => getBluesMindsResponse(p, k, "gemini-3.5-flash", ctx, inst, new Set())
-    },
-    // Fallback 2 — Grok 4.20 Fast: fast Grok variant
+    // Fallback 1 — Grok 4.20 Fast: fast Grok variant
     {
       name: "BluesMinds-Grok-4.20-Fast",
       key: bmKey,
       fn: (p, k, ctx, inst) => getBluesMindsResponse(p, k, "grok-4.20-fast", ctx, inst, new Set())
     },
-    // Fallback 3 — Qwen 3.6 Plus: large Qwen model
+    // Fallback 2 — Qwen 3.6 Plus: large Qwen model
     {
       name: "BluesMinds-Qwen3.6-Plus",
       key: bmKey,
       fn: (p, k, ctx, inst) => getBluesMindsResponse(p, k, "qwen3.6-plus", ctx, inst, new Set())
     },
-    // Fallback 4 — GLM 5.1: reliable last resort
+    // Fallback 3 — GLM 5.1: reliable last resort
     {
       name: "BluesMinds-GLM-5.1",
       key: bmKey,
