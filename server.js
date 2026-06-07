@@ -21,6 +21,7 @@ import { getAccuWeather } from "./services/weather.js";
 import { buildLinkContext } from "./services/linkReader.js";
 import { fetchSportsContext } from "./services/sportsReader.js";
 import { DEFAULT_TTS_CONFIG, generateTTSFile } from "./services/tts.js";
+import { VIDEO_DOWNLOADER_MESSAGES, downloadVideoWithYtDlp, extractSupportedVideoUrl, extractUrls, hasDownloaderIntent } from "./services/videoDownloader.js";
 // Image service — loaded dynamically so a missing/broken module never crashes the bot
 let ziGenerateImage = null;
 let ziParseImageModelKeyword = null;
@@ -112,6 +113,8 @@ const exportsDir = path.join(__dirname, "exports");
 fs.ensureDirSync(exportsDir);
 const musicDir = path.join(exportsDir, "music");
 fs.ensureDirSync(musicDir);
+const videoDir = path.join(exportsDir, "videos");
+fs.ensureDirSync(videoDir);
 const tempDir = path.join(__dirname, "temp");
 fs.ensureDirSync(tempDir);
 const cookiesDir = path.join(__dirname, "cookies");
@@ -298,7 +301,9 @@ db.exec(`
     publicCommandsEnabled INTEGER DEFAULT 1,
     blacklistedUsers TEXT DEFAULT '',
     whitelistedUsers TEXT DEFAULT '',
-    tts TEXT DEFAULT '{"primaryProvider":"elevenlabs","model":"eleven_multilingual_v2"}'
+    tts TEXT DEFAULT '{"primaryProvider":"elevenlabs","model":"eleven_multilingual_v2"}',
+    videoDownloaderMaxMb INTEGER DEFAULT 50,
+    videoDownloaderTimeoutSeconds INTEGER DEFAULT 180
   );
 
   CREATE TABLE IF NOT EXISTS group_settings (
@@ -557,6 +562,14 @@ try {
   db.exec(`ALTER TABLE config ADD COLUMN tts TEXT DEFAULT '{"primaryProvider":"elevenlabs","model":"eleven_multilingual_v2"}';`);
 } catch (e) {
 }
+try {
+  db.exec("ALTER TABLE config ADD COLUMN videoDownloaderMaxMb INTEGER DEFAULT 50;");
+} catch (e) {
+}
+try {
+  db.exec("ALTER TABLE config ADD COLUMN videoDownloaderTimeoutSeconds INTEGER DEFAULT 180;");
+} catch (e) {
+}
 db.exec(`
   CREATE TABLE IF NOT EXISTS user_nsfw_prefs (
     userId TEXT PRIMARY KEY,
@@ -623,7 +636,9 @@ db.exec(`
     cleanupEnabled = COALESCE(cleanupEnabled, 1),
     bluesmindsApiKey = COALESCE(bluesmindsApiKey, ''),
     activeModel = COALESCE(activeModel, 'deepseek.v3.2'),
-    tts = COALESCE(tts, '{"primaryProvider":"elevenlabs","model":"eleven_multilingual_v2"}')
+    tts = COALESCE(tts, '{"primaryProvider":"elevenlabs","model":"eleven_multilingual_v2"}'),
+    videoDownloaderMaxMb = COALESCE(videoDownloaderMaxMb, 50),
+    videoDownloaderTimeoutSeconds = COALESCE(videoDownloaderTimeoutSeconds, 180)
   WHERE id = 1;
 `);
 
@@ -695,6 +710,98 @@ function getTTSRuntimeConfig(config = {}) {
     tts = { ...DEFAULT_TTS_CONFIG, ...config.tts };
   }
   return { ...config, tts };
+}
+
+
+function detectFfmpegPath() {
+  const candidates = [
+    process.env.FFMPEG_PATH,
+    "/usr/local/bin/ffmpeg",
+    "/usr/bin/ffmpeg",
+    "/bin/ffmpeg",
+  ].filter(Boolean);
+  for (const p of candidates) {
+    try { if (fs.existsSync(p)) return p; } catch (_) {}
+  }
+  return null;
+}
+
+function getVideoDownloaderLimits(config = {}) {
+  const maxMb = Number(process.env.VIDEO_DOWNLOADER_MAX_MB || config.videoDownloaderMaxMb || 50);
+  const timeoutSeconds = Number(process.env.VIDEO_DOWNLOADER_TIMEOUT_SECONDS || config.videoDownloaderTimeoutSeconds || 180);
+  return {
+    maxFileSizeMb: Number.isFinite(maxMb) && maxMb > 0 ? maxMb : 50,
+    timeoutMs: Number.isFinite(timeoutSeconds) && timeoutSeconds > 0 ? timeoutSeconds * 1000 : 180000,
+  };
+}
+
+async function cleanupVideoDownloaderFiles(maxAgeMs = 60 * 60 * 1000) {
+  const cutoff = Date.now() - maxAgeMs;
+  try {
+    await fs.ensureDir(videoDir);
+    const entries = await fs.readdir(videoDir);
+    await Promise.all(entries.map(async (entry) => {
+      const filePath = path.join(videoDir, entry);
+      const stat = await fs.stat(filePath).catch(() => null);
+      if (stat && stat.mtimeMs < cutoff) await fs.remove(filePath).catch(() => {});
+    }));
+  } catch (e) {
+    console.warn("[videoDL] Cleanup skipped:", e?.message || e);
+  }
+}
+
+async function maybeHandleVideoDownloader({ client, message, config }) {
+  const textRaw = normalizeMessageText(message);
+  const supportedUrl = extractSupportedVideoUrl(textRaw);
+  const urls = extractUrls(textRaw);
+  if (!supportedUrl) {
+    if (urls.length > 0 && hasDownloaderIntent(textRaw)) {
+      await client.sendMessage(message.chatId, {
+        message: VIDEO_DOWNLOADER_MESSAGES.failure,
+        replyTo: message.id,
+      }).catch(() => {});
+      return true;
+    }
+    return false;
+  }
+
+  const status = new SmartStatus(client, message.chatId, false, message.id);
+  let workDir = null;
+  try {
+    await status.update(VIDEO_DOWNLOADER_MESSAGES.downloading, { parseMode: undefined });
+    const limits = getVideoDownloaderLimits(config);
+    const result = await downloadVideoWithYtDlp({
+      url: supportedUrl,
+      ytdlpPath: YTDLP_BIN,
+      ffmpegPath: detectFfmpegPath(),
+      outputRoot: videoDir,
+      cookiesPath: youtubeCookiesPath,
+      maxFileSizeMb: limits.maxFileSizeMb,
+      timeoutMs: limits.timeoutMs,
+      onLog: (line) => {
+        if (line) console.log(`[videoDL] ${line.slice(0, 220)}`);
+      },
+    });
+    workDir = result.workDir;
+    const targetPeer = await status.getChat();
+    try { if (status.messageId) await client.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch (_) {}
+    await client.sendFile(targetPeer, {
+      file: result.filePath,
+      caption: VIDEO_DOWNLOADER_MESSAGES.success,
+      replyTo: message.id,
+      forceDocument: false,
+    });
+    addLog(`[videoDL] Sent downloaded video (${Math.round(result.size / 1024 / 1024)} MB) from ${supportedUrl}`, "success");
+    return true;
+  } catch (e) {
+    console.error("[videoDL] Download failed:", e?.message || e);
+    addLog(`[videoDL] Failed: ${String(e?.message || e).slice(0, 160)}`, "error");
+    await status.finish(VIDEO_DOWNLOADER_MESSAGES.failure, { parseMode: undefined, replyTo: message.id });
+    return true;
+  } finally {
+    if (workDir) await fs.remove(workDir).catch(() => {});
+    cleanupVideoDownloaderFiles().catch(() => {});
+  }
 }
 
 async function sendTTSVoiceOrText({ client, targetPeer, message, status, text, config = {}, logPrefix = "[tts]" }) {
@@ -3500,6 +3607,7 @@ const pendingAgeConfirm = /* @__PURE__ */ new Set();
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT || 3e3);
+  cleanupVideoDownloaderFiles().catch(() => {});
   app.use(express.json());
   app.get("/api/health", (req, res) => {
     res.json({
@@ -3584,7 +3692,9 @@ async function startServer() {
       "telegramApiHash",
       "telegramStringSession",
       "maintenanceMode",
-      "tts"
+      "tts",
+      "videoDownloaderMaxMb",
+      "videoDownloaderTimeoutSeconds"
     ];
     // Read current creds BEFORE saving so we can detect actual changes
     const prevCreds = db.prepare(
@@ -5181,6 +5291,13 @@ async function startServer() {
               addLog(`Diagnostic: ${text} from ${senderId}`, "info");
             }
           }
+          const handledVideoDownload = await maybeHandleVideoDownloader({
+            client,
+            message,
+            config: config2
+          });
+          if (handledVideoDownload) return;
+
           if (!isMe) {
             await maybeHandleAutoReply(
               client,
@@ -5760,7 +5877,7 @@ ${mStr}`);
           db.prepare("DELETE FROM conversations WHERE timestamp < ?").run(
             oneWeekAgo
           );
-          for (const dir of [exportsDir, musicDir]) {
+          for (const dir of [exportsDir, musicDir, videoDir]) {
             const files = await fs.readdir(dir);
             for (const file of files) {
               const filePath = path.join(dir, file);
