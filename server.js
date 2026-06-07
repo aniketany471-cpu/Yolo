@@ -2692,40 +2692,24 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
     console.log("[intent] skipping_serper=true");
     console.log("[img] generation_started=true");
   } else {
-    // Gate 1: block only obvious social/greeting messages — never block by length alone
+    // Only trigger grounding for sports / weather / news keywords, or pasted URLs
     const promptTrimmed = prompt.trim();
-    const isCasualMessage =
-      /^(hi|hey|hello|yo|sup|hii|hlo|hl|ok|okay|k|lol|haha|hehe|😂|😊|👍|thanks|thank you|thx|ty|sure|nice|cool|great|good|wow|oh|hmm|yes|no|nope|yep|yup|bye|later|brb|np|fine|got it|noted|understood|same|lmao|omg|wtf|bro|dude|😅|🙏|❤️|🔥)\s*[!?.,😂😊👍🙏❤️🔥]*$/i.test(promptTrimmed);
+    const msgLower = rawUserMessage.toLowerCase();
 
-    // Anything with a search/realtime keyword always searches — no length gate
-    const isKnownSearchQuery = !isCasualMessage && /\b(f1|formula|grand prix|gp|race|circuit|qualifying|cricket|ipl|t20|odi|football|soccer|nba|nfl|nhl|ufc|mma|match|score|result|standings|winner|podium|news|weather|temperature|forecast|price|bitcoin|btc|eth|crypto|stock|nifty|sensex|today|tonight|latest|current|breaking|live|election|launch|ranking|leaderboard|transfer|injury|lineup|who won|who is|what happened|when is|where is)\b/i.test(promptTrimmed);
+    const hasSportsKeyword = /\b(cricket|ipl|t20|odi|test match|football|soccer|nba|nfl|nhl|ufc|mma|f1|formula|formula 1|grand prix|gp|race|circuit|qualifying|match|score|scores|result|results|standings|winner|wicket|goal|penalty|lineup|injury|transfer|ranking|leaderboard|podium|points table|series|tournament|champion|trophy|league|premier league|champions league|la liga|bundesliga|serie a|ligue 1|eredivisie|copa|euros|world cup|asia cup|psl|bbl|cpl|npl|kabaddi|hockey|badminton|tennis|wimbledon|us open|french open|australian open|grand slam|boxing|wrestling|wwe|olympics|commonwealth games)\b/i.test(msgLower);
 
-    // Force search for known queries; also search for any question (ends with ?) that isn't casual
-    const isQuestion = !isCasualMessage && /\?$/.test(promptTrimmed.replace(/\s+$/, ''));
+    const hasWeatherKeyword = /\b(weather|temperature|temp|forecast|humidity|rain|sunny|cloudy|storm|typhoon|hurricane|heatwave|cold wave|aqi|air quality|wind speed|uv index|feels like|dew point|snowfall|rainfall|monsoon|drizzle|thunderstorm)\b/i.test(msgLower);
 
-    let shouldSearch = isKnownSearchQuery || isQuestion || (isDeep && !isCasualMessage);
+    const hasNewsKeyword = /\b(news|breaking|latest news|headline|headlines|update|updates|today news|current news|live news|report|announce|announced|announced today|election|election result|vote|voting|verdict|arrest|attack|crash|explosion|earthquake|flood|disaster|launch|launched|pm|president|minister|government|policy|bill|budget|economy|gdp|inflation|rate cut|rbi|fed|federal reserve|modi|trump|biden|imf|un|nato|g20|g7|summit|treaty|ceasefire|war|conflict|strike|protest|rally|crisis|deal|merger|ipo|acquisition)\b/i.test(msgLower);
 
-    if (!shouldSearch && !isCasualMessage && needsSearch) {
-      // Gate 2: intent-based detection via serper module
-      const { needs } = needsSearch(prompt);
-      shouldSearch = needs;
-    } else if (!shouldSearch && !isCasualMessage) {
-      // Gate 3: fallback keyword check when serper module is unavailable
-      const fallbackKw = [
-        "today", "tonight", "right now", "latest", "current", "breaking",
-        "news", "score", "scores", "result", "results", "live",
-        "price", "bitcoin", "btc", "eth", "crypto", "stock", "nifty", "sensex",
-        "match", "ipl", "cricket", "football", "goal", "wicket",
-        "f1", "formula", "grand prix", "race", "circuit", "gp",
-        "standings", "winner", "podium", "ranking",
-        "weather", "temperature", "forecast",
-        "who won", "who is", "what happened", "election", "launch",
-      ];
-      shouldSearch = fallbackKw.some((kw) => rawUserMessage.toLowerCase().includes(kw));
-    }
+    const hasUrl = /https?:\/\/\S+/i.test(rawUserMessage);
 
-    if (isCasualMessage) {
-      console.log(`[search] Skipped — casual/short message: "${promptTrimmed.slice(0, 40)}"`);
+    let shouldSearch = hasSportsKeyword || hasWeatherKeyword || hasNewsKeyword || hasUrl;
+
+    if (shouldSearch) {
+      console.log(`[search] triggered — sports=${hasSportsKeyword} weather=${hasWeatherKeyword} news=${hasNewsKeyword} url=${hasUrl}`);
+    } else {
+      console.log(`[search] skipped — no sports/weather/news keyword or URL`);
     }
     if (shouldSearch) {
       // ── PRIMARY: Bluesminds gemini-3.5-flash ─────────────────────────────
