@@ -2148,10 +2148,12 @@ async function performBluesmindsWebGrounding(query, bluesmindsKey, config) {
 
   // Step 1: Fetch live search results via Serper (primary data source)
   let searchResults = "";
+  let serperSources = [];
   if (serperSearch && (config?.serperKey || process.env.SERPER_API_KEY)) {
     try {
       const sr = await serperSearch(query, config);
       if (sr?.summary) searchResults = sr.summary;
+      if (Array.isArray(sr?.sources)) serperSources = sr.sources;
     } catch (e) {
       console.warn("[GROUNDING_ERROR] Serper fetch failed:", e?.message || e);
     }
@@ -2164,6 +2166,7 @@ async function performBluesmindsWebGrounding(query, bluesmindsKey, config) {
     query.trim().split(/\s+/).length <= 6
   );
   const isSportsQuery = /\b(f1|formula.?1|grand prix|race|circuit|cricket|ipl|t20|odi|football|soccer|nba|nfl|ufc|mma|match|score|standings|podium|winner|league|tournament)\b/i.test(query);
+  const isWeatherQuery = /\b(weather|temperature|temp|rain|humid|forecast|climate|wind|aqi|air quality|feels like|°c|celsius|degrees)\b/i.test(query);
 
   const lengthRule = isDetailedQuery
     ? "Provide a comprehensive, structured answer with all relevant details and sources when available."
@@ -2175,10 +2178,20 @@ async function performBluesmindsWebGrounding(query, bluesmindsKey, config) {
     ? "\n\nSports Response Rules:\n- 'who won' → winner + key highlight only\n- 'next race/match' → event name + venue/circuit + date + local time\n- 'standings' → top 3–5 positions only\n- 'analyze / explain' → detailed answer only when explicitly asked\nDefault: short and factual. No essays unless the user requests detail."
     : "";
 
+  // IST date/time context for the grounding prompt
+  const nowIST = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
+  const istDateStr = nowIST.toLocaleString("en-IN", { timeZone: "Asia/Kolkata", dateStyle: "full", timeStyle: "short" });
+  const istContext = `Current date and time: ${istDateStr} (IST, Asia/Kolkata). Always use this as the reference point for "today", "now", "current", "latest", "right now".`;
+
+  // Weather formatting rules — always Celsius, always structured
+  const weatherRule = isWeatherQuery
+    ? "\n\nWeather Response Format (MANDATORY):\n- ALWAYS use Celsius (°C). Never use Fahrenheit.\n- Structure the reply as:\n  📍 [City/Location]\n  🌡️ Temp: X°C (Feels like X°C)\n  🌤️ Condition: [sky condition]\n  💧 Humidity: X%\n  💨 Wind: X km/h\n  🌅 Forecast: [brief 1-line outlook if available]\n- If forecast data is available, add 2–3 days max.\n- Keep it clean and scannable. No wall of text."
+    : "";
+
   // Step 3: Build grounding prompt
   const groundingPrompt = searchResults
-    ? `You are a precise web grounding assistant for a Telegram AI bot.\n\nLive Search Results:\n${searchResults}\n\nUser Question: ${query}\n\n${lengthRule}${sportsRule}\n\nStrict Rules:\n- Answer ONLY from the search results above — do not add, guess, or infer anything not present.\n- Quote exact scores, prices, dates, or times if present in the results.\n- If a key fact is missing from the results, say so honestly.\n- Keep Telegram readability in mind — avoid walls of text.\n- Priority: accuracy > relevance > detail.`
-    : `You are a precise web grounding assistant for a Telegram AI bot.\n\nUser Question: ${query}\n\n${lengthRule}${sportsRule}\n\nBe factual and direct. If you are uncertain about real-time data, acknowledge it clearly.`;
+    ? `You are a precise web grounding assistant for a Telegram AI bot.\n\n${istContext}\n\nLive Search Results:\n${searchResults}\n\nUser Question: ${query}\n\n${lengthRule}${sportsRule}${weatherRule}\n\nStrict Rules:\n- Answer ONLY from the search results above — do not add, guess, or infer anything not present.\n- Quote exact scores, prices, dates, or times if present in the results.\n- All temperatures MUST be in Celsius (°C). Convert if needed.\n- If a key fact is missing from the results, say so honestly.\n- Keep Telegram readability in mind — avoid walls of text.\n- Priority: accuracy > relevance > detail.`
+    : `You are a precise web grounding assistant for a Telegram AI bot.\n\n${istContext}\n\nUser Question: ${query}\n\n${lengthRule}${sportsRule}${weatherRule}\n\nAll temperatures MUST be in Celsius (°C). Be factual and direct. If you are uncertain about real-time data, acknowledge it clearly.`;
 
   const maxTokens = isDetailedQuery ? 600 : isShortQuery ? 150 : 350;
 
@@ -2203,8 +2216,14 @@ async function performBluesmindsWebGrounding(query, bluesmindsKey, config) {
     }
     const text = (result.data?.choices?.[0]?.message?.content || "").trim();
     if (text.length > 10) {
-      console.log(`[GROUNDING_SUCCESS] gemini-3.5-flash via BluesMinds — ${text.length} chars`);
-      return text;
+      console.log(`[GROUNDING_SUCCESS] gemini-3.5-flash via BluesMinds — ${text.length} chars, sources=${serperSources.length}`);
+      // Append source links if we have them
+      let finalText = text;
+      if (serperSources.length > 0) {
+        finalText += "\n\n🔗 *Sources:* " + serperSources.map(u => u.replace(/^https?:\/\/(www\.)?/, "").split("/")[0]).join(" • ");
+        finalText += "\n" + serperSources.join("\n");
+      }
+      return finalText;
     }
     console.warn("[GROUNDING_ERROR] gemini-3.5-flash returned empty response");
     return null;
@@ -2512,6 +2531,12 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
     "'make me an explicit image' → [IMAGE_GENERATION]...[/IMAGE_GENERATION]",
     "'visualize futuristic Tokyo' → [IMAGE_GENERATION]...[/IMAGE_GENERATION]",
   ].join("\n");
+
+  // Inject recent group chat context so Donna understands ongoing conversations from other users
+  if (opts.groupContext && opts.groupContext.length > 0) {
+    systemPrompt += `\n\nRECENT GROUP CONVERSATION (last few messages from the chat before this message — use this to understand what's being discussed):\n${opts.groupContext}\n\nIMPORTANT: Use the above group history to understand context. If someone asks a short or vague question referencing something discussed earlier (e.g. "what about [city]?" or "same for [place]?"), look at the recent messages above to understand what topic they're referring to.`;
+  }
+
   const detectedMood = !isRealtimeQuery ? detectMood(prompt) : null;
   if (detectedMood) {
     systemPrompt += `\n\nMOOD DETECTION: ${detectedMood.tone}`;
@@ -4743,6 +4768,24 @@ async function startServer() {
           return;
         }
 
+        // Fetch recent group chat history so Donna has cross-user context (fixes 3rd-person "what about X?" questions)
+        let groupContext = "";
+        if (!isPrivate && client2) {
+          try {
+            const recentMsgs = await client2.getMessages(message.inputChat || message.chatId, { limit: 8 });
+            const lines = [];
+            for (const m of [...recentMsgs].reverse()) {
+              if (!m?.message) continue;
+              if (m.id === message.id) continue; // skip the current message itself
+              const who = m.sender?.username || m.sender?.firstName || m.senderId?.toString() || "unknown";
+              lines.push(`${who}: ${m.message.slice(0, 300)}`);
+            }
+            if (lines.length > 0) groupContext = lines.join("\n");
+          } catch (e) {
+            console.warn("[AI-Auto] Failed to fetch group context:", e?.message || e);
+          }
+        }
+
         // Retry up to 3 times silently — never show an error to the user mid-retry
         let aiRes = null;
         for (let attempt = 1; attempt <= 3; attempt++) {
@@ -4782,7 +4825,8 @@ async function startServer() {
                 skipRealtimeVerification: hasVisionImage && !!visionOcrVerified,
                 botUsername: myUsername,
                 isOwner: message.out || (myId && senderId === myId) || message.sender?.username?.toLowerCase() === DONNA_OWNER_USERNAME,
-                ownerId: myId
+                ownerId: myId,
+                groupContext: groupContext || ""
               }
             );
             if (hasVisionImage && !!visionOcrVerified && aiRes) {
