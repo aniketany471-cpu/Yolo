@@ -369,7 +369,15 @@ export async function serperSearch(rawQuery, config) {
       const summary = extractSerperSummary(data, intent);
 
       if (summary) {
-        return { summary, intent, optimizedQuery, corrected, confidence };
+        // Collect top source URLs from organic results and news items
+        const sources = [];
+        for (const r of (data.organic || []).slice(0, 4)) {
+          if (r.link && !sources.includes(r.link)) sources.push(r.link);
+        }
+        for (const n of (data.news || []).slice(0, 3)) {
+          if (n.link && !sources.includes(n.link)) sources.push(n.link);
+        }
+        return { summary, intent, optimizedQuery, corrected, confidence, sources: sources.slice(0, 3) };
       }
     } catch (e) {
       if (attempt === 2) console.warn(`[serper] Failed: ${e.message}`);
