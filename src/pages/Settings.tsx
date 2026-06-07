@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useAppContext } from '../context/AppContext';
-import { Settings as SettingsIcon, Save, Clock, ShieldAlert, Key, MessageSquareX, RotateCcw, ListFilter, Trash2, Bot } from 'lucide-react';
+import { Settings as SettingsIcon, Save, Clock, ShieldAlert, Key, MessageSquareX, RotateCcw, ListFilter, Trash2, Bot, Video } from 'lucide-react';
 import { cn } from '../lib/utils';
 
 export function Settings() {
@@ -17,6 +17,8 @@ export function Settings() {
   const [globalCooldown, setGlobalCooldown] = useState(config.globalCooldown.toString());
   const [userCooldown, setUserCooldown] = useState(config.perUserCooldown.toString());
   const [maxTasks, setMaxTasks] = useState(config.maxConcurrentTasks.toString());
+  const [videoMaxMb, setVideoMaxMb] = useState((config.videoDownloaderMaxMb || 50).toString());
+  const [videoTimeoutSeconds, setVideoTimeoutSeconds] = useState((config.videoDownloaderTimeoutSeconds || 180).toString());
   const [autoDelete, setAutoDelete] = useState(config.autoDeleteCommands === 1);
   const [autoDeleteDelay, setAutoDeleteDelay] = useState((config.autoDeleteDelay || 0).toString());
   const [autoDeleteWhitelist, setAutoDeleteWhitelist] = useState(config.autoDeleteWhitelist || '');
@@ -39,6 +41,8 @@ export function Settings() {
     setGlobalCooldown(config.globalCooldown.toString());
     setUserCooldown(config.perUserCooldown.toString());
     setMaxTasks(config.maxConcurrentTasks.toString());
+    setVideoMaxMb((config.videoDownloaderMaxMb || 50).toString());
+    setVideoTimeoutSeconds((config.videoDownloaderTimeoutSeconds || 180).toString());
     setAutoDelete(config.autoDeleteCommands === 1);
     setAutoDeleteDelay((config.autoDeleteDelay || 0).toString());
     setAutoDeleteWhitelist(config.autoDeleteWhitelist || '');
@@ -94,6 +98,8 @@ export function Settings() {
       globalCooldown: parseInt(globalCooldown) || 3,
       perUserCooldown: parseInt(userCooldown) || 10,
       maxConcurrentTasks: parseInt(maxTasks) || 2,
+      videoDownloaderMaxMb: parseInt(videoMaxMb) || 50,
+      videoDownloaderTimeoutSeconds: parseInt(videoTimeoutSeconds) || 180,
       autoDeleteCommands: autoDelete ? 1 : 0,
       autoDeleteDelay: parseInt(autoDeleteDelay) || 0,
       autoDeleteWhitelist: autoDeleteWhitelist,
@@ -353,6 +359,47 @@ export function Settings() {
                     value={maxTasks}
                     onChange={(e) => setMaxTasks(e.target.value)}
                     className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2.5 text-slate-200 focus:outline-none focus:border-red-500 transition-colors"
+                  />
+                </div>
+              </div>
+            </div>
+          </section>
+
+          {/* Video Downloader Configuration */}
+          <section>
+            <div className="flex items-center gap-2 mb-4">
+              <Video className="w-4 h-4 text-orange-400" />
+              <h3 className="font-medium text-slate-300">Video Downloader</h3>
+            </div>
+
+            <div className="bg-slate-950/50 border border-slate-800 rounded-lg p-4 space-y-4">
+              <p className="text-sm text-slate-400 leading-relaxed">
+                Configure Donna's automatic YouTube, Shorts, Instagram Reel, and Instagram post downloader.
+              </p>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs font-medium text-slate-500 mb-1.5 uppercase tracking-wider">
+                    Max Video Size (MB)
+                  </label>
+                  <input
+                    type="number"
+                    min="1"
+                    value={videoMaxMb}
+                    onChange={(e) => setVideoMaxMb(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2.5 text-slate-200 focus:outline-none focus:border-orange-500 transition-colors"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-500 mb-1.5 uppercase tracking-wider">
+                    Timeout (seconds)
+                  </label>
+                  <input
+                    type="number"
+                    min="10"
+                    value={videoTimeoutSeconds}
+                    onChange={(e) => setVideoTimeoutSeconds(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2.5 text-slate-200 focus:outline-none focus:border-orange-500 transition-colors"
                   />
                 </div>
               </div>

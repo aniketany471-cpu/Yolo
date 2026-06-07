@@ -52,6 +52,8 @@ export interface AppConfig {
   whitelistedUsers?: string;
   maintenanceMode?: number;
   tts?: TTSConfig;
+  videoDownloaderMaxMb?: number;
+  videoDownloaderTimeoutSeconds?: number;
 }
 
 export interface LogEntry {
@@ -143,6 +145,8 @@ const defaultConfig: AppConfig = {
     primaryProvider: 'elevenlabs',
     model: 'eleven_multilingual_v2',
   },
+  videoDownloaderMaxMb: 50,
+  videoDownloaderTimeoutSeconds: 180,
 };
 
 const defaultContext: AppContextType = {
@@ -193,7 +197,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             aiMode, formattingEnabled, cleanupEnabled,
             bluesmindsApiKey, activeModel,
             deepThinking, sudoUsers, publicCommandsEnabled, blacklistedUsers, whitelistedUsers,
-            maintenanceMode, tts,
+            maintenanceMode, tts, videoDownloaderMaxMb, videoDownloaderTimeoutSeconds,
             ...restConfig
           } = data.config;
 
@@ -252,6 +256,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             whitelistedUsers: whitelistedUsers || '',
             maintenanceMode: maintenanceMode ?? 0,
             tts: parsedTts,
+            videoDownloaderMaxMb: videoDownloaderMaxMb ?? 50,
+            videoDownloaderTimeoutSeconds: videoDownloaderTimeoutSeconds ?? 180,
           };
 
           setConfig(prev => JSON.stringify(prev) === JSON.stringify(nextConfig) ? prev : nextConfig);

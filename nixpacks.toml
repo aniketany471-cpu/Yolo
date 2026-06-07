@@ -1,2 +1,2 @@
 [phases.setup]
-aptPkgs = ["ca-certificates", "fonts-liberation"]
+aptPkgs = ["ca-certificates", "fonts-liberation", "ffmpeg"]
