@@ -4422,12 +4422,7 @@ async function startServer() {
       return;
     }
     userCooldowns.set(lastReplyKey, now);
-    const minDelay = (config.autoReplyDelayMin || 3) * 1e3;
-    const maxDelay = (config.autoReplyDelayMax || 15) * 1e3;
-    const actualDelay = Math.floor(Math.random() * (maxDelay - minDelay + 1)) + minDelay;
-    console.log(
-      `[AI-Auto] AI reply triggered for ${chatIdStr}. Delay: ${actualDelay / 1e3}s`
-    );
+    console.log(`[AI-Auto] AI reply triggered for ${chatIdStr}. Delay: 0s`);
     setTimeout(async () => {
       try {
         if (!client2) return;
@@ -4925,7 +4920,7 @@ async function startServer() {
       } finally {
         setTimeout(() => aiProcessingLock.delete(lockKey), 6e4);
       }
-    }, actualDelay);
+    }, 0);
   }
   const loadTelethon = async () => {
     const config = db.prepare("SELECT * FROM config WHERE id = 1").get();
