@@ -733,22 +733,45 @@ const BLUEMINDS_BASE_URL = "https://api.bluesminds.com/v1";
 // Models confirmed broken: tier restriction, suspended, 404 not found, or permanent timeout.
 // Updated from live audit May 2026.
 const KNOWN_BAD_MODELS = new Set([
-  "gpt-5-nano",             // permanent timeout
-  "deepseek-chat",          // permanent timeout
-  "deepseek-reasoner",      // permanent timeout
-  "blackbox",               // permanent timeout
-  "kimi-k2.5",              // permanent timeout
-  "deepseek-v4-flash",      // 403 Tier Restriction
+  // ── Confirmed broken via live API tests ──────────────────────────────────
+  "gpt-4o",                         // 500 upstream "Extra data" — malformed response
+  "gpt-4o-mini",                    // insufficient credits
+  "gpt-5-nano",                     // permanent timeout
+  "gpt-5-chat",                     // permanent timeout
+  "minimax-m2",                     // invalid model name
+  "minimax-m2.1",                   // invalid model name
+  "MiniMax-M2.7",                   // permanent timeout
+  "MiniMax-M2.1-lightning",         // permanent timeout
+  "minimaxai/minimax-m2.7",         // permanent timeout
+  "grok-4.20-0309-non-reasoning",   // permanent timeout / 403
+  "openai/gpt-oss-120b",            // permanent timeout
+  "stepfun-ai/step-3.5-flash",      // permanent timeout
+  "openai/zai-org/GLM-4.7",         // permanent timeout
+  "multi-model",                    // permanent timeout
+  "fallback",                       // permanent timeout
+  "vllm-current",                   // verbose chain-of-thought — unusable for chat
+  "blackbox",                       // invalid model name
+  "kimi-k2.5",                      // permanent timeout
+  // ── Tier / policy restrictions ───────────────────────────────────────────
+  "deepseek-chat",                  // permanent timeout
+  "deepseek-reasoner",              // permanent timeout
+  "deepseek-v4-flash",              // 403 Tier Restriction
   "deepseek-ai/deepseek-v4-flash",  // 403 Tier Restriction
-  "claude-sonnet-4-6",      // 403 Tier Restriction
+  "claude-sonnet-4-6",              // 403 Tier Restriction
   "gemini-3.1-flash-lite-preview",  // 404 Not Found
   "mistralai/mistral-large",        // 404 Function not found
-  "gpt-4o",                 // 500 upstream "Extra data" — malformed response
 ]);
 
-// Fallback chain — only GPT-5 remains as safety net.
+// Fallback chain — tried in order when primary model fails.
+// All entries are confirmed live via API tests on 2026-06-07.
 const BM_FALLBACK_CHAIN = [
-  "gpt-5-chat",
+  "gemini-3.5-flash",                              // fastest, vision-capable
+  "grok-4.20-fast",                                // Grok fast lane
+  "qwen3.6-plus",                                  // Qwen large variant
+  "qwen3.6-27b",                                   // Qwen 27B
+  "z-ai/glm-5.1",                                  // GLM 5.1
+  "moonshotai/kimi-k2.6",                          // Kimi K2.6
+  "race:moonshotai/kimi-k2.5|qwen/qwen3.5-397b-a17b", // race — fastest wins
 ];
 
 function sleep(ms) {
@@ -2249,7 +2272,7 @@ function formatAiMessage(text) {
   if (!text) return { text: "" };
   return { text: text.trim() };
 }
-async function generateImage(prompt, apiKey, model = "flux") {
+async function generateImage(prompt, apiKey, model = "grok-imagine-image-lite") {
   try {
     const cleanKey = apiKey?.trim();
     if (!cleanKey) return null;
@@ -2882,20 +2905,41 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
 User Message: ${prompt}`;
 
   const providers = [];
-  // Provider 1: DeepSeek V4 Pro — primary, 3 attempts before giving up
-  const deepSeekV4Provider = {
-    name: "BluesMinds-DeepSeek-V4-Pro",
-    key: config.bluesmindsApiKey,
-    fn: (p, k, ctx, inst) => getBluesMindsWithRetries(p, k, "accounts/fireworks/models/deepseek-v4-pro", ctx, inst, 3)
-  };
-  // Provider 2: GPT-5 — fallback only, used when DeepSeek V4 Pro exhausts all 3 tries
-  const gpt5FallbackProvider = {
-    name: "BluesMinds-GPT5",
-    key: config.bluesmindsApiKey,
-    fn: (p, k, ctx, inst) => getBluesMindsResponse(p, k, "gpt-5-chat", ctx, inst, new Set())
-  };
-  // Runtime execution order: DeepSeek V4 Pro (3 tries) → GPT-5 (fallback)
-  providers.push(deepSeekV4Provider, gpt5FallbackProvider);
+  // All providers use the Bluesminds API key.
+  // Models confirmed live on 2026-06-07. Execution order: first success wins.
+  const bmKey = config.bluesmindsApiKey;
+  providers.push(
+    // Primary — DeepSeek V4 Pro: best quality, 3 retries before giving up
+    {
+      name: "BluesMinds-DeepSeek-V4-Pro",
+      key: bmKey,
+      fn: (p, k, ctx, inst) => getBluesMindsWithRetries(p, k, "accounts/fireworks/models/deepseek-v4-pro", ctx, inst, 3)
+    },
+    // Fallback 1 — Gemini 3.5 Flash: fast, vision-capable, highly reliable
+    {
+      name: "BluesMinds-Gemini-3.5-Flash",
+      key: bmKey,
+      fn: (p, k, ctx, inst) => getBluesMindsResponse(p, k, "gemini-3.5-flash", ctx, inst, new Set())
+    },
+    // Fallback 2 — Grok 4.20 Fast: fast Grok variant
+    {
+      name: "BluesMinds-Grok-4.20-Fast",
+      key: bmKey,
+      fn: (p, k, ctx, inst) => getBluesMindsResponse(p, k, "grok-4.20-fast", ctx, inst, new Set())
+    },
+    // Fallback 3 — Qwen 3.6 Plus: large Qwen model
+    {
+      name: "BluesMinds-Qwen3.6-Plus",
+      key: bmKey,
+      fn: (p, k, ctx, inst) => getBluesMindsResponse(p, k, "qwen3.6-plus", ctx, inst, new Set())
+    },
+    // Fallback 4 — GLM 5.1: reliable last resort
+    {
+      name: "BluesMinds-GLM-5.1",
+      key: bmKey,
+      fn: (p, k, ctx, inst) => getBluesMindsResponse(p, k, "z-ai/glm-5.1", ctx, inst, new Set())
+    }
+  );
   for (const p of providers) {
     if (p.key && p.key !== "undefined" && p.key !== "null" && p.key.length > 5) {
       try {
