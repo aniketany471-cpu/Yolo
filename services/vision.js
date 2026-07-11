@@ -1,5 +1,5 @@
-import { MODELS, TASK, getIamhcApiKey } from "../config/models.js";
-import { chatCompletion } from "../providers/iamhcProvider.js";
+import { MODELS, TASK } from "../config/models.js";
+import { routedChatCompletion as chatCompletion } from "./providerGateway.js";
 
 // sharp lazy-loaded to defer ~80MB libvips until first image request
 let _sharp = null;
@@ -205,20 +205,19 @@ async function optimizeImagePayload(imageBuffer, mimeType) {
   return { mimeType: "image/jpeg", base64Data: out.toString("base64") };
 }
 
-async function requestVisionWithIamhc({ model, mimeType, base64Data }) {
-  const apiKey = getIamhcApiKey(process.env.OPENAI_API_KEY);
-  if (!apiKey) throw new Error("missing iamhc/openai key");
-
+async function requestVisionModel({ model, mimeType, base64Data }) {
+  // No apiKey passed — providerGateway routes to whichever gateway serves
+  // `model` (api17 for the default GPT vision model) and that provider
+  // pulls its own dedicated API key from its own secret.
   const result = await chatCompletion({
     model,
-    apiKey,
     maxRetries: 0, // retry/fallback across models is handled by runVisionPipeline
     messages: [{ role: "user", content: [{ type: "text", text: buildVisionExtractionPrompt() }, { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64Data}` } }] }],
     extra: { max_tokens: 420, temperature: 0 }
   });
 
   if (!result.ok) {
-    const err = new Error(`iamhc ${result.status || 0}: ${(result.error || "request failed").slice(0, 200)}`);
+    const err = new Error(`vision provider ${result.status || 0}: ${(result.error || "request failed").slice(0, 200)}`);
     err.broken = !!result.broken; // e.g. "no available channel for model" — retiring/renamed model, retrying won't help
     throw err;
   }
@@ -234,7 +233,7 @@ async function requestVisionWithIamhc({ model, mimeType, base64Data }) {
 }
 
 async function runVisionPipeline(mimeType, base64Data, requestId = "vision") {
-  console.log("[vision] provider=iamhc");
+  console.log("[vision] provider=gateway");
   console.log(`[vision] model_chain=${VISION_MODELS.join(",")}`);
   console.log("[vision] primary_vision_started=true");
   console.log("[vision] image_analysis_started=true");
@@ -249,7 +248,7 @@ async function runVisionPipeline(mimeType, base64Data, requestId = "vision") {
     for (let i = 0; i < attempts; i++) {
       totalRequestsUsed++;
       try {
-        const result = await requestVisionWithIamhc({ model, mimeType, base64Data, requestId });
+        const result = await requestVisionModel({ model, mimeType, base64Data, requestId });
         console.log(`[vision] total_requests_used=${totalRequestsUsed} succeeded_model=${model}`);
         return result;
       } catch (e) {
