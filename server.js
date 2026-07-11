@@ -24,7 +24,7 @@ async function getPDF() {
 import fs from "fs-extra";
 import yts from "yt-search";
 import youtubedl from "youtube-dl-exec";
-import { analyzeTelegramImageWithGemini, buildVisionPrompt } from "./services/vision.js";
+import { analyzeTelegramImage, buildVisionPrompt } from "./services/vision.js";
 import { getRoutedResponse } from "./services/aiRouterService.js";
 import { classifyImageGenerationIntent, classifyRealtimeGroundingIntent } from "./router/router.js";
 import { MODELS, TASK, PRIMARY_MODEL } from "./config/models.js";
@@ -4596,8 +4596,7 @@ async function startServer() {
           // General chat / coding — router's own text-model call already ran.
           replyText = routed.content;
         } else if (routed.decision?.model === MODELS[TASK.VISION]) {
-          const geminiKey = (config.geminiKey || getGeminiPrimaryKey() || "").trim();
-          const vision = await analyzeTelegramImageWithGemini(client2, visionSourceMessage, geminiKey, message.__requestId || `msg-${message.id}`);
+          const vision = await analyzeTelegramImage(client2, visionSourceMessage, message.__requestId || `msg-${message.id}`);
           if (!vision) {
             await status.finish("I couldn't analyze that image right now — the vision service is temporarily busy. Try again in a moment.");
             return;
