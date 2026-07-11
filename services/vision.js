@@ -14,7 +14,11 @@ const RETRY_DELAYS_MS = [1500, 3000, 5000];
 // instead of dying when one model/provider is down. Configure via env
 // without touching code: MODEL_VISION (primary, see config/models.js) and
 // MODEL_VISION_FALLBACK (comma-separated list of extra models to try).
-const VISION_FALLBACK_MODELS = (process.env.MODEL_VISION_FALLBACK || "gpt-5.5-2026-04-23")
+// No default fallback model is hardcoded here — a dead/renamed model name
+// (e.g. a retired snapshot) would just burn retries for nothing. Set
+// MODEL_VISION_FALLBACK to a real, currently-available vision model on your
+// provider if you want a second option.
+const VISION_FALLBACK_MODELS = (process.env.MODEL_VISION_FALLBACK || "")
   .split(",")
   .map((m) => m.trim())
   .filter(Boolean);
@@ -152,7 +156,20 @@ function parseVisionText(rawText) {
     const extracted = extractFirstJsonObject(cleaned);
     if (extracted) parsed = safeJsonParse(extracted);
   }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("malformed response");
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    // Model answered in plain prose instead of the requested JSON schema
+    // (some models, e.g. Qwen, don't always obey format instructions).
+    // That's still a real, usable answer — don't discard it as a failure.
+    console.warn("[vision] non_json_response_using_raw_text_fallback=true");
+    return {
+      type: "unknown",
+      summary: cleaned,
+      visible_text: "",
+      objects: [],
+      detected_context: cleaned,
+      confidence: 0.5
+    };
+  }
   const { result, valid } = normalizeAndValidate(parsed);
   const responseValid = !!(valid && (result.visible_text || result.summary || result.detected_context));
   console.log(`[vision] OCR_success=${!!result.visible_text}`);
@@ -200,7 +217,11 @@ async function requestVisionWithIamhc({ model, mimeType, base64Data }) {
     extra: { max_tokens: 420, temperature: 0 }
   });
 
-  if (!result.ok) throw new Error(`iamhc ${result.status || 0}: ${(result.error || "request failed").slice(0, 200)}`);
+  if (!result.ok) {
+    const err = new Error(`iamhc ${result.status || 0}: ${(result.error || "request failed").slice(0, 200)}`);
+    err.broken = !!result.broken; // e.g. "no available channel for model" — retiring/renamed model, retrying won't help
+    throw err;
+  }
 
   const normalized = (result.content || "").trim();
   const malformed = !normalized;
@@ -234,6 +255,10 @@ async function runVisionPipeline(mimeType, base64Data, requestId = "vision") {
       } catch (e) {
         lastError = e;
         console.warn(`[vision] model=${model} attempt_${i + 1}_failed=${(e?.message || "unknown").slice(0, 100)}`);
+        if (e?.broken) {
+          console.warn(`[vision] model=${model} broken_no_channel=true skipping_remaining_retries`);
+          break; // model doesn't exist/isn't reachable on this provider — retrying is pointless
+        }
         const retriable = isRetriableVisionError(e);
         if (!retriable || i >= attempts - 1) break;
         await sleep(RETRY_DELAYS_MS[i] || 1500);
