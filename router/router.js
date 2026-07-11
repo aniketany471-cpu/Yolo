@@ -58,6 +58,38 @@ export async function classifyImageGenerationIntent({ text, apiKey } = {}) {
 }
 
 /**
+ * Ask the router model whether a message needs live/real-time information
+ * (sports scores, weather, news, prices, current events) to answer well.
+ * Replaces the old keyword list (which matched on any bare mention of
+ * "score", "price", "update", etc. even inside unrelated text, such as an
+ * AI-generated image description). Fails safe to false — if the classifier
+ * is unavailable or errors, we answer from general knowledge rather than
+ * risk triggering a live web-grounding call that then fails.
+ */
+export async function classifyRealtimeGroundingIntent({ text, apiKey } = {}) {
+  const raw = String(text || "").trim();
+  if (!raw) return false;
+  if (!ROUTER_MODEL) return false;
+
+  const prompt = [
+    "You are a strict binary classifier. Do NOT answer the user's message.",
+    "Question: to answer this message accurately, does the assistant need CURRENT/live information from the internet (e.g. today's news, live sports scores, current weather, live prices/stocks) that a general knowledge model would not reliably know?",
+    "Answer \"no\" for casual chat, general knowledge questions, requests to describe/explain an image or document already provided, coding help, or anything else that doesn't hinge on live data.",
+    "Respond with ONLY one word: yes or no.",
+    "",
+    `Message: ${raw}`,
+  ].join("\n");
+
+  const result = await chatCompletion({ model: ROUTER_MODEL, prompt, apiKey, extra: { temperature: 0 }, maxRetries: 0 });
+  if (!result.ok) {
+    logRouterFallback({ from: ROUTER_MODEL, to: "text_or_other", cause: result.error || "grounding_intent_classifier_failed" });
+    return false;
+  }
+  const answer = (result.content || "").trim().toLowerCase();
+  return answer.startsWith("yes");
+}
+
+/**
  * Decide which model should handle a request.
  *
  * @param {object} input
