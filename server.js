@@ -7,6 +7,9 @@ import { NewMessage } from "telegram/events/index.js";
 import path from "path";
 import { fileURLToPath } from "url";
 import multer from "multer";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import zlib from "node:zlib";
 // sharp + PDFDocument are lazy-loaded — saves ~100MB at startup (libvips + pdfkit not needed until first use)
 let _sharp = null;
 async function getSharp() {
@@ -340,7 +343,6 @@ const db = new Database(path.join(__dirname, "bot_database.sqlite"));
 
 const DONNA_DATA_DIR = "/data";
 const DONNA_DB_PATH = path.join(DONNA_DATA_DIR, "donna.db");
-const DONNA_DB_GZ_PATH = path.join(DONNA_DATA_DIR, "donna.db.gz");
 const DONNA_DB_DOWNLOAD_URL = "https://github.com/Skyemike1/Skye/releases/download/V1/donna.db.gz"; // force-set release URL
 let donnaDb = null;
 let donnaSearchStmtByMode = { username: null, id: null };
@@ -388,15 +390,22 @@ async function ensureDonnaDbReady() {
   try {
     const res = await fetch(DONNA_DB_DOWNLOAD_URL, { redirect: "follow" });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const buffer = Buffer.from(await res.arrayBuffer());
-    if (!buffer?.length) throw new Error("empty file payload");
-    await fs.writeFile(DONNA_DB_GZ_PATH, buffer);
+    if (!res.body) throw new Error("empty response body");
 
-    console.log("[DB] Extracting database...");
-    await fs.writeFile(DONNA_DB_PATH, await import("node:zlib").then(({ gunzipSync }) => gunzipSync(buffer)));
+    // Stream download -> gunzip -> disk instead of buffering the whole file
+    // (twice: once compressed, once decompressed) in memory. On a
+    // memory-constrained host (e.g. Railway's trial plan) buffering a large
+    // sqlite DB fully in RAM is what was triggering the OOM kill right after
+    // boot. This keeps memory usage roughly constant regardless of DB size.
+    console.log("[DB] Streaming + extracting database...");
+    const nodeReadable = Readable.fromWeb(res.body);
+    const gunzip = zlib.createGunzip();
+    const outStream = fs.createWriteStream(DONNA_DB_PATH);
+    await pipeline(nodeReadable, gunzip, outStream);
     console.log("[DB] Database ready");
   } catch (e) {
     console.warn(`[DB] Database bootstrap failed: ${e?.message || String(e)}`);
+    try { await fs.remove(DONNA_DB_PATH); } catch (_) {}
     return { ok: false, reason: "bootstrap_failed", error: e?.message || String(e) };
   }
 
