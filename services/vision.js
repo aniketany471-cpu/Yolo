@@ -272,7 +272,7 @@ async function runVisionPipeline(mimeType, base64Data, requestId = "vision") {
   throw new Error(`VISION_TEMPORARILY_BUSY: ${lastError?.message || "unknown"}`);
 }
 
-export async function analyzeTelegramImageWithGemini(client, message, _unusedApiKey, requestId = "vision") {
+export async function analyzeTelegramImage(client, message, requestId = "vision") {
   const imageRef = extractImageFromMessage(message);
   if (!imageRef) return null;
 
