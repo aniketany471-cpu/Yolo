@@ -27,8 +27,9 @@ import youtubedl from "youtube-dl-exec";
 import { analyzeTelegramImage, buildVisionPrompt } from "./services/vision.js";
 import { getRoutedResponse } from "./services/aiRouterService.js";
 import { classifyImageGenerationIntent, classifyRealtimeGroundingIntent } from "./router/router.js";
-import { MODELS, TASK, PRIMARY_MODEL } from "./config/models.js";
+import { MODELS, TASK, PRIMARY_MODEL, GENERAL_FALLBACK_MODEL, getTextModelChain } from "./config/models.js";
 import { chatCompletion } from "./providers/iamhcProvider.js";
+import { routedChatCompletion } from "./services/providerGateway.js";
 import { requestGemini, beginGeminiRequestScope } from "./services/geminiManager.js";
 import { getGeminiPrimaryKey } from "./services/geminiKeyManager.js";
 import { getAccuWeather } from "./services/weather.js";
@@ -4761,8 +4762,21 @@ async function startServer() {
             return;
           }
           const visionPrompt = buildVisionPrompt(promptForRouter, vision);
-          const visionAnswer = await chatCompletion({ model: PRIMARY_MODEL, prompt: visionPrompt, apiKey: config.iamhcApiKey, systemInstruction: buildCoreSystemPrompt(config, { botUsername: myUsername }) });
-          replyText = visionAnswer.ok ? visionAnswer.content : null;
+          // Try every model in the fallback chain via the correct gateway.
+          // PRIMARY_MODEL is posiden/deepseek-v4-flash (api17) — must use
+          // routedChatCompletion, NOT the iamhc-only chatCompletion.
+          const visionResponseChain = getTextModelChain(PRIMARY_MODEL);
+          let visionAnswer = { ok: false };
+          for (const mdl of visionResponseChain) {
+            visionAnswer = await routedChatCompletion({
+              model: mdl,
+              prompt: visionPrompt,
+              systemInstruction: buildCoreSystemPrompt(config, { botUsername: myUsername }),
+            });
+            if (visionAnswer.ok) break;
+            console.warn(`[vision-reply] model=${mdl} failed(${visionAnswer.status}) trying_next`);
+          }
+          replyText = visionAnswer.ok ? sanitizeIdentityLeak(visionAnswer.content) : null;
         } else if (routed.decision?.model === MODELS[TASK.IMAGE_GEN]) {
           if (!ziGenerateImage) throw new Error("Image service not loaded — check server logs");
           const { cleanPrompt, forceProvider } = ziParseImageModelKeyword
