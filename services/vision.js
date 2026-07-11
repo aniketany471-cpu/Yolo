@@ -1,3 +1,6 @@
+import { MODELS, TASK, getIamhcApiKey } from "../config/models.js";
+import { chatCompletion } from "../providers/iamhcProvider.js";
+
 // sharp lazy-loaded to defer ~80MB libvips until first image request
 let _sharp = null;
 async function getSharp() {
@@ -5,7 +8,20 @@ async function getSharp() {
   return _sharp;
 }
 const RETRY_DELAYS_MS = [1500, 3000, 5000];
-const PRIMARY_MODEL = "gpt-5.5-2026-04-23";
+
+// Vision model fallback chain — same idea as the text router's provider
+// fallback: try the configured model first, then fall back to alternates
+// instead of dying when one model/provider is down. Configure via env
+// without touching code: MODEL_VISION (primary, see config/models.js) and
+// MODEL_VISION_FALLBACK (comma-separated list of extra models to try).
+const VISION_FALLBACK_MODELS = (process.env.MODEL_VISION_FALLBACK || "gpt-5.5-2026-04-23")
+  .split(",")
+  .map((m) => m.trim())
+  .filter(Boolean);
+const VISION_MODELS = [MODELS[TASK.VISION], ...VISION_FALLBACK_MODELS].filter(
+  (m, i, arr) => m && arr.indexOf(m) === i
+);
+
 const MAX_IMAGE_BYTES = 2_400_000;
 const MAX_IMAGE_DIMENSION = 1600;
 const MIN_MEANINGFUL_BYTES = 5_000;
@@ -172,27 +188,21 @@ async function optimizeImagePayload(imageBuffer, mimeType) {
   return { mimeType: "image/jpeg", base64Data: out.toString("base64") };
 }
 
-async function requestVisionWithIamhc({ mimeType, base64Data }) {
-  const apiKey = process.env.IAMHC_API_KEY || process.env.OPENAI_API_KEY;
+async function requestVisionWithIamhc({ model, mimeType, base64Data }) {
+  const apiKey = getIamhcApiKey(process.env.OPENAI_API_KEY);
   if (!apiKey) throw new Error("missing iamhc/openai key");
 
-  const res = await fetch("https://api.iamhc.cn/v1/chat/completions", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify({
-      model: PRIMARY_MODEL,
-      max_tokens: 420,
-      temperature: 0,
-      messages: [{ role: "user", content: [{ type: "text", text: buildVisionExtractionPrompt() }, { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64Data}` } }] }]
-    })
+  const result = await chatCompletion({
+    model,
+    apiKey,
+    maxRetries: 0, // retry/fallback across models is handled by runVisionPipeline
+    messages: [{ role: "user", content: [{ type: "text", text: buildVisionExtractionPrompt() }, { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64Data}` } }] }],
+    extra: { max_tokens: 420, temperature: 0 }
   });
 
-  if (!res.ok) throw new Error(`iamhc ${res.status}`);
-  const json = await res.json();
-  const rawType = Array.isArray(json?.choices) ? "choices" : typeof json;
-  console.log(`[vision] raw_response_type=${rawType}`);
+  if (!result.ok) throw new Error(`iamhc ${result.status || 0}: ${(result.error || "request failed").slice(0, 200)}`);
 
-  const normalized = extractTextFromOpenAICompatibleResponse(json);
+  const normalized = (result.content || "").trim();
   const malformed = !normalized;
   console.log("[vision] normalized_response=true");
   console.log(`[vision] extracted_text_length=${normalized.length}`);
@@ -204,23 +214,33 @@ async function requestVisionWithIamhc({ mimeType, base64Data }) {
 
 async function runVisionPipeline(mimeType, base64Data, requestId = "vision") {
   console.log("[vision] provider=iamhc");
-  console.log(`[vision] model=${PRIMARY_MODEL}`);
+  console.log(`[vision] model_chain=${VISION_MODELS.join(",")}`);
   console.log("[vision] primary_vision_started=true");
   console.log("[vision] image_analysis_started=true");
 
   const attempts = RETRY_DELAYS_MS.length + 1;
   let lastError = null;
-  for (let i = 0; i < attempts; i++) {
-    try {
-      const result = await requestVisionWithIamhc({ mimeType, base64Data, requestId });
-      console.log(`[vision] total_requests_used=${i + 1}`);
-      return result;
-    } catch (e) {
-      lastError = e;
-      console.warn(`[vision] attempt_${i + 1}_failed=${(e?.message || "unknown").slice(0, 100)}`);
-      const retriable = isRetriableVisionError(e);
-      if (!retriable || i >= attempts - 1) break;
-      await sleep(RETRY_DELAYS_MS[i] || 1500);
+  let totalRequestsUsed = 0;
+
+  for (let m = 0; m < VISION_MODELS.length; m++) {
+    const model = VISION_MODELS[m];
+    console.log(`[vision] trying_model=${model}`);
+    for (let i = 0; i < attempts; i++) {
+      totalRequestsUsed++;
+      try {
+        const result = await requestVisionWithIamhc({ model, mimeType, base64Data, requestId });
+        console.log(`[vision] total_requests_used=${totalRequestsUsed} succeeded_model=${model}`);
+        return result;
+      } catch (e) {
+        lastError = e;
+        console.warn(`[vision] model=${model} attempt_${i + 1}_failed=${(e?.message || "unknown").slice(0, 100)}`);
+        const retriable = isRetriableVisionError(e);
+        if (!retriable || i >= attempts - 1) break;
+        await sleep(RETRY_DELAYS_MS[i] || 1500);
+      }
+    }
+    if (m < VISION_MODELS.length - 1) {
+      console.warn(`[vision] model_exhausted=${model} falling_back_to=${VISION_MODELS[m + 1]}`);
     }
   }
 
