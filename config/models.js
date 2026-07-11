@@ -66,17 +66,21 @@ const GENERAL_EXTRA_FALLBACKS = (process.env.MODEL_GENERAL_EXTRA_FALLBACKS || "p
   .filter(Boolean);
 
 // Cross-provider redundancy for normal chat: DeepSeek-V4-Flash (free, on
-// api17) is tried first, then DeepSeek-V4-Pro (on the original iamhc
-// gateway) as the next-best model — so a normal chat survives either whole
+// api17) is tried first, then DeepSeek-V4-Flash on the original iamhc
+// gateway as the next-best model — so a normal chat survives either whole
 // PROVIDER being down, not just one model within a single provider.
-const DEEPSEEK_PRO_MODEL = process.env.MODEL_GENERAL_IAMHC_FALLBACK || "DeepSeek-V4-Pro";
+// NOTE: "DeepSeek-V4-Pro" on iamhc was tested and is currently timing out
+// (30s, no response) even with a valid key — iamhc's own Flash model
+// responds normally (~7s), so that's the default here instead. Once Pro is
+// confirmed healthy again, set MODEL_GENERAL_IAMHC_FALLBACK=DeepSeek-V4-Pro.
+const IAMHC_GENERAL_FALLBACK = process.env.MODEL_GENERAL_IAMHC_FALLBACK || "DeepSeek-V4-Flash";
 
 // Ordered "next best model" chains per text task. When a reply fails, the
 // caller tries each subsequent model here in turn instead of giving up or
 // retrying the same broken model.
 const TEXT_MODEL_CHAINS = {
-  [TASK.GENERAL]: dedupe([MODELS[TASK.GENERAL], DEEPSEEK_PRO_MODEL, GENERAL_FALLBACK_MODEL, ...GENERAL_EXTRA_FALLBACKS]),
-  [TASK.CODING]: dedupe([MODELS[TASK.CODING], MODELS[TASK.GENERAL], DEEPSEEK_PRO_MODEL, GENERAL_FALLBACK_MODEL, ...GENERAL_EXTRA_FALLBACKS]),
+  [TASK.GENERAL]: dedupe([MODELS[TASK.GENERAL], IAMHC_GENERAL_FALLBACK, GENERAL_FALLBACK_MODEL, ...GENERAL_EXTRA_FALLBACKS]),
+  [TASK.CODING]: dedupe([MODELS[TASK.CODING], MODELS[TASK.GENERAL], IAMHC_GENERAL_FALLBACK, GENERAL_FALLBACK_MODEL, ...GENERAL_EXTRA_FALLBACKS]),
 };
 
 /**
