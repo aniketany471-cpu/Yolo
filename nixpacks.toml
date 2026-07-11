@@ -1,0 +1,8 @@
+[phases.setup]
+aptPkgs = ["ca-certificates", "fonts-liberation", "python3", "python3-pip"]
+
+[phases.build]
+cmds = [
+  "curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux -o /usr/local/bin/yt-dlp && chmod +x /usr/local/bin/yt-dlp",
+  "pip3 install bgutil-ytdlp-pot-provider --break-system-packages --quiet"
+]
