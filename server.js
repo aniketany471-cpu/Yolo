@@ -26,6 +26,7 @@ import yts from "yt-search";
 import youtubedl from "youtube-dl-exec";
 import { analyzeTelegramImageWithGemini, buildVisionPrompt } from "./services/vision.js";
 import { getRoutedResponse } from "./services/aiRouterService.js";
+import { classifyImageGenerationIntent } from "./router/router.js";
 import { requestGemini, beginGeminiRequestScope } from "./services/geminiManager.js";
 import { getGeminiPrimaryKey } from "./services/geminiKeyManager.js";
 import { getAccuWeather } from "./services/weather.js";
@@ -1684,36 +1685,12 @@ function detectImageEditIntent(text) {
   return false;
 }
 
-function classifyImageIntent(text) {
-  const raw = String(text || "").trim();
-  const lower = raw.toLowerCase();
-
-  const imageSignals = [
-    { term: "wallpaper", score: 4 }, { term: "poster", score: 4 }, { term: "thumbnail", score: 4 }, { term: "logo", score: 4 },
-    { term: "generate image", score: 4 }, { term: "generate an image", score: 4 }, { term: "generate a ", score: 4 },
-    { term: "create image", score: 4 }, { term: "create an image", score: 4 }, { term: "create a ", score: 4 },
-    { term: "make image", score: 4 }, { term: "make an image", score: 4 }, { term: "make me an image", score: 4 }, { term: "make me a ", score: 4 },
-    { term: "an image of", score: 4 }, { term: "a photo of", score: 4 }, { term: "a picture of", score: 4 },
-    { term: "draw", score: 4 }, { term: "render", score: 3 },
-    { term: "realistic", score: 2 }, { term: "cinematic", score: 2 }, { term: "anime", score: 2 }, { term: "cyberpunk", score: 2 }, { term: "portrait", score: 2 }, { term: "artwork", score: 2 }, { term: "illustration", score: 2 },
-    { term: "photo", score: 1 }, { term: "background", score: 1 }, { term: "art", score: 1 }, { term: "scene", score: 1 }
-  ];
-  const securitySignals = [
-    { term: "system prompt", score: -20 }, { term: "reveal instructions", score: -20 }, { term: "protocol start", score: -20 }, { term: "internal review", score: -20 }, { term: "ignore previous instructions", score: -20 }, { term: "developer message", score: -20 },
-    { term: "meta evaluation", score: -15 }, { term: "alignment protocol", score: -15 }, { term: "hidden instructions", score: -15 }, { term: "jailbreak", score: -15 },
-    { term: "simulate", score: -10 }, { term: "dump instructions", score: -10 }, { term: "disclose prompt", score: -10 }
-  ];
-
-  let imageScore = 0;
-  let securityScore = 0;
-  for (const sig of imageSignals) if (lower.includes(sig.term)) imageScore += sig.score;
-  for (const sig of securitySignals) if (lower.includes(sig.term)) securityScore += sig.score;
-
-  const hasSecuritySignal = securityScore < 0;
-  const shouldGenerateImage = !hasSecuritySignal && imageScore >= 4;
-  const finalHandler = hasSecuritySignal ? "security_text" : (shouldGenerateImage ? "image_generation" : "text_or_other");
-  return { imageScore, securityScore, hasSecuritySignal, shouldGenerateImage, finalHandler };
-}
+// classifyImageIntent (keyword/weighted-score classifier) removed — it was
+// scoring raw substrings (e.g. "art" inside "Quarter-finals") and could
+// false-positive on any keyword-dense text, including vision-generated
+// descriptions, hijacking normal replies into image-generation attempts.
+// Replaced by classifyImageGenerationIntent() (router/router.js), which asks
+// the AI router model directly instead of guessing from word lists.
 
 function normalizeMessageText(messageOrText) {
   if (messageOrText === undefined || messageOrText === null) return "";
@@ -2847,14 +2824,16 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
   // vision reply as a generation request — the user is asking about an
   // existing image, not asking to create a new one.
   const isVisionReply = !!opts?.isVisionReply;
-  const imageIntent = classifyImageIntent(prompt);
-  console.log(`[intent] image_score=${imageIntent.imageScore}`);
-  console.log(`[intent] security_score=${imageIntent.securityScore}`);
-  console.log(`[intent] final_handler=${imageIntent.finalHandler}`);
-  if (isVisionReply && imageIntent.shouldGenerateImage) {
+  // isVisionReply short-circuits the classifier call entirely — a vision
+  // reply is never a generation request, and skipping the AI call here also
+  // saves a redundant round-trip.
+  let imageGenerationIntent = false;
+  if (isVisionReply) {
     console.log("[intent] image_generation_suppressed=true reason=vision_reply_in_progress");
+  } else {
+    imageGenerationIntent = await classifyImageGenerationIntent({ text: prompt, apiKey: config?.iamhcApiKey });
+    console.log(`[intent] explicit_generation_request_ai=${imageGenerationIntent}`);
   }
-  const imageGenerationIntent = imageIntent.shouldGenerateImage && !isVisionReply;
   let searchContext = opts?.searchContext ?? null;
   let trustedGroundedReply = null;
   let realtimeSearchFailed = false;
@@ -4731,11 +4710,8 @@ async function startServer() {
           }
         }
 
-        const userIntent = classifyImageIntent(text);
-        console.log(`[intent] image_score=${userIntent.imageScore}`);
-        console.log(`[intent] security_score=${userIntent.securityScore}`);
-        console.log(`[intent] final_handler=${userIntent.finalHandler}`);
-        const explicitGenerationRequest = userIntent.shouldGenerateImage;
+        const explicitGenerationRequest = await classifyImageGenerationIntent({ text, apiKey: config.iamhcApiKey });
+        console.log(`[intent] explicit_generation_request_ai=${explicitGenerationRequest}`);
         const visionAnalysisIntent = detectVisionAnalysisIntent(text);
         const imageEditIntent = hasVisionImage && detectImageEditIntent(text);
         const visionToGenerateIntent = hasVisionImage && !imageEditIntent && detectVisionToGenerateIntent(text);
@@ -5074,7 +5050,7 @@ async function startServer() {
 
           // ── Image generation routing ─────────────────────────────────────
           // Strip any [IMAGE_GENERATION] tags the AI hallucinated without the user asking
-          const userActuallyWantsImage = classifyImageIntent(text).shouldGenerateImage && !hasVisionImage;
+          const userActuallyWantsImage = !hasVisionImage && await classifyImageGenerationIntent({ text, apiKey: config?.iamhcApiKey });
           if (!userActuallyWantsImage && /\[IMAGE_GENERATION\]/i.test(aiRes)) {
             addLog(`[img] AI hallucinated [IMAGE_GENERATION] tag — user did not request an image. Stripping tag.`, "warn");
             aiRes = aiRes.replace(/\[IMAGE_GENERATION\][\s\S]*?\[\/IMAGE_GENERATION\]/gi, '').trim();
