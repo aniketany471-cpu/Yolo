@@ -27,6 +27,8 @@ import youtubedl from "youtube-dl-exec";
 import { analyzeTelegramImageWithGemini, buildVisionPrompt } from "./services/vision.js";
 import { getRoutedResponse } from "./services/aiRouterService.js";
 import { classifyImageGenerationIntent, classifyRealtimeGroundingIntent } from "./router/router.js";
+import { MODELS, TASK, PRIMARY_MODEL } from "./config/models.js";
+import { chatCompletion } from "./providers/iamhcProvider.js";
 import { requestGemini, beginGeminiRequestScope } from "./services/geminiManager.js";
 import { getGeminiPrimaryKey } from "./services/geminiKeyManager.js";
 import { getAccuWeather } from "./services/weather.js";
@@ -4494,9 +4496,7 @@ async function startServer() {
     }
   }
   async function maybeHandleAutoReply(client2, message, config, myId, myUsername) {
-    if (config.aiEnabled !== 1) {
-      return;
-    }
+    if (config.aiEnabled !== 1) return;
     const textRaw = normalizeMessageText(message);
     const text = textRaw;
     const hasPhoto = !!message?.media?.photo;
@@ -4504,144 +4504,44 @@ async function startServer() {
     const hasImage = hasPhoto || hasImageDoc;
     if (!text && !hasImage) return;
     if (text && (text.startsWith("/") || text.startsWith("."))) return;
+    if (message.sender?.bot) return;
     const senderId = message.senderId?.toString();
     const chatIdStr = message.chatId?.toString();
     const isPrivate = message.isPrivate;
-    let isNSFWActive = false;
-    if (message.sender?.bot) return;
+
+    // Only decide WHETHER to reply here (DM, @mention, "donna" keyword, or a
+    // reply to one of the bot's own messages). Everything else — what the
+    // message is *about* — is left entirely to the AI router below.
     let shouldReply = false;
-    let reason = "";
     if (isPrivate) {
-      // DMs always get AI replies — no toggle needed
-      console.log(`[AI-Auto] DM detected from ${senderId}`);
       shouldReply = true;
-    }
-    if (!isPrivate) {
-      const lowerText = (text || "").toLowerCase();
-      // "donna" keyword: ALWAYS triggers in groups regardless of any config toggle.
-      // This is a direct name-call — it must never be gated.
-      const isDonnaKeyword = /\bdonna\b/i.test(lowerText);
-      if (isDonnaKeyword) {
-        console.log(`[AI-Auto] Triggered by donna keyword in group`);
-        shouldReply = true;
-      }
-      if (!shouldReply && config.autoReplyMention === 1) {
-        // Text-based mention: someone typed @username
-        const isMentionedByText = myUsername && lowerText.includes(`@${myUsername.toLowerCase()}`);
-        // Entity-based mention: covers accounts with no username — Telegram uses
-        // MessageEntityMentionName (tapping someone's name from contacts) which
-        // embeds the userId in the entity, NOT in the raw text.
-        const isMentionedByEntity = Array.isArray(message.entities) && message.entities.some(
-          (e) => (e.className === 'MessageEntityMentionName' || e._ === 'messageEntityMentionName') && e.userId?.toString() === myId
-        );
-        // Also catch when someone literally types the numeric ID (rare but valid)
-        const isMentionedById = !!(myId && lowerText.includes(myId));
-        const isMentioned = isMentionedByText || isMentionedByEntity || isMentionedById;
-        let isReplyToMe = false;
-        const replyMsgId = message.replyTo?.replyToMsgId;
-        if (replyMsgId) {
-          try {
-            const target = message.inputChat || message.chatId;
-            const repliedMsg = await client2.getMessages(target, {
-              ids: [replyMsgId]
-            });
-            if (repliedMsg && repliedMsg.length > 0 && (repliedMsg[0].out || repliedMsg[0].senderId?.toString() === myId)) {
-              isReplyToMe = true;
-            }
-          } catch (e) {
-            console.error(
-              `[AI-Auto] Error fetching replied message for chat ${chatIdStr}:`,
-              e
-            );
-          }
-        }
-        if (isMentioned || isReplyToMe) {
-          console.log(
-            `[AI-Auto] Triggered in group! Mentioned: ${isMentioned}, ReplyToMe: ${isReplyToMe}`
-          );
-          shouldReply = true;
-        } else {
-          reason = "Not mentioned or replied to in group";
-        }
-      } else if (!shouldReply) {
-        reason = "Group mentions disabled and no donna keyword";
-      }
-    }
-    if (!shouldReply) {
-      if (reason) console.log(`[AI-Auto] Skipping ${senderId}: ${reason}`);
-      return;
-    }
-    const blacklist = (config.autoReplyBlacklist || "").split(",").map((s) => s.trim()).filter(Boolean);
-    if (blacklist.includes(senderId) || blacklist.includes(chatIdStr)) {
-      console.log(
-        `[AI-Auto] Blocked by blacklist: ${senderId} or ${chatIdStr}`
-      );
-      return;
-    }
-    const whitelist = (config.autoReplyWhitelist || "").split(",").map((s) => s.trim()).filter(Boolean);
-    if (whitelist.length > 0 && !whitelist.includes(senderId) && !whitelist.includes(chatIdStr)) {
-      console.log(`[AI-Auto] Not in whitelist: ${senderId} or ${chatIdStr}`);
-      return;
-    }
-    if (isPrivate) {
-      // Check user-level NSFW pref regardless of global nsfwEnabled toggle
-      const userPref = db.prepare(
-        "SELECT nsfwEnabled, ageConfirmed FROM user_nsfw_prefs WHERE userId = ?"
-      ).get(senderId);
-      if (userPref?.nsfwEnabled === 1) {
-        isNSFWActive = true;
-      }
-    }
-    // Content moderation only applies in groups — DMs are unrestricted.
-    // Illegal content patterns (minors, bestiality, etc.) are still blocked everywhere.
-    const hardBlocked = [
-      /\b(minor|child|toddler|kid|infant)\s+(porn|sex|erotica|nude|naked)\b/i,
-      /\b(zoo|bestiality|animal)\s+(sex|porn)\b/i,
-      /\b(underage)\b/i
-    ];
-    if (!isPrivate) {
-      const modResult = await moderateContent(text);
-      if (!modResult.safe) {
-        console.log(
-          `[AI-Auto] NSFW Content Violation by ${senderId}: ${modResult.reason}`
-        );
-        const nsfwLogId = Math.random().toString(36).substring(2);
-        db.prepare(
-          "INSERT INTO nsfw_logs (id, timestamp, userId, chatId, message, violation) VALUES (?, ?, ?, ?, ?, ?)"
-        ).run(nsfwLogId, Date.now(), senderId, chatIdStr, text, modResult.reason);
-        return;
-      }
     } else {
-      // In DMs: only block truly illegal content (hard rules that cannot be bypassed)
-      const hardViolation = hardBlocked.some((p) => p.test(text));
-      if (hardViolation) {
-        console.log(`[AI-Auto] Hard block in DM from ${senderId}`);
-        return;
+      const lowerText = text.toLowerCase();
+      const isDonnaKeyword = /\bdonna\b/i.test(lowerText);
+      const isMentionedByText = myUsername && lowerText.includes("@" + myUsername.toLowerCase());
+      const isMentionedByEntity = Array.isArray(message.entities) && message.entities.some(
+        (e) => (e.className === "MessageEntityMentionName" || e._ === "messageEntityMentionName") && e.userId?.toString() === myId
+      );
+      let isReplyToMe = false;
+      const replyMsgId = message.replyTo?.replyToMsgId;
+      if (replyMsgId) {
+        try {
+          const target = message.inputChat || message.chatId;
+          const repliedMsg = await client2.getMessages(target, { ids: [replyMsgId] });
+          if (repliedMsg && repliedMsg.length > 0 && (repliedMsg[0].out || repliedMsg[0].senderId?.toString() === myId)) {
+            isReplyToMe = true;
+          }
+        } catch (e) {}
       }
+      shouldReply = isDonnaKeyword || isMentionedByText || isMentionedByEntity || isReplyToMe;
     }
-    console.log(
-      `[AI-Auto] Processing reply for ${chatIdStr} (NSFW: ${isNSFWActive})...`
-    );
-    addLog(
-      `Processing auto-reply for ${chatIdStr} (NSFW: ${isNSFWActive})`,
-      "info"
-    );
-    const lockKey = `auto:${chatIdStr}:${message.id}`;
+    if (!shouldReply) return;
+
+    const lockKey = "auto:" + chatIdStr + ":" + message.id;
     if (aiProcessingLock.has(lockKey)) return;
     aiProcessingLock.add(lockKey);
-    const now = Date.now();
-    // Cooldown is per-user (not per-chat) so multiple users tagging at the same
-    // time each get their own independent timer and all receive a reply.
-    const lastReplyKey = `lastAuto:${chatIdStr}:${senderId}`;
-    const lastReply = userCooldowns.get(lastReplyKey) || 0;
-    const cooldownSec = config.perUserCooldown || 10;
-    if (now - lastReply < cooldownSec * 1e3) {
-      console.log(`[AI-Auto] Cooldown active for user ${senderId} in ${chatIdStr}`);
-      aiProcessingLock.delete(lockKey);
-      return;
-    }
-    userCooldowns.set(lastReplyKey, now);
-    console.log(`[AI-Auto] AI reply triggered for ${chatIdStr}. Delay: 0s`);
+
+    console.log("[AI-Auto] AI reply triggered for " + chatIdStr + ".");
     setTimeout(async () => {
       try {
         if (!client2) return;
@@ -4649,28 +4549,11 @@ async function startServer() {
         try {
           targetPeer = await client2.getInputEntity(targetPeer);
         } catch (e) {
-          try {
-            targetPeer = await client2.getEntity(targetPeer);
-          } catch (e2) {
-          }
+          try { targetPeer = await client2.getEntity(targetPeer); } catch (e2) {}
         }
-        const status = new SmartStatus(client2, targetPeer, false, message.id);
-        if (config.typingSimulation === 1) {
-          try {
-            await client2.invoke(
-              new Api.messages.SetTyping({
-                peer: targetPeer,
-                action: new Api.SendMessageTypingAction()
-              })
-            );
-          } catch (e) {
-          }
-        }
-        // Show smarter status: search-aware message if live data is needed
-        const searchStatus = (config.searchEnabled === 1 && text)
-          ? isRealtimeQuery(text)
-          : false;
-        await status.update(searchStatus ? HS.search() : HS.think());
+        // Deterministic fact-gathering only — no keyword/regex guessing. An
+        // image attached to this message, OR to the message being replied
+        // to (e.g. "what is this?" on a reply), counts as an image present.
         let visionSourceMessage = message;
         let hasVisionImage = hasImage;
         if (!hasVisionImage && message.replyTo?.replyToMsgId) {
@@ -4683,489 +4566,85 @@ async function startServer() {
             if (rHasPhoto || rHasImageDoc) {
               visionSourceMessage = rmsg;
               hasVisionImage = true;
-              console.log("[vision] image detected from replied message");
             }
           } catch (e) {
             console.warn("[vision] failed to inspect replied media:", e.message || e);
           }
         }
 
-        const ttsIntent = detectTTSIntent(textRaw);
-        const codeFileIntent = detectCodeFileIntent(textRaw);
-        if (codeFileIntent) {
-          addLog(`[codegen] File generation mode triggered for: "${textRaw.slice(0, 80)}"`, "info");
-        }
-        if (ttsIntent && !hasVisionImage) {
-          const inlineText = extractInlineSpeakText(textRaw);
-          let speakText = inlineText;
-          if (!speakText && message.replyTo?.replyToMsgId) {
-            try {
-              const repliedMsgs = await client2.getMessages(message.inputChat || message.chatId, { ids: [message.replyTo.replyToMsgId] });
-              speakText = (repliedMsgs?.[0]?.message || "").trim();
-            } catch {}
-          }
-          if (speakText) {
-            await status.update(HS.tts());
-            await sendTTSVoiceOrText({
-              client: client2,
-              targetPeer,
-              message,
-              status,
-              text: speakText,
-              config,
-              logPrefix: "[tts] inline",
-            });
+        const status = new SmartStatus(client2, targetPeer, false, message.id);
+        await status.update(hasVisionImage ? HS.image() : HS.think());
+        const promptForRouter = myUsername
+          ? text.replace(new RegExp("@" + myUsername + "\\s*", "gi"), "").trim() || text
+          : text;
+
+        // The router (router/router.js) picks the model — vision, image
+        // generation, or general/coding chat — purely from an AI classifier
+        // call plus the deterministic fact of whether an image is attached.
+        // No keyword/regex intent-guessing lives here.
+        const routed = await getRoutedResponse({
+          text: promptForRouter,
+          attachments: { image: hasVisionImage },
+          apiKey: config.iamhcApiKey,
+        });
+
+        let replyText = null;
+        let imageBuffer = null;
+        let imageProvider = null;
+
+        if (routed.handled) {
+          // General chat / coding — router's own text-model call already ran.
+          replyText = routed.content;
+        } else if (routed.decision?.model === MODELS[TASK.VISION]) {
+          const geminiKey = (config.geminiKey || getGeminiPrimaryKey() || "").trim();
+          const vision = await analyzeTelegramImageWithGemini(client2, visionSourceMessage, geminiKey, message.__requestId || `msg-${message.id}`);
+          if (!vision) {
+            await status.finish("I couldn't analyze that image right now — the vision service is temporarily busy. Try again in a moment.");
             return;
           }
-        }
-
-        const explicitGenerationRequest = await classifyImageGenerationIntent({ text, apiKey: config.iamhcApiKey });
-        console.log(`[intent] explicit_generation_request_ai=${explicitGenerationRequest}`);
-        const visionAnalysisIntent = detectVisionAnalysisIntent(text);
-        const imageEditIntent = hasVisionImage && detectImageEditIntent(text);
-        const visionToGenerateIntent = hasVisionImage && !imageEditIntent && detectVisionToGenerateIntent(text);
-        const generationBlockedForAnalysis = hasVisionImage && !explicitGenerationRequest && !visionToGenerateIntent && !imageEditIntent;
-        console.log(`[intent] image_present=${hasVisionImage}`);
-        console.log(`[intent] explicit_generation_request=${explicitGenerationRequest}`);
-        console.log(`[intent] image_edit=${imageEditIntent}`);
-        console.log(`[intent] vision_to_generate=${visionToGenerateIntent}`);
-        if (imageEditIntent) {
-          console.log("[intent] detected=image_edit");
-        } else if (visionToGenerateIntent) {
-          console.log("[intent] detected=vision_to_generate");
-        } else if (hasVisionImage && (visionAnalysisIntent || generationBlockedForAnalysis)) {
-          console.log("[intent] detected=vision_analysis");
-          if (generationBlockedForAnalysis) {
-            console.log("[intent] generation_blocked_for_analysis=true");
-          }
-        } else if (explicitGenerationRequest && !hasVisionImage) {
-          console.log("[intent] detected=image_generation");
-        }
-
-        if (imageEditIntent) {
-          addLog(`[img] intent=image_edit instruction="${text.slice(0, 60)}"`, "info");
-          const isOwner = message.sender?.username?.toLowerCase() === "broken_identity";
-          const IMAGE_LIMIT = 2;
-          const quotaRow = db.prepare("SELECT count FROM user_image_counts WHERE userId = ?").get(senderId);
-          const usedCount = quotaRow?.count ?? 0;
-          if (!isOwner && usedCount >= IMAGE_LIMIT) {
-            const ownerInfo = (config.adminUsers || "").split(",").map(s => s.trim()).filter(Boolean)[0];
-            const ownerHint = ownerInfo ? ` Contact **${ownerInfo}** to get more.` : " Contact the bot owner to get more.";
-            await status.finish(`🖼 You've used your **${IMAGE_LIMIT} free image generations**.\n\nYou've reached your limit.${ownerHint}`);
-            addLog(`[img] Quota exceeded for ${senderId} (${usedCount}/${IMAGE_LIMIT})`, "warn");
-            return;
-          }
-          try {
-            await status.update(HS.image());
-            if (!ziEditImage) throw new Error("Image edit service not loaded — check server logs");
-            const rawImageBuffer = await client2.downloadMedia(visionSourceMessage.media, {});
-            if (!rawImageBuffer || !Buffer.isBuffer(rawImageBuffer) || rawImageBuffer.length === 0) {
-              throw new Error("Could not download the image from Telegram");
-            }
-            addLog(`[img] downloaded source image (${rawImageBuffer.length} bytes)`, "info");
-            await status.update(HS.imageRender());
-            // Wrap the user's instruction in a preservation-first prompt so the
-            // model makes only the requested change and keeps everything else intact.
-            const editInstruction = text.trim();
-            const editPrompt = `Make ONLY this specific change to the image: ${editInstruction}. ` +
-              `Preserve absolutely everything else exactly as-is — the same layout, ` +
-              `all existing text, fonts, colors, UI elements, profile photos, icons, ` +
-              `background, and overall visual style. Do not remove or alter anything ` +
-              `that was not explicitly mentioned in the instruction.`;
-            const { buffer, provider } = await ziEditImage(rawImageBuffer, editPrompt);
-            await status.update(HS.upload());
-            const caption = isOwner
-              ? `✏️ **Edited Image**\n\`${text.slice(0, 120)}\`\n\n_Unlimited ∞ — owner_`
-              : `✏️ **Edited Image**\n\`${text.slice(0, 120)}\`\n\n_${usedCount + 1}/${IMAGE_LIMIT} free generations used_`;
-            const tmpImgPath = path.join(tempDir, `img_edit_${Date.now()}.jpg`);
-            await fs.writeFile(tmpImgPath, buffer);
-            try {
-              try { await client2.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch {}
-              await client2.sendFile(targetPeer, {
-                file: tmpImgPath,
-                caption,
-                parseMode: "markdown",
-                replyTo: message.id,
-                forceDocument: false
-              });
-              if (!isOwner) db.prepare(
-                "INSERT INTO user_image_counts (userId, count, resetAt) VALUES (?, 1, ?) ON CONFLICT(userId) DO UPDATE SET count = count + 1"
-              ).run(senderId, Date.now());
-              addLog(`[img] edit_success=true provider=${provider} owner=${isOwner} (${isOwner ? "∞" : `${usedCount + 1}/${IMAGE_LIMIT}`})`, "success");
-            } finally {
-              fs.remove(tmpImgPath).catch(() => {});
-            }
-          } catch (editErr) {
-            console.error("[img] Image edit failed:", editErr.message);
-            await status.finish(`❌ **Image edit failed:** ${editErr.message.slice(0, 120)}`);
-          }
-          return;
-        }
-
-        if (visionToGenerateIntent) {
-          addLog(`[img] intent=vision_to_generate`, "info");
-          const isOwner = message.sender?.username?.toLowerCase() === "broken_identity";
-          const IMAGE_LIMIT = 2;
-          const quotaRow = db.prepare("SELECT count FROM user_image_counts WHERE userId = ?").get(senderId);
-          const usedCount = quotaRow?.count ?? 0;
-          if (!isOwner && usedCount >= IMAGE_LIMIT) {
-            const ownerInfo = (config.adminUsers || "").split(",").map(s => s.trim()).filter(Boolean)[0];
-            const ownerHint = ownerInfo ? ` Contact **${ownerInfo}** to get more.` : " Contact the bot owner to get more.";
-            await status.finish(`🖼 You've used your **${IMAGE_LIMIT} free image generations**.\n\nYou've reached your limit.${ownerHint}`);
-            addLog(`[img] Quota exceeded for ${senderId} (${usedCount}/${IMAGE_LIMIT})`, "warn");
-            return;
-          }
-          try {
-            await status.update(HS.image());
-            if (!ziGenerateImage) throw new Error("Image service not loaded — check server logs");
-            const geminiKey = (config.geminiKey || getGeminiPrimaryKey() || "").trim();
-            const visionResult = await analyzeTelegramImageWithGemini(client2, visionSourceMessage, geminiKey, message.__requestId || `msg-${message.id}`);
-            if (!visionResult) throw new Error("Could not analyze the image — vision service unavailable");
-            const visionPrompt = ziBuildImagePromptFromVision
-              ? ziBuildImagePromptFromVision(visionResult)
-              : [visionResult.summary, visionResult.detected_context].filter(Boolean).join(". ");
-            addLog(`[img] vision_prompt="${visionPrompt.slice(0, 80)}"`, "info");
-            const { forceProvider: _vImgForce } = ziParseImageModelKeyword ? ziParseImageModelKeyword(text) : { forceProvider: null };
-            await status.update(HS.imageRender());
-            const { buffer, provider } = await ziGenerateImage(visionPrompt, config, { forceProvider: _vImgForce });
-            await status.update(HS.upload());
-            const caption = isOwner
-              ? `🎨 **Similar Image Generated**\n\`${visionPrompt.slice(0, 120)}\`\n\n_Unlimited ∞ — owner_`
-              : `🎨 **Similar Image Generated**\n\`${visionPrompt.slice(0, 120)}\`\n\n_${usedCount + 1}/${IMAGE_LIMIT} free generations used_`;
-            const tmpImgPath = path.join(tempDir, `img_${Date.now()}.jpg`);
-            await fs.writeFile(tmpImgPath, buffer);
-            try {
-              try { await client2.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch {}
-              await client2.sendFile(targetPeer, {
-                file: tmpImgPath,
-                caption,
-                parseMode: "markdown",
-                replyTo: message.id,
-                forceDocument: false
-              });
-              if (!isOwner) db.prepare(
-                "INSERT INTO user_image_counts (userId, count, resetAt) VALUES (?, 1, ?) ON CONFLICT(userId) DO UPDATE SET count = count + 1"
-              ).run(senderId, Date.now());
-              addLog(`[img] vision_to_generate_success=true provider=${provider} owner=${isOwner} (${isOwner ? "∞" : `${usedCount + 1}/${IMAGE_LIMIT}`})`, "success");
-            } finally {
-              fs.remove(tmpImgPath).catch(() => {});
-            }
-          } catch (imgErr) {
-            console.error("[img] Vision-to-generate failed:", imgErr.message);
-            await status.finish(`❌ **Could not generate similar image:** ${imgErr.message.slice(0, 120)}`);
-          }
-          return;
-        }
-
-        if (explicitGenerationRequest && !hasVisionImage) {
-          addLog(`[img] intent=image_generation prompt="${text.slice(0, 60)}"`, "info");
-          console.log("[img] endpoint=/images/generations");
-
-          const isOwner = message.sender?.username?.toLowerCase() === "broken_identity";
-          const IMAGE_LIMIT = 2;
-          const quotaRow = db.prepare(
-            "SELECT count FROM user_image_counts WHERE userId = ?"
-          ).get(senderId);
-          const usedCount = quotaRow?.count ?? 0;
-
-          if (!isOwner && usedCount >= IMAGE_LIMIT) {
-            const ownerInfo = (config.adminUsers || "").split(",").map(s => s.trim()).filter(Boolean)[0];
-            const ownerHint = ownerInfo ? ` Contact **${ownerInfo}** to get more.` : " Contact the bot owner to get more.";
-            await status.finish(
-              `🖼 You've used your **${IMAGE_LIMIT} free image generations**.\n\nYou've reached your limit.${ownerHint}`
-            );
-            addLog(`[img] Quota exceeded for ${senderId} (${usedCount}/${IMAGE_LIMIT})`, "warn");
-            return;
-          }
-
-          try {
-            await status.update(HS.image());
-            await new Promise((r) => setTimeout(r, 800));
-            await status.update(HS.imageRender());
-            if (!ziGenerateImage) throw new Error("Image service not loaded — check server logs");
-            const { cleanPrompt: _imgPrompt1, forceProvider: _imgForce1 } = ziParseImageModelKeyword ? ziParseImageModelKeyword(text) : { cleanPrompt: text, forceProvider: null };
-            if (_imgForce1) console.log(`[img] user_selected_model=${_imgForce1}`);
-            const { buffer, provider } = await ziGenerateImage(_imgPrompt1, config, { forceProvider: _imgForce1 });
-            await status.update(HS.upload());
-            const caption = isOwner
-              ? `🎨 **Generated Image**\n\`${_imgPrompt1.slice(0, 120)}\`\n\n_Unlimited ∞ — owner_`
-              : `🎨 **Generated Image**\n\`${_imgPrompt1.slice(0, 120)}\`\n\n_${usedCount + 1}/${IMAGE_LIMIT} free generations used_`;
-            const tmpImgPath = path.join(tempDir, `img_${Date.now()}.jpg`);
-            await fs.writeFile(tmpImgPath, buffer);
-            try {
-              try { await client2.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch {}
-              await client2.sendFile(targetPeer, {
-                file: tmpImgPath,
-                caption,
-                parseMode: "markdown",
-                replyTo: message.id,
-                forceDocument: false
-              });
-              if (!isOwner) db.prepare(
-                "INSERT INTO user_image_counts (userId, count, resetAt) VALUES (?, 1, ?) ON CONFLICT(userId) DO UPDATE SET count = count + 1"
-              ).run(senderId, Date.now());
-              addLog(`[img] generation_success=true provider=${provider} owner=${isOwner} (${isOwner ? "∞" : `${usedCount + 1}/${IMAGE_LIMIT}`})`, "success");
-            } finally {
-              fs.remove(tmpImgPath).catch(() => {});
-            }
-          } catch (imgErr) {
-            console.error("[img] Image generation failed:", imgErr.message);
-            await status.finish(`❌ **Image generation failed:** ${imgErr.message.slice(0, 120)}`);
-          }
-          return;
-        }
-
-        // Fetch recent group chat history so Donna has cross-user context (fixes 3rd-person "what about X?" questions)
-        let groupContext = "";
-        if (!isPrivate && client2) {
-          try {
-            const recentMsgs = await client2.getMessages(message.inputChat || message.chatId, { limit: 8 });
-            const lines = [];
-            for (const m of [...recentMsgs].reverse()) {
-              if (!m?.message) continue;
-              if (m.id === message.id) continue; // skip the current message itself
-              const who = m.sender?.username || m.sender?.firstName || m.senderId?.toString() || "unknown";
-              lines.push(`${who}: ${m.message.slice(0, 300)}`);
-            }
-            if (lines.length > 0) groupContext = lines.join("\n");
-          } catch (e) {
-            console.warn("[AI-Auto] Failed to fetch group context:", e?.message || e);
-          }
-        }
-
-        // Retry up to 3 times silently — never show an error to the user mid-retry
-        let aiRes = null;
-        for (let attempt = 1; attempt <= 3; attempt++) {
-          try {
-            // Strip @botUsername mention from text so AI doesn't get confused
-            let promptForDeepSeek = myUsername
-              ? text.replace(new RegExp(`@${myUsername}\\s*`, "gi"), "").trim() || text
-              : text;
-            let visionOcrVerified = false;
-            if (codeFileIntent && !hasVisionImage) {
-              promptForDeepSeek = buildCodeFilePrompt(promptForDeepSeek);
-            }
-            if (hasVisionImage) {
-              try {
-                const geminiKey = (config.geminiKey || getGeminiPrimaryKey() || "").trim();
-                const vision = await analyzeTelegramImageWithGemini(client2, visionSourceMessage, geminiKey, message.__requestId || `msg-${message.id}`);
-                if (!vision) throw new Error("VISION_TEMPORARILY_BUSY");
-                console.log("[vision] DeepSeek formatting started");
-                promptForDeepSeek = buildVisionPrompt(text, vision);
-                // Any successful vision analysis is enough — requiring all
-                // three fields (visible_text/summary/detected_context) meant
-                // a normal photo with no text on it (visible_text empty)
-                // never counted as "verified", so downstream logic kept
-                // treating it like an unverified/uncertain result.
-                visionOcrVerified = !!(vision && vision.summary);
-              } catch (visionErr) {
-                console.warn("[vision] Gemini Vision failure:", visionErr.message || visionErr);
-                await status.finish("I couldn't analyze the image right now — the vision service is temporarily busy. Try again in a moment.");
-                return;
-              }
-            }
-            aiRes = await getAIResponse(
-              promptForDeepSeek,
-              config,
-              chatIdStr,
-              senderId,
-              isNSFWActive,
-              false,
-              message.sender?.username || null,
-              message.__requestId || `msg-${message.id}`,
-              {
-                skipRealtimeVerification: hasVisionImage && !!visionOcrVerified,
-                isVisionReply: hasVisionImage,
-                botUsername: myUsername,
-                isOwner: message.out || (myId && senderId === myId) || message.sender?.username?.toLowerCase() === DONNA_OWNER_USERNAME,
-                ownerId: myId,
-                groupContext: groupContext || ""
-              }
-            );
-            if (hasVisionImage && !!visionOcrVerified && aiRes) {
-              console.log("[vision] OCR_response_sent=true");
-            }
-            if (aiRes) break;
-          } catch (retryErr) {
-            console.error(`[AI-Auto] Attempt ${attempt} failed:`, retryErr.message || retryErr);
-          }
-          if (attempt < 3) await new Promise(r => setTimeout(r, 2000 * attempt));
-        }
-
-        // ── DM image fallback: bypass AI refusal ──────────────────────────
-        // If we're in a private DM and the user's message looks like an image
-        // request but the AI didn't produce a [IMAGE_GENERATION] tag (refused
-        // or returned plain text), inject the user's own message as the prompt.
-        const imageKeywords = /\b(create|generate|make|draw|design|render|show|paint|produce|visualize|imagine|sketch|depict|give me|send me)\b.{0,60}\b(image|photo|pic|picture|wallpaper|artwork|illustration|anime|drawing|portrait|logo|banner|poster|render|nude|naked|sexy|nsfw|explicit|hentai|girl|boy|woman|man|character|scene)\b/i;
-        if (!codeFileIntent && isPrivate && imageKeywords.test(text)) {
-          const hasTag = aiRes && /\[IMAGE_GENERATION\]/i.test(aiRes);
-          if (!hasTag) {
-            // AI refused or missed — use the user's original message as the prompt directly
-            addLog(`[img] DM fallback: AI did not produce tag, forcing image from: "${text.slice(0, 60)}"`, "warn");
-            try {
-              await status.update(HS.image());
-              if (!ziGenerateImage) throw new Error("Image service not loaded");
-              const { cleanPrompt: _imgPrompt2, forceProvider: _imgForce2 } = ziParseImageModelKeyword ? ziParseImageModelKeyword(text) : { cleanPrompt: text, forceProvider: null };
-              if (_imgForce2) console.log(`[img] user_selected_model=${_imgForce2}`);
-              const { buffer, provider } = await ziGenerateImage(_imgPrompt2, config, { forceProvider: _imgForce2 });
-              const tmpImgPath = path.join(tempDir, `img_${Date.now()}.jpg`);
-              await fs.writeFile(tmpImgPath, buffer);
-
-              // Check and update quota
-              const isOwner = message.sender?.username?.toLowerCase() === "broken_identity";
-              const IMAGE_LIMIT = 2;
-              const quotaRow = db.prepare("SELECT count FROM user_image_counts WHERE userId = ?").get(senderId);
-              const usedCount = quotaRow?.count ?? 0;
-              if (!isOwner && usedCount >= IMAGE_LIMIT) {
-                const ownerInfo = (config.adminUsers || "").split(",").map(s => s.trim()).filter(Boolean)[0];
-                const ownerHint = ownerInfo ? ` Contact **${ownerInfo}** to get more.` : " Contact the bot owner to get more.";
-                await status.finish(`🖼 You've used your **${IMAGE_LIMIT} free image generations**.\n\nYou've reached your limit.${ownerHint}`);
-                return;
-              }
-
-              try {
-                try { await client2.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch {}
-                await client2.sendFile(targetPeer, {
-                  file: tmpImgPath,
-                  caption: isOwner
-                    ? `🎨 **Generated Image**\n\`${text.slice(0, 120)}\`\n\n_Unlimited ∞ — owner_`
-                    : `🎨 **Generated Image**\n\`${text.slice(0, 120)}\`\n\n_${usedCount + 1}/${IMAGE_LIMIT} free generations used_`,
-                  parseMode: "markdown",
-                  replyTo: message.id,
-                  forceDocument: false
-                });
-                if (!isOwner) db.prepare(
-                  "INSERT INTO user_image_counts (userId, count, resetAt) VALUES (?, 1, ?) ON CONFLICT(userId) DO UPDATE SET count = count + 1"
-                ).run(senderId, Date.now());
-                addLog(`[img] DM fallback image sent via ${provider} owner=${isOwner}`, "success");
-              } finally {
-                fs.remove(tmpImgPath).catch(() => {});
-              }
-            } catch (fbErr) {
-              await status.finish(`❌ **Image generation failed:** ${fbErr.message?.slice(0, 100)}`);
-            }
-            return;
-          }
-        }
-        // ─────────────────────────────────────────────────────────────────
-
-        if (aiRes && client2) {
-          if (codeFileIntent && !hasVisionImage) {
-            const sentCodeDoc = await sendGeneratedCodeDocument({
-              client: client2,
-              targetPeer,
-              message,
-              status,
-              aiText: aiRes,
-              originalPrompt: textRaw
-            });
-            if (sentCodeDoc) return;
-          }
-
-          // ── Image generation routing ─────────────────────────────────────
-          // Strip any [IMAGE_GENERATION] tags the AI hallucinated without the user asking
-          const userActuallyWantsImage = !hasVisionImage && await classifyImageGenerationIntent({ text, apiKey: config?.iamhcApiKey });
-          if (!userActuallyWantsImage && /\[IMAGE_GENERATION\]/i.test(aiRes)) {
-            addLog(`[img] AI hallucinated [IMAGE_GENERATION] tag — user did not request an image. Stripping tag.`, "warn");
-            aiRes = aiRes.replace(/\[IMAGE_GENERATION\][\s\S]*?\[\/IMAGE_GENERATION\]/gi, '').trim();
-          }
-          const imgMatch = aiRes.match(/\[IMAGE_GENERATION\]([\s\S]*?)\[\/IMAGE_GENERATION\]/i);
-          if (imgMatch) {
-            const imgPrompt = imgMatch[1].trim();
-            addLog(`[img] Image request detected: "${imgPrompt.slice(0, 60)}..."`, "info");
-
-            // ── Per-user quota: 2 images max ─────────────────────────────
-            const IMAGE_LIMIT = 2;
-            const quotaRow = db.prepare(
-              "SELECT count FROM user_image_counts WHERE userId = ?"
-            ).get(senderId);
-            const usedCount = quotaRow?.count ?? 0;
-
-            if (usedCount >= IMAGE_LIMIT) {
-              const ownerInfo = (config.adminUsers || "").split(",").map(s => s.trim()).filter(Boolean)[0];
-              const ownerHint = ownerInfo ? ` Contact **${ownerInfo}** to get more.` : " Contact the bot owner to get more.";
-              await status.finish(
-                `🖼 You've used your **${IMAGE_LIMIT} free image generations**.\n\nYou've reached your limit.${ownerHint}`
-              );
-              addLog(`[img] Quota exceeded for ${senderId} (${usedCount}/${IMAGE_LIMIT})`, "warn");
-              return;
-            }
-            // ─────────────────────────────────────────────────────────────
-
-            try {
-              await status.update(HS.image());
-              await new Promise((r) => setTimeout(r, 800));
-              await status.update(HS.imageRender());
-              if (!ziGenerateImage) throw new Error("Image service not loaded — check server logs");
-              const { cleanPrompt: _imgPrompt3, forceProvider: _imgForce3 } = ziParseImageModelKeyword ? ziParseImageModelKeyword(imgPrompt) : { cleanPrompt: imgPrompt, forceProvider: null };
-              if (_imgForce3) console.log(`[img] user_selected_model=${_imgForce3}`);
-              const { buffer, provider } = await ziGenerateImage(_imgPrompt3, config, { forceProvider: _imgForce3 });
-              await status.update(HS.upload());
-              const caption = `🎨 **Generated Image**\n\`${_imgPrompt3.slice(0, 120)}\`\n\n_${usedCount + 1}/${IMAGE_LIMIT} free generations used_`;
-              const tmpImgPath = path.join(tempDir, `img_${Date.now()}.jpg`);
-              await fs.writeFile(tmpImgPath, buffer);
-              try {
-                try { await client2.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch {}
-                await client2.sendFile(targetPeer, {
-                  file: tmpImgPath,
-                  caption,
-                  parseMode: "markdown",
-                  replyTo: message.id,
-                  forceDocument: false
-                });
-                // Increment quota after successful send
-                db.prepare(
-                  "INSERT INTO user_image_counts (userId, count, resetAt) VALUES (?, 1, ?) ON CONFLICT(userId) DO UPDATE SET count = count + 1"
-                ).run(senderId, Date.now());
-                addLog(`[img] Image sent via ${provider} (${usedCount + 1}/${IMAGE_LIMIT}): "${imgPrompt.slice(0, 40)}"`, "success");
-              } finally {
-                fs.remove(tmpImgPath).catch(() => {});
-              }
-            } catch (imgErr) {
-              console.error("[img] Image generation failed:", imgErr.message);
-              await status.finish(`❌ **Image generation failed:** ${imgErr.message.slice(0, 120)}`);
-            }
-            return;
-          }
-
-          // ── Normal text reply (or TTS voice note if intent detected) ────
-          if (ttsIntent) {
-            const cleanText = aiRes.replace(/\*\*/g, "").replace(/[*_`#]/g, "").trim();
-            await status.update(HS.tts());
-            await sendTTSVoiceOrText({
-              client: client2,
-              targetPeer,
-              message,
-              status,
-              text: cleanText,
-              config,
-              logPrefix: `[tts] AI response to ${chatIdStr}`,
-            });
-          } else {
-            const formatted = formatAiMessage(aiRes);
-            await status.update(formatted.text, {
-              parseMode: formatted.parseMode
-            });
-            addLog(
-              `Auto-replied to ${chatIdStr}: ${formatted.text.substring(0, 30)}...`,
-              "success"
-            );
-          }
+          const visionPrompt = buildVisionPrompt(promptForRouter, vision);
+          const visionAnswer = await chatCompletion({ model: PRIMARY_MODEL, prompt: visionPrompt, apiKey: config.iamhcApiKey });
+          replyText = visionAnswer.ok ? visionAnswer.content : null;
+        } else if (routed.decision?.model === MODELS[TASK.IMAGE_GEN]) {
+          if (!ziGenerateImage) throw new Error("Image service not loaded — check server logs");
+          const { cleanPrompt, forceProvider } = ziParseImageModelKeyword
+            ? ziParseImageModelKeyword(promptForRouter)
+            : { cleanPrompt: promptForRouter, forceProvider: null };
+          const generated = await ziGenerateImage(cleanPrompt, config, { forceProvider });
+          imageBuffer = generated.buffer;
+          imageProvider = generated.provider;
         } else {
-          // All retries failed. Previously this deleted the "thinking"
-          // indicator and sent nothing — the user saw the bot go silent
-          // with no explanation. Always tell them something went wrong
-          // instead of dropping the interaction with no trace.
-          console.error(`[AI-Auto] All retries failed for ${chatIdStr}, notifying user.`);
+          // ASR/TTS or anything else the router picked that this minimal
+          // pipeline doesn't have a dedicated handler for.
+          replyText = null;
+        }
+
+        if (imageBuffer) {
+          const tmpImgPath = path.join(tempDir, `img_${Date.now()}.jpg`);
+          await fs.writeFile(tmpImgPath, imageBuffer);
           try {
-            await status.finish("Sorry, I couldn't put a reply together for that — something failed on my end. Please try again in a moment.");
-          } catch (notifyErr) {
-            console.error(`[AI-Auto] Failed to notify user of total failure:`, notifyErr.message || notifyErr);
             try { await client2.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch {}
+            await client2.sendFile(targetPeer, {
+              file: tmpImgPath,
+              caption: `🎨 **Generated Image**\n\`${promptForRouter.slice(0, 120)}\``,
+              parseMode: "markdown",
+              replyTo: message.id,
+              forceDocument: false,
+            });
+            addLog(`[img] Image sent via ${imageProvider} for ${chatIdStr}`, "success");
+          } finally {
+            fs.remove(tmpImgPath).catch(() => {});
           }
+        } else if (replyText) {
+          const formatted = formatAiMessage(replyText);
+          await status.update(formatted.text, { parseMode: formatted.parseMode });
+          addLog("Auto-replied to " + chatIdStr + ": " + formatted.text.substring(0, 30) + "...", "success");
+        } else {
+          console.error("[AI-Auto] Router produced no usable reply for " + chatIdStr + ".");
+          await status.finish("Sorry, I could not put a reply together for that - please try again in a moment.");
         }
       } catch (e) {
-        console.error(`[AI-Auto] Error:`, e.message || e);
+        console.error("[AI-Auto] Error:", e.message || e);
       } finally {
         setTimeout(() => aiProcessingLock.delete(lockKey), 6e4);
       }
@@ -5238,702 +4717,15 @@ async function startServer() {
           if (!client) return;
           const message = event.message;
           const textRaw = normalizeMessageText(message);
-          if (!message || (!textRaw && !message.media)) return;
-          const text = textRaw.toLowerCase();
-          const rawText = textRaw;
-          const isSrcCommand = /^([./])(src|web)(\s|$)/i.test(rawText);
+          if (!message || !textRaw) return;
           const senderId = message.senderId?.toString();
-          const chatIdStr = message.chatId?.toString();
-          const requestId = `tg-${chatIdStr || "chat"}-${message.id || Date.now()}`;
-          message.__requestId = requestId;
-          beginGeminiRequestScope(requestId);
-          console.log(`[gemini-manager] requestId=${requestId} source=telegram_message`);
-          if (isSrcCommand) {
-            console.log("[SRC_BYPASS] true");
-            let configSrc = db.prepare("SELECT * FROM config WHERE id = 1").get();
-            await handleSrcCommand({
-              client,
-              message,
-              config: configSrc,
-              rawQuery: rawText.replace(/^([./])(src|web)\s*/i, "").trim(),
-              requestId
-            });
-            return;
-          }
-          const isMe = message.out || myId && senderId === myId;
-          let config2 = db.prepare("SELECT * FROM config WHERE id = 1").get();
-          const admins = config2?.adminUsers ? config2.adminUsers.split(",").map((s) => s.trim()) : [];
-          // Only gate commands (/ or .) — plain mentions and DMs bypass permission check
-          // so maybeHandleAutoReply can process them normally
-          const isCommand = textRaw.startsWith("/") || textRaw.startsWith(".");
-          let auth = { allowed: true, level: PermissionLevel.PUBLIC };
-          if (isCommand) {
-            auth = await PermissionManager.check(
-              text,
-              senderId || "",
-              chatIdStr || "",
-              myId
-            );
-          } else {
-            // For non-commands, still compute the user's level for use in later checks
-            const config2tmp = db.prepare("SELECT * FROM config WHERE id = 1").get();
-            auth.level = PermissionManager.getLevel(senderId || "", myId, config2tmp);
-          }
-          console.log(
-            `[BOT] Incoming: "${textRaw.substring(0, 30)}" from ${senderId}, Level: ${auth.level}, Allowed: ${auth.allowed}`
-          );
-          if (isCommand && !auth.allowed) {
-            if (auth.reason && !isMe) {
-              await client?.sendMessage(message.chatId, {
-                message: auth.reason,
-                replyTo: message.id
-              }).catch(() => {
-              });
-            }
-            return;
-          }
-
-          // ── Maintenance mode ─────────────────────────────────────────────
-          const isMaintenanceCmd = text === "/maintenance" || text.startsWith("/maintenance ") || text === ".maintenance" || text.startsWith(".maintenance ");
-          // Only reply with maintenance notice when the bot would normally respond:
-          // – always in private/DM chats
-          // – in groups: only when directly addressed (command, @mention, or reply to bot)
-          const isMentionedHere = myUsername && text.includes(`@${myUsername.toLowerCase()}`);
-          const isReplyToBot = !!message.replyTo?.replyToMsgId;
-          const botWouldRespond = message.isPrivate || isCommand || isMentionedHere || isReplyToBot;
-          if (config2?.maintenanceMode === 1 && !isMe && !isMaintenanceCmd && botWouldRespond) {
-            await client?.sendMessage(message.chatId, {
-              message: "🔧 **Bot is under maintenance.**\nPlease check back shortly.",
-              replyTo: message.id
-            }).catch(() => {});
-            return;
-          }
-          if (text === "/aitest" || text === ".aitest" || text === "/ping" || text === ".ping" || text === "/debug" || text === ".debug") {
-            if (isMe || auth.level >= PermissionLevel.SUDO) {
-              console.log(
-                `[BOT] Diagnostic command triggered: ${text} from ${senderId}`
-              );
-              addLog(`Diagnostic: ${text} from ${senderId}`, "info");
-            }
-          }
-          const handledVideoDownload = await maybeHandleVideoDownloader({
-            client,
-            message,
-            config: config2
-          });
-          if (handledVideoDownload) return;
-
-          // Natural language song download — runs BEFORE auto-reply so it intercepts first
-          {
-            const _mp4 = textRaw.match(/(?:download|dl|get)\s+(?:this\s+)?(?:song\s+)?(.+?)\s+(?:in|as)\s+mp4\b/i)
-              || textRaw.match(/(?:download|dl|get)\s+(.+?)\s+(?:in|as)\s+video\b/i);
-            const _mp3 = !_mp4 && (
-              textRaw.match(/(?:download|dl|get)\s+(?:this\s+)?(?:song|audio|music|track)\s+(.+)/i)
-              || textRaw.match(/(?:download|dl|get)\s+(.+?)\s+(?:as|in)\s+(?:mp3|audio)\b/i)
-            );
-            if (_mp4) {
-              const q = (_mp4[1] || "").trim();
-              if (q) {
-                const st = new SmartStatus(client, message.chatId, false, message.id);
-                await handleSongVideoCommand(message, q, st, config2);
-                return;
-              }
-            }
-            if (_mp3) {
-              const q = (_mp3[1] || "").trim();
-              if (q) {
-                const st = new SmartStatus(client, message.chatId, false, message.id);
-                await handleMusicCommand(message, `music ${q}`, st);
-                return;
-              }
-            }
-          }
-
-          if (!isMe) {
-            await maybeHandleAutoReply(
-              client,
-              message,
-              config2,
-              myId,
-              myUsername
-            );
-          }
-          // NSFW commands always work in DMs — no global flag gate
-          if (message.isPrivate && !isMe) {
-            if (text === "/nsfw on" || text === ".nsfw on") {
-              // Check if user has already confirmed age before
-              const existing = db.prepare(
-                "SELECT ageConfirmed FROM user_nsfw_prefs WHERE userId = ?"
-              ).get(senderId);
-              if (existing?.ageConfirmed === 1) {
-                // Already confirmed — activate directly
-                db.prepare(
-                  "INSERT OR REPLACE INTO user_nsfw_prefs (userId, nsfwEnabled, ageConfirmed, updatedAt) VALUES (?, 1, 1, ?)"
-                ).run(senderId, Date.now());
-                await client.sendMessage(message.chatId, {
-                  message: "🔞 **Unrestricted Mode ON.** The AI will now chat freely with no restrictions. Type `/nsfw off` to disable.",
-                  replyTo: message.id
-                });
-              } else {
-                // First time — require age confirmation
-                pendingAgeConfirm.add(senderId);
-                await client.sendMessage(message.chatId, {
-                  message: "⚠️ **Age Verification Required**\n\nUnrestricted mode contains mature content intended for adults only.\n\nPlease confirm you are **18 years or older** by typing:\n\n`/confirmage yes`\n\nType `/confirmage no` to cancel.",
-                  replyTo: message.id
-                });
-              }
-              return;
-            }
-            if (text === "/confirmage yes" || text === ".confirmage yes") {
-              if (pendingAgeConfirm.has(senderId)) {
-                pendingAgeConfirm.delete(senderId);
-                db.prepare(
-                  "INSERT OR REPLACE INTO user_nsfw_prefs (userId, nsfwEnabled, ageConfirmed, updatedAt) VALUES (?, 1, 1, ?)"
-                ).run(senderId, Date.now());
-                await client.sendMessage(message.chatId, {
-                  message: "✅ **Age confirmed. Unrestricted Mode ON.**\n\nThe AI will now chat freely with no topic restrictions in this DM.\nType `/nsfw off` to return to standard mode at any time.",
-                  replyTo: message.id
-                });
-              } else {
-                await client.sendMessage(message.chatId, {
-                  message: "ℹ️ No pending confirmation. Type `/nsfw on` first.",
-                  replyTo: message.id
-                });
-              }
-              return;
-            }
-            if (text === "/confirmage no" || text === ".confirmage no") {
-              pendingAgeConfirm.delete(senderId);
-              await client.sendMessage(message.chatId, {
-                message: "✅ Cancelled. You remain in standard mode.",
-                replyTo: message.id
-              });
-              return;
-            }
-            if (text === "/nsfw off" || text === ".nsfw off") {
-              pendingAgeConfirm.delete(senderId);
-              db.prepare(
-                "INSERT OR REPLACE INTO user_nsfw_prefs (userId, nsfwEnabled, ageConfirmed, updatedAt) VALUES (?, 0, 1, ?)"
-              ).run(senderId, Date.now());
-              await client.sendMessage(message.chatId, {
-                message: "✅ **Unrestricted Mode OFF.** Returning to standard mode.",
-                replyTo: message.id
-              });
-              return;
-            }
-            if (text === "/nsfw status" || text === ".nsfw status") {
-              const userPref = db.prepare(
-                "SELECT nsfwEnabled FROM user_nsfw_prefs WHERE userId = ?"
-              ).get(senderId);
-              const nsfwStatus = userPref?.nsfwEnabled === 1 ? "ON 🔞 (unrestricted)" : "OFF 👤 (standard)";
-              await client.sendMessage(message.chatId, {
-                message: `🔞 **Unrestricted Mode:** ${nsfwStatus}`,
-                replyTo: message.id
-              });
-              return;
-            }
-          }
-          if (text === "/ping" || text === ".ping") {
-            await client?.sendMessage(message.chatId, {
-              message: "\u{1F3D3} **Pong!** Bot is alive.",
-              replyTo: message.id
-            });
-            return;
-          }
-          if (text === "/debug" || text === ".debug") {
-            const debugInfo = `\u{1F50D} **Bot Debug Info**
-- **Listener:** ${isListenerActive ? "\u2705 Active" : "\u274C Inactive"}
-- **AI Enabled:** ${config2.aiEnabled === 1 ? "\u2705 Yes" : "\u274C No"}
-- **Provider:** ${config2.aiProvider}
-- **My ID:** ${myId}
-- **Your Level:** ${auth.level}
-- **Uptime:** ${Math.floor(process.uptime() / 60)}m`;
-            await client?.sendMessage(message.chatId, {
-              message: debugInfo,
-              replyTo: message.id
-            });
-            return;
-          }
-          const cmdName = text.replace("/", "").replace(".", "").split(" ")[0];
-          if (isSourceCommand(textRaw)) {
-            await CommandProcessor.process(
-              client,
-              message,
-              config2,
-              myId,
-              "src",
-              textRaw,
-              async (status) => {
-                await status.update(HS.search());
-                const aiRes = await getAIResponse(
-                  textRaw,
-                  config2,
-                  message.chatId?.toString(),
-                  senderId,
-                  false,
-                  false,
-                  message.sender?.username || null,
-                  requestId,
-                  { isOwner: isMe || message.sender?.username?.toLowerCase() === DONNA_OWNER_USERNAME, ownerId: myId }
-                );
-                if (aiRes) {
-                  const formatted = formatAiMessage(aiRes);
-                  await status.finish(formatted.text, {
-                    parseMode: formatted.parseMode,
-                    replyTo: message.id
-                  });
-                } else {
-                  await status.fail("All realtime search providers are currently busy. Try again later.");
-                }
-              }
-            );
-            return;
-          }
-          const isPublicCommand = [
-            "ans",
-            "music",
-            "song",
-            "gif",
-            "sticker",
-            "stcr",
-            "pdf",
-            "summarize",
-            "translate",
-            "dltest",
-            "help",
-            "commands",
-            "info"
-          ].includes(cmdName);
-          if (isPublicCommand) {
-            if (!auth.allowed && !isMe) {
-              if (auth.reason)
-                await client.sendMessage(message.chatId, {
-                  message: auth.reason,
-                  replyTo: message.id
-                });
-              return;
-            }
-            if (!isMe && auth.level === PermissionLevel.PUBLIC && senderId) {
-              const now = Date.now();
-              const lastUsed = userCooldowns.get(senderId) || 0;
-              const cooldown = (config2.perUserCooldown || 10) * 1e3;
-              if (now - lastUsed < cooldown) {
-                const remain = Math.ceil((cooldown - (now - lastUsed)) / 1e3);
-                await client.sendMessage(message.chatId, {
-                  message: `\u23F3 **Cooldown:** Please wait ${remain}s.`,
-                  replyTo: message.id
-                });
-                return;
-              }
-              userCooldowns.set(senderId, now);
-            }
-            if (text === "/commands" || text === ".commands" || text === "/help" || text === ".help") {
-              await CommandProcessor.process(
-                client,
-                message,
-                config2,
-                myId,
-                "help",
-                textRaw,
-                async (status) => {
-                  const helpMsg = `\u{1F916} **Bot Commands**
-
-**Public Commands** \u{1F464}
-\u2022 \`/ans\` - Reply to get AI answer
-\u2022 \`/music\` - Search & download song
-\u2022 \`/dltest\` - Check yt-dlp/ffmpeg runtime
-\u2022 \`/gif <query>\` - Search & send GIF
-\u2022 \`/sticker\` - Reply to photo for sticker
-\u2022 \`/pdf\` - Reply to text for PDF
-\u2022 \`/summarize\` - Reply to chat history
-\u2022 \`/translate <lang>\` - Translate text
-
-**Admin Commands** \u{1F510}
-\u2022 \`/startbot\` - Resume automation
-\u2022 \`/stopbot\` - Pause automation
-\u2022 \`/sudoadd <id>\` - Add sudo user
-\u2022 \`/sudoremove <id>\` - Remove sudo user
-\u2022 \`/model <name>\` - Change AI model
-\u2022 \`/exportchat <n>\` - Export chat logs
-
-_Visit the dashboard for advanced configuration._`;
-                  await status.finish(helpMsg);
-                }
-              );
-              return;
-            }
-            if (text.startsWith("/ans") || text.startsWith(".ans")) {
-              await CommandProcessor.process(
-                client,
-                message,
-                config2,
-                myId,
-                "ans",
-                textRaw,
-                async (status) => {
-                  if (!message.replyToMsgId)
-                    return status.fail("Reply to a message with /ans");
-                  const repl = await client.getMessages(message.chatId, {
-                    ids: [message.replyToMsgId]
-                  });
-                  const promptText = (repl[0]?.message || "").trim();
-                  if (!promptText)
-                    return status.fail("No text content in replied message.");
-                  await status.update(HS.think());
-                  await taskQueue.add(async () => {
-                    const aiRes = await getAIResponse(
-                      promptText,
-                      config2,
-                      message.chatId?.toString(),
-                      senderId,
-                      false,
-                      false,
-                      message.sender?.username || null,
-                      requestId,
-                      { isOwner: isMe || message.sender?.username?.toLowerCase() === DONNA_OWNER_USERNAME, ownerId: myId }
-                    );
-                    if (aiRes) {
-                      const formatted = formatAiMessage(aiRes);
-                      await status.finish(formatted.text, {
-                        parseMode: formatted.parseMode,
-                        replyTo: repl[0].id
-                      });
-                    } else {
-                      await status.fail("AI failed to respond.");
-                    }
-                  });
-                }
-              );
-              return;
-            }
-            if (text === "/dltest" || text === ".dltest") {
-              await CommandProcessor.process(
-                client,
-                message,
-                config2,
-                myId,
-                "dltest",
-                textRaw,
-                async (status) => {
-                  try {
-                    await verifyVideoDownloaderRuntime({ installIfMissing: true });
-                    await status.finish(formatVideoDownloaderTestMessage(), { parseMode: "markdown", replyTo: message.id });
-                  } catch (e) {
-                    await status.finish(`${formatVideoDownloaderTestMessage()}\n\nerror: ${e?.message || e}`, { parseMode: "markdown", replyTo: message.id });
-                  }
-                }
-              );
-              return;
-            }
-            if (text.startsWith("/music ") || text.startsWith(".music ") || text.startsWith("/song ") || text.startsWith(".song ")) {
-              await CommandProcessor.process(
-                client,
-                message,
-                config2,
-                myId,
-                "music",
-                textRaw,
-                async (status) => {
-                  await handleMusicCommand(message, textRaw, status);
-                }
-              );
-              return;
-            }
-            if (text.startsWith("/gif ") || text.startsWith(".gif ")) {
-              await CommandProcessor.process(
-                client,
-                message,
-                config2,
-                myId,
-                "gif",
-                textRaw,
-                async (status) => {
-                  const queryString = textRaw.split(/\s+/).slice(1).join(" ");
-                  await handleGif(client, message, config2, status, queryString);
-                }
-              );
-              return;
-            }
-            if (text === "/sticker" || text === ".sticker" || text === "/stcr" || text === ".stcr") {
-              await CommandProcessor.process(
-                client,
-                message,
-                config2,
-                myId,
-                "stcr",
-                textRaw,
-                async (status) => {
-                  await handleStickerCommand(client, message, status);
-                }
-              );
-              return;
-            }
-            if (text === "/pdf" || text === ".pdf") {
-              await CommandProcessor.process(
-                client,
-                message,
-                config2,
-                myId,
-                "pdf",
-                textRaw,
-                async (status) => {
-                  await handlePdfCommand(client, message, status);
-                }
-              );
-              return;
-            }
-            if (text.startsWith("/summarize") || text.startsWith(".summarize")) {
-              await CommandProcessor.process(
-                client,
-                message,
-                config2,
-                myId,
-                "summarize",
-                textRaw,
-                async (status) => {
-                  await handleSummarize(client, message, config2, status);
-                }
-              );
-              return;
-            }
-            if (text.startsWith("/translate") || text.startsWith(".translate")) {
-              await CommandProcessor.process(
-                client,
-                message,
-                config2,
-                myId,
-                "translate",
-                textRaw,
-                async (status) => {
-                  const args = textRaw.split(/\s+/).slice(1).join(" ");
-                  await handleTranslate(client, message, config2, status, args);
-                }
-              );
-              return;
-            }
-            if (text.startsWith("/info") || text.startsWith(".info")) {
-              await CommandProcessor.process(client, message, config2, myId, "info", textRaw, async (status) => {
-                const sender = senderId || "";
-                if (!sender) return status.fail("Unable to identify user.");
-                const usage = db.prepare("SELECT count FROM info_search_usage WHERE userId = ?").get(sender);
-                if ((usage?.count || 0) >= 2) {
-                  return status.fail("🚫 Limit reached: you can use /info only 2 times.");
-                }
-                const args = textRaw.split(/\s+/).slice(1).join(" ").trim();
-                if (!args) return status.fail("Usage: /info <@username|telegram_id>");
-                if (/^\+\d{7,15}$/.test(args) || /phone/i.test(args)) {
-                  return status.fail("❌ Phone search is disabled. Use username or Telegram ID only.");
-                }
-                const init = initDonnaDb();
-                if (!init.ok) {
-                  return status.fail("⚠️ Database unavailable right now. Please try later.");
-                }
-                let mode = "username";
-                let term = args;
-                if (/^id:/i.test(args)) {
-                  mode = "id";
-                  term = args.replace(/^id:/i, "").trim();
-                } else if (/^@/.test(args)) {
-                  mode = "username";
-                  term = args.slice(1).trim();
-                } else if (/^\d{5,20}$/.test(args)) {
-                  mode = "id";
-                  term = args;
-                }
-                if (!term) return status.fail("Invalid query.");
-                const rows = donnaSearchStmtByMode[mode].all(term);
-                db.prepare("INSERT INTO info_search_usage (userId, count, updatedAt) VALUES (?, 1, ?) ON CONFLICT(userId) DO UPDATE SET count = count + 1, updatedAt = excluded.updatedAt").run(sender, Date.now());
-                await status.finish(formatInfoRows(rows));
-              });
-              return;
-            }
-          }
-          if (!auth.allowed && !isMe) {
-            if (text.startsWith("/") || text.startsWith(".")) {
-              console.log(
-                `[BOT] Blocked protected command "${cmdName}" from ${senderId}`
-              );
-            }
-            return;
-          }
-          if (isMaintenanceCmd && (isMe || auth.level >= PermissionLevel.SUDO)) {
-            const arg = textRaw.trim().split(/\s+/)[1]?.toLowerCase();
-            if (arg === "on") {
-              db.prepare("UPDATE config SET maintenanceMode = 1 WHERE id = 1").run();
-              await client?.sendMessage(message.chatId, {
-                message: "🔧 **Maintenance mode ON.** All incoming messages will receive a maintenance notice.",
-                replyTo: message.id
-              }).catch(() => {});
-            } else if (arg === "off") {
-              db.prepare("UPDATE config SET maintenanceMode = 0 WHERE id = 1").run();
-              await client?.sendMessage(message.chatId, {
-                message: "✅ **Maintenance mode OFF.** Bot is back to normal.",
-                replyTo: message.id
-              }).catch(() => {});
-            } else {
-              const current = db.prepare("SELECT maintenanceMode FROM config WHERE id = 1").get();
-              const status = current?.maintenanceMode === 1 ? "🔧 ON" : "✅ OFF";
-              await client?.sendMessage(message.chatId, {
-                message: `**Maintenance Mode:** ${status}\n\nUsage:\n\`/maintenance on\` — enable\n\`/maintenance off\` — disable`,
-                replyTo: message.id
-              }).catch(() => {});
-            }
-            return;
-          }
-          if (text.startsWith("/sudoadd ")) {
-            const target = textRaw.split(/\s+/)[1]?.trim();
-            if (target)
-              await handleSudoManagement(client, message, myId, "add", target);
-            return;
-          }
-          if (text.startsWith("/sudoremove ")) {
-            const target = textRaw.split(/\s+/)[1]?.trim();
-            if (target)
-              await handleSudoManagement(
-                client,
-                message,
-                myId,
-                "remove",
-                target
-              );
-            return;
-          }
-          if (text.startsWith("/model ") || text.startsWith(".model ") || text.startsWith("/setmodel ") || text.startsWith(".setmodel ")) {
-            const parts = textRaw.split(/\s+/);
-            const modelName = parts[1]?.trim();
-            if (!modelName) {
-              await client.sendMessage(message.chatId, {
-                message: "\u274C **Usage:** `/model <model-name>`",
-                replyTo: message.id
-              });
-              return;
-            }
-            db.prepare("UPDATE config SET activeModel = ? WHERE id = 1").run(
-              modelName
-            );
-            await client.sendMessage(message.chatId, {
-              message: `\u2705 **Model set to:** \`${modelName}\``,
-              replyTo: message.id
-            });
-            return;
-          }
-          if (text === "/models" || text === ".models") {
-            await CommandProcessor.process(
-              client,
-              message,
-              config2,
-              myId,
-              "models",
-              textRaw,
-              async (status) => {
-                await status.update(HS.models());
-                try {
-                  const response = await fetch(
-                    "https://api.iamhc.cn/v1/models",
-                    {
-                      headers: {
-                        Authorization: `Bearer ${config2.iamhcApiKey}`
-                      }
-                    }
-                  );
-                  if (response.ok) {
-                    const data = await response.json();
-                    const mStr = data.data?.map((m) => `\u2022 \`${m.id}\``).join("\n") || "No models.";
-                    await status.finish(`\u{1F916} **Models**
-
-${mStr}`);
-                  } else {
-                    await status.fail("API Error");
-                  }
-                } catch (e) {
-                  await status.fail("Failed to fetch.");
-                }
-              }
-            );
-            return;
-          }
-          if (text.startsWith("/exportchat")) {
-            await CommandProcessor.process(
-              client,
-              message,
-              config2,
-              myId,
-              "exportchat",
-              textRaw,
-              async (status) => {
-                const parts = text.split(" ");
-                const limit = parseInt(parts[1]) || 50;
-                await status.update(HS.export());
-                try {
-                  const history = await client?.getMessages(message.chatId, {
-                    limit
-                  });
-                  if (history && history.length > 0) {
-                    await status.update(HS.queue());
-                    await taskQueue.add(async () => {
-                      await status.update(HS.exportBuild());
-                      const doc = new (await getPDF())();
-                      const id = Math.random().toString(36).substring(2);
-                      const filename = `chat_export_${id}.pdf`;
-                      const filepath = path.join(exportsDir, filename);
-                      const stream = fs.createWriteStream(filepath);
-                      doc.pipe(stream);
-                      doc.fontSize(16).text(`Export for Chat ${message.chatId}`, {
-                        underline: true
-                      });
-                      doc.moveDown();
-                      const sortedHistory = [...history].reverse();
-                      for (const msg of sortedHistory) {
-                        if (msg.message) {
-                          const date = new Date(
-                            msg.date * 1e3
-                          ).toLocaleString();
-                          const sender = msg.senderId ? msg.senderId.toString() : "Unknown";
-                          doc.fontSize(10).fillColor("gray").text(`[${date}] ${sender}:`);
-                          doc.fontSize(12).fillColor("black").text(msg.message);
-                          doc.moveDown(0.5);
-                        }
-                      }
-                      doc.end();
-                      await new Promise((resolve, reject) => {
-                        stream.on("finish", resolve);
-                        stream.on("error", reject);
-                      });
-                      db.prepare(
-                        "INSERT INTO exports (id, filename, filepath, createdAt, type, status) VALUES (?, ?, ?, ?, ?, ?)"
-                      ).run(
-                        id,
-                        filename,
-                        filepath,
-                        Date.now(),
-                        "chat-export",
-                        "success"
-                      );
-                      await status.update(HS.pdfUpload());
-                      await client?.sendMessage(message.chatId, {
-                        message: "\u2705 Chat export complete!",
-                        file: filepath
-                      });
-                      await status.done(null, 0);
-                      addLog(
-                        `Exported ${sortedHistory.length} messages to ${filename}`,
-                        "success"
-                      );
-                    });
-                  } else {
-                    await status.fail("No messages found to export.");
-                  }
-                } catch (err) {
-                  await status.fail(`Export failed: ${String(err)}`);
-                  addLog(`Chat export failed: ${String(err)}`, "error");
-                }
-              }
-            );
-            return;
-          }
+          const isMe = message.out || (myId && senderId === myId);
+          if (isMe) return;
+          const config2 = db.prepare("SELECT * FROM config WHERE id = 1").get();
+          await maybeHandleAutoReply(client, message, config2, myId, myUsername);
         } catch (err) {
           console.error("[BOT] Error in messageHandler:", err);
-          addLog(`Handler Error: ${err.message || String(err)}`, "error");
+          addLog("Handler Error: " + (err.message || String(err)), "error");
         }
       };
       client.addEventHandler(
