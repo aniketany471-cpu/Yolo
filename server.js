@@ -26,7 +26,7 @@ import yts from "yt-search";
 import youtubedl from "youtube-dl-exec";
 import { analyzeTelegramImageWithGemini, buildVisionPrompt } from "./services/vision.js";
 import { getRoutedResponse } from "./services/aiRouterService.js";
-import { classifyImageGenerationIntent } from "./router/router.js";
+import { classifyImageGenerationIntent, classifyRealtimeGroundingIntent } from "./router/router.js";
 import { requestGemini, beginGeminiRequestScope } from "./services/geminiManager.js";
 import { getGeminiPrimaryKey } from "./services/geminiKeyManager.js";
 import { getAccuWeather } from "./services/weather.js";
@@ -1042,7 +1042,11 @@ const MAX_RETRIES = 1;             // 1 retry = max 30s total before giving up
 
 // Single AI provider: iamhc (https://api.iamhc.cn) — OpenAI-compatible, many models.
 const IAMHC_BASE_URL = (process.env.IAMHC_BASE_URL || "https://api.iamhc.cn/v1").replace(/\/+$/, "");
-const NORMAL_CHAT_MODEL = process.env.IAMHC_DEFAULT_MODEL || "gpt-4o";
+// "gpt-4o" was the old default here but is a retired/unreachable model on
+// this provider ("no available channel for model") — every grounding call
+// using it fails outright. DeepSeek-V4-Pro matches the router's own default
+// general-purpose model (config/models.js), which is confirmed reachable.
+const NORMAL_CHAT_MODEL = process.env.IAMHC_DEFAULT_MODEL || "DeepSeek-V4-Pro";
 const CODING_MODEL = NORMAL_CHAT_MODEL;
 const GROUNDING_MODEL = NORMAL_CHAT_MODEL;
 const GROUNDING_MODEL_LOG_NAME = "Iamhc";
@@ -2419,6 +2423,13 @@ function formatAiMessage(text) {
 // there is no separate provider-specific image function here anymore.
 async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = false, forceDeep = false, senderUsername = null, requestId = "chat", opts = {}) {
   const rawUserMessage = String(prompt || "").trim();
+  // Set whenever this call is formatting a reply about an image the user
+  // already sent (vision flow). In that case `prompt`/`rawUserMessage` is an
+  // AI-generated *description* of the image, not the user's own words — it
+  // must never be treated as the basis for image-generation or real-time
+  // web-grounding intent (a keyword-dense description like a pricing table
+  // screenshot can otherwise false-positive on "score"/"price"/etc.).
+  const isVisionReply = !!opts?.isVisionReply;
   const isOwnerConversation = isDonnaOwnerConversation(userId, senderUsername, opts);
   const normalizedText = rawUserMessage.toLowerCase();
   if (
@@ -2440,7 +2451,11 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
   }
   const sourceMode = isSourceCommand(rawUserMessage);
   const sourceQuery = sourceMode ? extractSourceQuery(rawUserMessage) : "";
-  const requiresGrounding = isRealtimeQuery(rawUserMessage);
+  // isVisionReply short-circuits the classifier call outright — a reply
+  // describing an image the user sent should never trigger live web
+  // grounding, and skipping the AI call here also saves a round-trip.
+  const requiresGrounding = isVisionReply ? false : await classifyRealtimeGroundingIntent({ text: rawUserMessage, apiKey: config?.iamhcApiKey });
+  console.log(`[intent] requires_grounding_ai=${requiresGrounding}${isVisionReply ? " (suppressed: vision_reply)" : ""}`);
   console.log("[RAW MESSAGE]", rawUserMessage);
   if (sourceMode) {
     console.log("[SRC_MODE] enabled");
@@ -2823,7 +2838,6 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
   // simple "what is this" into a botched image-gen attempt. Never treat a
   // vision reply as a generation request — the user is asking about an
   // existing image, not asking to create a new one.
-  const isVisionReply = !!opts?.isVisionReply;
   // isVisionReply short-circuits the classifier call entirely — a vision
   // reply is never a generation request, and skipping the AI call here also
   // saves a redundant round-trip.
@@ -2846,24 +2860,19 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
     console.log("[intent] skipping_serper=true");
     console.log("[img] generation_started=true");
   } else {
-    // Only trigger grounding for sports / weather / news keywords, or pasted URLs
+    // Trigger grounding only for AI-classified real-time-info needs (sports/
+    // weather/news/prices etc. all fold into requiresGrounding above) or an
+    // actual pasted URL — a real, deterministic fact about the message
+    // rather than a guess about its wording, so it's kept as-is.
     const promptTrimmed = prompt.trim();
-    const msgLower = rawUserMessage.toLowerCase();
-
-    const hasSportsKeyword = /\b(cricket|ipl|t20|odi|test match|test series|one day|twenty20|drs|super over|powerplay|football|soccer|nba|nfl|nhl|nba finals|nfl draft|ufc|mma|bellator|pfl|f1|formula 1|formula one|grand prix|qualifying|pit stop|fastest lap|pole position|live match|match result|live score|scorecard|wicket|wickets|run rate|hat trick|penalty kick|red card|yellow card|offside|own goal|playing 11|injury update|transfer news|transfer window|points table|standings|leaderboard|podium|ranking|tournament|champion|champions|trophy|cup final|title race|premier league|epl|la liga|bundesliga|serie a|ligue 1|eredivisie|mls|copa america|euros|euro 2024|euro 2025|euro 2026|world cup|asia cup|psl|bbl|cpl|npl|sa20|illt20|wpl|wbbl|kabaddi|pkl|field hockey|badminton|bwf|thomas cup|uber cup|sudirman cup|tennis|wimbledon|us open|french open|roland garros|australian open|atp finals|wta|grand slam|davis cup|boxing match|wbc|wba|ibf|wbo|fight night|wrestling|wwe|aew|smackdown|olympics|commonwealth games|asian games|paralympics|chess tournament|fide|esports|valorant|csgo|dota 2|lol worlds|swimming|athletics|100m|marathon|f2|indycar|motogp|nascar|superbike|wrc|snooker|darts|cycling|tour de france|vuelta|giro|rugby|six nations|super rugby|nrl|afl|baseball|mlb|world series|nba draft)\b/i.test(msgLower);
-
-    const hasWeatherKeyword = /\b(weather|temperature|temp|celsius|fahrenheit|forecast|humidity|rainfall|thunderstorm|typhoon|cyclone|hurricane|tornado|heatwave|heat wave|cold wave|cold snap|aqi|air quality|air pollution|pm2\.?5|pm10|wind speed|uv index|snowfall|blizzard|smog|monsoon|drizzle|black ice|flooding|drought)\b/i.test(msgLower);
-
-    const hasNewsKeyword = /\b(breaking news|latest news|just in|top news|headlines|today news|current news|live news|reportedly|sources say|election result|election 2024|election 2025|election 2026|exit poll|verdict|judgment|acquitted|convicted|sentenced|arrested|detained|jailbreak|terror attack|terrorist|explosion|blast|bombing|shooting|gunfire|plane crash|train crash|car crash|earthquake|natural disaster|eruption|volcano|landslide|tsunami|product launch|unveiled|prime minister|vice president|cabinet|parliament|congress|senate|government policy|legislation|economy|gdp|inflation|deflation|rate cut|rate hike|rbi|sebi|federal reserve|ecb|imf|world bank|modi|trump|biden|harris|putin|zelensky|zelenskyy|nato|united nations|g20|g7|brics|bilateral|ceasefire|peace talks|invasion|offensive|airstrike|drone strike|military operation|trade war|sanctions|embargo|tariff|protest|riot|demonstration|coup|emergency|lockdown|curfew|merger|acquisition|takeover|buyout|ipo|stock market|sensex|nifty|dow jones|nasdaq|s&p 500|bitcoin|btc|ethereum|eth|crypto)\b/i.test(msgLower);
-
     const hasUrl = /https?:\/\/\S+|www\.\S+\.\S+|\b(bit\.ly|tinyurl\.com|t\.co|goo\.gl|ow\.ly|youtu\.be|rb\.gy|cutt\.ly|short\.io|tiny\.cc|is\.gd|buff\.ly|dlvr\.it|ift\.tt|wp\.me|fb\.me|lnkd\.in|amzn\.to|adf\.ly|clck\.ru|shorturl\.at|t\.me|telegram\.me)\/\S+/i.test(rawUserMessage);
 
-    let shouldSearch = requiresGrounding || hasSportsKeyword || hasWeatherKeyword || hasNewsKeyword || hasUrl;
+    let shouldSearch = requiresGrounding || hasUrl;
 
     if (shouldSearch) {
-      console.log(`[search] triggered — realtime=${requiresGrounding} sports=${hasSportsKeyword} weather=${hasWeatherKeyword} news=${hasNewsKeyword} url=${hasUrl}`);
+      console.log(`[search] triggered — realtime_ai=${requiresGrounding} url=${hasUrl}`);
     } else {
-      console.log(`[search] skipped — no sports/weather/news keyword or URL`);
+      console.log(`[search] skipped — no live-info need detected and no URL`);
     }
     if (shouldSearch) {
       // ── PRIMARY: Iamhc grounding model ────────────────────────────────
@@ -4943,7 +4952,12 @@ async function startServer() {
                 if (!vision) throw new Error("VISION_TEMPORARILY_BUSY");
                 console.log("[vision] DeepSeek formatting started");
                 promptForDeepSeek = buildVisionPrompt(text, vision);
-                visionOcrVerified = !!(vision?.visible_text && vision?.summary && vision?.detected_context);
+                // Any successful vision analysis is enough — requiring all
+                // three fields (visible_text/summary/detected_context) meant
+                // a normal photo with no text on it (visible_text empty)
+                // never counted as "verified", so downstream logic kept
+                // treating it like an unverified/uncertain result.
+                visionOcrVerified = !!(vision && vision.summary);
               } catch (visionErr) {
                 console.warn("[vision] Gemini Vision failure:", visionErr.message || visionErr);
                 await status.finish("I couldn't analyze the image right now — the vision service is temporarily busy. Try again in a moment.");
@@ -5138,9 +5152,17 @@ async function startServer() {
             );
           }
         } else {
-          // All retries failed — delete the thinking indicator silently, no error shown
-          console.error(`[AI-Auto] All retries failed for ${chatIdStr}, dropping silently.`);
-          try { await client2.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch {}
+          // All retries failed. Previously this deleted the "thinking"
+          // indicator and sent nothing — the user saw the bot go silent
+          // with no explanation. Always tell them something went wrong
+          // instead of dropping the interaction with no trace.
+          console.error(`[AI-Auto] All retries failed for ${chatIdStr}, notifying user.`);
+          try {
+            await status.finish("Sorry, I couldn't put a reply together for that — something failed on my end. Please try again in a moment.");
+          } catch (notifyErr) {
+            console.error(`[AI-Auto] Failed to notify user of total failure:`, notifyErr.message || notifyErr);
+            try { await client2.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch {}
+          }
         }
       } catch (e) {
         console.error(`[AI-Auto] Error:`, e.message || e);
