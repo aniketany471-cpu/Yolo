@@ -65,12 +65,18 @@ const GENERAL_EXTRA_FALLBACKS = (process.env.MODEL_GENERAL_EXTRA_FALLBACKS || "p
   .map((m) => m.trim())
   .filter(Boolean);
 
+// Cross-provider redundancy for normal chat: DeepSeek-V4-Flash (free, on
+// api17) is tried first, then DeepSeek-V4-Pro (on the original iamhc
+// gateway) as the next-best model — so a normal chat survives either whole
+// PROVIDER being down, not just one model within a single provider.
+const DEEPSEEK_PRO_MODEL = process.env.MODEL_GENERAL_IAMHC_FALLBACK || "DeepSeek-V4-Pro";
+
 // Ordered "next best model" chains per text task. When a reply fails, the
 // caller tries each subsequent model here in turn instead of giving up or
 // retrying the same broken model.
 const TEXT_MODEL_CHAINS = {
-  [TASK.GENERAL]: dedupe([MODELS[TASK.GENERAL], GENERAL_FALLBACK_MODEL, ...GENERAL_EXTRA_FALLBACKS]),
-  [TASK.CODING]: dedupe([MODELS[TASK.CODING], MODELS[TASK.GENERAL], GENERAL_FALLBACK_MODEL, ...GENERAL_EXTRA_FALLBACKS]),
+  [TASK.GENERAL]: dedupe([MODELS[TASK.GENERAL], DEEPSEEK_PRO_MODEL, GENERAL_FALLBACK_MODEL, ...GENERAL_EXTRA_FALLBACKS]),
+  [TASK.CODING]: dedupe([MODELS[TASK.CODING], MODELS[TASK.GENERAL], DEEPSEEK_PRO_MODEL, GENERAL_FALLBACK_MODEL, ...GENERAL_EXTRA_FALLBACKS]),
 };
 
 /**
