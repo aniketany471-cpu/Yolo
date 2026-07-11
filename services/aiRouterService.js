@@ -7,8 +7,9 @@
 // the two text-based models (general chat + coding).
 // ──────────────────────────────────────────────────────────────────────────
 import { route } from "../router/router.js";
-import { chatCompletion, normalizeContextMessages } from "../providers/iamhcProvider.js";
-import { PRIMARY_MODEL, MODELS, TASK } from "../config/models.js";
+import { normalizeContextMessages } from "../providers/iamhcProvider.js";
+import { routedChatCompletion as chatCompletion } from "./providerGateway.js";
+import { PRIMARY_MODEL, GENERAL_FALLBACK_MODEL, MODELS, TASK } from "../config/models.js";
 import { logModelFallback } from "../utils/logger.js";
 
 const TEXT_MODELS = new Set([MODELS[TASK.GENERAL], MODELS[TASK.CODING]]);
@@ -34,7 +35,12 @@ export async function getRoutedResponse({ text, context = [], systemInstruction,
   const messages = normalizeContextMessages(text, context, systemInstruction);
   let result = await chatCompletion({ model: decision.model, messages, apiKey });
 
-  if (!result.ok && decision.model !== PRIMARY_MODEL) {
+  if (!result.ok && decision.model === PRIMARY_MODEL) {
+    // DeepSeek (the general/primary model) failed — try the GPT model
+    // instead of retrying the same model that just failed.
+    logModelFallback({ from: decision.model, to: GENERAL_FALLBACK_MODEL, cause: result.error || `status_${result.status}` });
+    result = await chatCompletion({ model: GENERAL_FALLBACK_MODEL, messages, apiKey });
+  } else if (!result.ok && decision.model !== PRIMARY_MODEL) {
     logModelFallback({ from: decision.model, to: PRIMARY_MODEL, cause: result.error || `status_${result.status}` });
     result = await chatCompletion({ model: PRIMARY_MODEL, messages, apiKey });
   }
