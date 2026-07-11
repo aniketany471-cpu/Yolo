@@ -1,7 +1,18 @@
 // ──────────────────────────────────────────────────────────────────────────
-// Central model configuration for Donna (Skye).
+// Central model configuration for Donna.
 // This is the ONLY place model names / provider settings should be edited.
 // Switching a model = change a value here, nothing else.
+//
+// PROVIDER ROUTING — automatic, name-based:
+//   "owner/model"  (contains "/") → api.17.wtf  (API17_API_KEY)
+//   "BareModelName" (no "/")      → api.iamhc.cn (IAMHC_API_KEY)
+//
+// NORMAL CHAT FALLBACK ORDER — both DeepSeek Flash providers first:
+//   1. posiden/deepseek-v4-flash  — api17 gateway  (primary)
+//   2. DeepSeek-V4-Flash          — iamhc gateway  (same model, second provider)
+//   3. posiden/mimo-v2.5          — api17 fallback  (first non-DeepSeek)
+//   4. posiden/hy3                — api17 fallback
+//   5. posiden/nemotron-3-ultra   — api17 fallback
 // ──────────────────────────────────────────────────────────────────────────
 
 export const IAMHC_BASE_URL = (process.env.IAMHC_BASE_URL || "https://api.iamhc.cn/v1").replace(/\/+$/, "");
@@ -17,96 +28,87 @@ function api17Key() {
 
 // Task categories the router can select between.
 export const TASK = {
-  GENERAL: "general",       // chat, reasoning, planning, writing, fallback
-  VISION: "vision",         // image understanding, screenshots, OCR, documents
-  CODING: "coding",         // coding, debugging, code generation, refactoring
-  IMAGE_GEN: "image_gen",   // image generation and editing
-  ASR: "asr",               // speech-to-text
-  TTS: "tts",               // text-to-speech
+  GENERAL:   "general",    // chat, reasoning, planning, writing, fallback
+  VISION:    "vision",     // image understanding, screenshots, OCR, documents
+  CODING:    "coding",     // coding, debugging, code generation, refactoring
+  IMAGE_GEN: "image_gen",  // image generation and editing
+  ASR:       "asr",        // speech-to-text
+  TTS:       "tts",        // text-to-speech
 };
 
-// Model assigned to each task category. Change values here to swap models.
-// GENERAL and VISION now run on the api.17.wtf gateway (see MODEL_PROVIDER
-// below) — DeepSeek for normal chat.
-//
-// NOTE on GPT models on api.17.wtf: as of this account's current key, the
-// real "gpt-5.4"/"gpt-5.5" models return HTTP 402 "insufficient tokens" (no
-// paid balance), "persia/gpt-5.4-mini" returns HTTP 403 (no permission for
-// that group), and "latina/gpt-5.6-luna" returns HTTP 200 but always empty
-// content (broken upstream). None of them are usable right now, so
-// MODEL_GENERAL_FALLBACK and MODEL_VISION default to "posiden/mimo-v2.5" —
-// a free model on the same account that actually works for both text and
-// image input. Once the account has GPT access/balance, just set
-// MODEL_VISION / MODEL_GENERAL_FALLBACK env vars to the real gpt-5.x model
-// name — no code changes needed.
+// ── Primary model per task ─────────────────────────────────────────────────
+// Change a value here (or set the matching env var on Railway) to swap models.
 export const MODELS = {
-  [TASK.GENERAL]: process.env.MODEL_GENERAL || "posiden/deepseek-v4-flash",
-  [TASK.VISION]: process.env.MODEL_VISION || "posiden/mimo-v2.5",
-  [TASK.CODING]: process.env.MODEL_CODING || "kat-coder-pro-v2",
+  [TASK.GENERAL]:   process.env.MODEL_GENERAL   || "posiden/deepseek-v4-flash", // api17
+  [TASK.VISION]:    process.env.MODEL_VISION    || "posiden/mimo-v2.5",          // api17
+  [TASK.CODING]:    process.env.MODEL_CODING    || "kat-coder-pro-v2",           // iamhc
   [TASK.IMAGE_GEN]: process.env.MODEL_IMAGE_GEN || "step-image-edit-2",
-  [TASK.ASR]: process.env.MODEL_ASR || "stepaudio-2.5-asr",
-  [TASK.TTS]: process.env.MODEL_TTS || "stepaudio-2.5-tts",
+  [TASK.ASR]:       process.env.MODEL_ASR       || "stepaudio-2.5-asr",
+  [TASK.TTS]:       process.env.MODEL_TTS       || "stepaudio-2.5-tts",
 };
 
-// Fallback for normal chat — used when the DeepSeek general model fails, so
-// "normal chats" get a second model on api.17.wtf instead of retrying the
-// same failed model. See the GPT note above for why this isn't a gpt-5.x
-// model yet.
+// ── DeepSeek Flash on the iamhc gateway ────────────────────────────────────
+// Same DeepSeek Flash model, second provider. Tried immediately after the
+// api17 variant fails — so both DeepSeek providers are exhausted before we
+// ever touch any non-DeepSeek model.
+// Override via MODEL_DEEPSEEK_IAMHC env var if iamhc ever renames it.
+const DEEPSEEK_IAMHC = process.env.MODEL_DEEPSEEK_IAMHC || process.env.MODEL_GENERAL_IAMHC_FALLBACK || "DeepSeek-V4-Flash";
+
+// ── First non-DeepSeek fallback ─────────────────────────────────────────────
+// Used after both DeepSeek Flash providers fail.
 export const GENERAL_FALLBACK_MODEL = process.env.MODEL_GENERAL_FALLBACK || "posiden/mimo-v2.5";
 
-function dedupe(arr) {
-  return arr.filter(Boolean).filter((m, i, a) => a.indexOf(m) === i);
-}
-
-// Further models tried, in order, if the router's chosen model AND its
-// immediate fallback both fail — configurable without code changes.
+// ── Additional fallbacks ────────────────────────────────────────────────────
+// Tried in order after GENERAL_FALLBACK_MODEL. Comma-separated, no spaces.
 const GENERAL_EXTRA_FALLBACKS = (process.env.MODEL_GENERAL_EXTRA_FALLBACKS || "posiden/hy3,posiden/nemotron-3-ultra")
   .split(",")
   .map((m) => m.trim())
   .filter(Boolean);
 
-// Cross-provider redundancy for normal chat: DeepSeek-V4-Flash (free, on
-// api17) is tried first, then DeepSeek-V4-Flash on the original iamhc
-// gateway as the next-best model — so a normal chat survives either whole
-// PROVIDER being down, not just one model within a single provider.
-// NOTE: "DeepSeek-V4-Pro" on iamhc was tested and is currently timing out
-// (30s, no response) even with a valid key — iamhc's own Flash model
-// responds normally (~7s), so that's the default here instead. Once Pro is
-// confirmed healthy again, set MODEL_GENERAL_IAMHC_FALLBACK=DeepSeek-V4-Pro.
-const IAMHC_GENERAL_FALLBACK = process.env.MODEL_GENERAL_IAMHC_FALLBACK || "DeepSeek-V4-Flash";
+function dedupe(arr) {
+  return arr.filter(Boolean).filter((m, i, a) => a.indexOf(m) === i);
+}
 
-// Ordered "next best model" chains per text task. When a reply fails, the
-// caller tries each subsequent model here in turn instead of giving up or
-// retrying the same broken model.
+// ── Full ordered fallback chains per task ──────────────────────────────────
+//
+// GENERAL:  api17-DeepSeek → iamhc-DeepSeek → mimo → hy3 → nemotron
+// CODING:   kat-coder-pro  → api17-DeepSeek  → iamhc-DeepSeek → mimo → …
+//
+// getTextModelChain() always prepends the actual router-chosen model so any
+// env-var override is tried first even if it doesn't appear in this list.
 const TEXT_MODEL_CHAINS = {
-  [TASK.GENERAL]: dedupe([MODELS[TASK.GENERAL], IAMHC_GENERAL_FALLBACK, GENERAL_FALLBACK_MODEL, ...GENERAL_EXTRA_FALLBACKS]),
-  [TASK.CODING]: dedupe([MODELS[TASK.CODING], MODELS[TASK.GENERAL], IAMHC_GENERAL_FALLBACK, GENERAL_FALLBACK_MODEL, ...GENERAL_EXTRA_FALLBACKS]),
+  [TASK.GENERAL]: dedupe([
+    MODELS[TASK.GENERAL],   // posiden/deepseek-v4-flash (api17)  ← PRIMARY
+    DEEPSEEK_IAMHC,         // DeepSeek-V4-Flash         (iamhc)  ← SECOND DEEPSEEK
+    GENERAL_FALLBACK_MODEL, // posiden/mimo-v2.5          (api17)  ← first non-DeepSeek fallback
+    ...GENERAL_EXTRA_FALLBACKS,
+  ]),
+  [TASK.CODING]: dedupe([
+    MODELS[TASK.CODING],    // kat-coder-pro-v2           (iamhc)  ← PRIMARY for coding
+    MODELS[TASK.GENERAL],   // posiden/deepseek-v4-flash  (api17)
+    DEEPSEEK_IAMHC,         // DeepSeek-V4-Flash          (iamhc)
+    GENERAL_FALLBACK_MODEL,
+    ...GENERAL_EXTRA_FALLBACKS,
+  ]),
 };
 
 /**
- * Full ordered list of models to try for a text reply, starting with the
- * router's actual chosen model (even if it's a stale override that isn't
- * literally MODELS[task]) followed by that task's proven-working fallback
- * chain, deduped.
+ * Full ordered list of models to try for a text reply.
+ * Starts with the router's chosen model, then that task's fallback chain,
+ * deduped. For any unknown model the GENERAL chain is used, ensuring both
+ * DeepSeek Flash providers are always tried before non-DeepSeek models.
  */
 export function getTextModelChain(model) {
   const entry = Object.entries(MODELS).find(([, m]) => m === model);
-  const task = entry ? entry[0] : null;
-  const chain = TEXT_MODEL_CHAINS[task] || [MODELS[TASK.GENERAL], GENERAL_FALLBACK_MODEL, ...GENERAL_EXTRA_FALLBACKS];
+  const task  = entry ? entry[0] : null;
+  const chain = TEXT_MODEL_CHAINS[task] || TEXT_MODEL_CHAINS[TASK.GENERAL];
   return dedupe([model, ...chain]);
 }
 
-// Looks up which gateway a given model name should be called through.
-// Detected from the model NAME itself, not from which task it's assigned
-// to — every model on api.17.wtf is namespaced as "owner/model" (e.g.
-// "posiden/deepseek-v4-flash", "persia/gpt-5.4-mini"), while every iamhc
-// model is a bare name (e.g. "DeepSeek-V4-Pro", "kat-coder-pro-v2").
-//
-// This must stay name-based rather than task-based: if a task's env var
-// override (MODEL_GENERAL, MODEL_VISION, ...) still points at an old
-// iamhc model name (e.g. leftover "DeepSeek-V4-Pro" on a deploy that
-// predates api.17.wtf), a task-based map would wrongly send it to api17
-// and get an empty/failed response even though the model exists on iamhc.
+/**
+ * Returns which gateway a given model should be called through.
+ * Detection is name-based: "owner/model" → api17, bare name → iamhc.
+ */
 export function getProviderForModel(model) {
   if (!model) return "iamhc";
   return model.includes("/") ? "api17" : "iamhc";
@@ -115,12 +117,11 @@ export function getProviderForModel(model) {
 // The primary/default model — used whenever routing is skipped or falls back.
 export const PRIMARY_MODEL = MODELS[TASK.GENERAL];
 
-// Lightweight router model. If unset/unavailable, the router falls back to
-// heuristic (attachment/keyword) routing only, never to answering the user.
+// Lightweight router model (for intent classification only — never answers users).
+// Falls back to heuristic routing if unset/unavailable.
 export const ROUTER_MODEL = process.env.MODEL_ROUTER || "sensenova-6.7-flash-lite";
 
-// Router never answers user questions — this is only a confidence floor for
-// its own model choice. Below this, we always use the primary model.
+// Router confidence floor. Below this we always use the primary model.
 export const ROUTER_CONFIDENCE_THRESHOLD = 0.70;
 
 export const getIamhcApiKey = (overrideKey) => {
