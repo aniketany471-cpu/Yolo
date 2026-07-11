@@ -2838,11 +2838,23 @@ async function getAIResponse(prompt, config, chatId, userId, isNSFWActive = fals
     }
   }
   // ──────────────────────────────────────────────────────────────────────────
+  // When this call is formatting a reply about an image the user already
+  // sent (vision flow), `prompt` here is the vision-generated description
+  // text (buildVisionPrompt output) — not the user's literal message. That
+  // description can be keyword-dense (mentions of "photo", "art", "stream",
+  // etc.) and false-positive as an image-*generation* request, hijacking a
+  // simple "what is this" into a botched image-gen attempt. Never treat a
+  // vision reply as a generation request — the user is asking about an
+  // existing image, not asking to create a new one.
+  const isVisionReply = !!opts?.isVisionReply;
   const imageIntent = classifyImageIntent(prompt);
   console.log(`[intent] image_score=${imageIntent.imageScore}`);
   console.log(`[intent] security_score=${imageIntent.securityScore}`);
   console.log(`[intent] final_handler=${imageIntent.finalHandler}`);
-  const imageGenerationIntent = imageIntent.shouldGenerateImage;
+  if (isVisionReply && imageIntent.shouldGenerateImage) {
+    console.log("[intent] image_generation_suppressed=true reason=vision_reply_in_progress");
+  }
+  const imageGenerationIntent = imageIntent.shouldGenerateImage && !isVisionReply;
   let searchContext = opts?.searchContext ?? null;
   let trustedGroundedReply = null;
   let realtimeSearchFailed = false;
@@ -4973,6 +4985,7 @@ async function startServer() {
               message.__requestId || `msg-${message.id}`,
               {
                 skipRealtimeVerification: hasVisionImage && !!visionOcrVerified,
+                isVisionReply: hasVisionImage,
                 botUsername: myUsername,
                 isOwner: message.out || (myId && senderId === myId) || message.sender?.username?.toLowerCase() === DONNA_OWNER_USERNAME,
                 ownerId: myId,
