@@ -54,6 +54,38 @@ export const MODELS = {
 // model yet.
 export const GENERAL_FALLBACK_MODEL = process.env.MODEL_GENERAL_FALLBACK || "posiden/mimo-v2.5";
 
+function dedupe(arr) {
+  return arr.filter(Boolean).filter((m, i, a) => a.indexOf(m) === i);
+}
+
+// Further models tried, in order, if the router's chosen model AND its
+// immediate fallback both fail — configurable without code changes.
+const GENERAL_EXTRA_FALLBACKS = (process.env.MODEL_GENERAL_EXTRA_FALLBACKS || "posiden/hy3,posiden/nemotron-3-ultra")
+  .split(",")
+  .map((m) => m.trim())
+  .filter(Boolean);
+
+// Ordered "next best model" chains per text task. When a reply fails, the
+// caller tries each subsequent model here in turn instead of giving up or
+// retrying the same broken model.
+const TEXT_MODEL_CHAINS = {
+  [TASK.GENERAL]: dedupe([MODELS[TASK.GENERAL], GENERAL_FALLBACK_MODEL, ...GENERAL_EXTRA_FALLBACKS]),
+  [TASK.CODING]: dedupe([MODELS[TASK.CODING], MODELS[TASK.GENERAL], GENERAL_FALLBACK_MODEL, ...GENERAL_EXTRA_FALLBACKS]),
+};
+
+/**
+ * Full ordered list of models to try for a text reply, starting with the
+ * router's actual chosen model (even if it's a stale override that isn't
+ * literally MODELS[task]) followed by that task's proven-working fallback
+ * chain, deduped.
+ */
+export function getTextModelChain(model) {
+  const entry = Object.entries(MODELS).find(([, m]) => m === model);
+  const task = entry ? entry[0] : null;
+  const chain = TEXT_MODEL_CHAINS[task] || [MODELS[TASK.GENERAL], GENERAL_FALLBACK_MODEL, ...GENERAL_EXTRA_FALLBACKS];
+  return dedupe([model, ...chain]);
+}
+
 // Looks up which gateway a given model name should be called through.
 // Detected from the model NAME itself, not from which task it's assigned
 // to — every model on api.17.wtf is namespaced as "owner/model" (e.g.
@@ -98,6 +130,7 @@ export default {
   MODELS,
   GENERAL_FALLBACK_MODEL,
   getProviderForModel,
+  getTextModelChain,
   PRIMARY_MODEL,
   ROUTER_MODEL,
   ROUTER_CONFIDENCE_THRESHOLD,
