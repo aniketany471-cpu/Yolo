@@ -54,25 +54,20 @@ export const MODELS = {
 // model yet.
 export const GENERAL_FALLBACK_MODEL = process.env.MODEL_GENERAL_FALLBACK || "posiden/mimo-v2.5";
 
-// Which gateway serves each task's model. "api17" = api.17.wtf (DeepSeek/GPT,
-// free models), "iamhc" = the original gateway (still used for coding,
-// image-gen, ASR, TTS, which api17 doesn't offer).
-export const MODEL_PROVIDER = {
-  [TASK.GENERAL]: "api17",
-  [TASK.VISION]: "api17",
-  [TASK.CODING]: "iamhc",
-  [TASK.IMAGE_GEN]: "iamhc",
-  [TASK.ASR]: "iamhc",
-  [TASK.TTS]: "iamhc",
-};
-
-// Looks up which gateway a given model name should be called through, by
-// reverse-matching it against MODELS. Falls back to "iamhc" for any model
-// not found here (e.g. the router's own classifier model).
+// Looks up which gateway a given model name should be called through.
+// Detected from the model NAME itself, not from which task it's assigned
+// to — every model on api.17.wtf is namespaced as "owner/model" (e.g.
+// "posiden/deepseek-v4-flash", "persia/gpt-5.4-mini"), while every iamhc
+// model is a bare name (e.g. "DeepSeek-V4-Pro", "kat-coder-pro-v2").
+//
+// This must stay name-based rather than task-based: if a task's env var
+// override (MODEL_GENERAL, MODEL_VISION, ...) still points at an old
+// iamhc model name (e.g. leftover "DeepSeek-V4-Pro" on a deploy that
+// predates api.17.wtf), a task-based map would wrongly send it to api17
+// and get an empty/failed response even though the model exists on iamhc.
 export function getProviderForModel(model) {
-  const entry = Object.entries(MODELS).find(([, m]) => m === model);
-  const task = entry ? entry[0] : null;
-  return MODEL_PROVIDER[task] || "iamhc";
+  if (!model) return "iamhc";
+  return model.includes("/") ? "api17" : "iamhc";
 }
 
 // The primary/default model — used whenever routing is skipped or falls back.
@@ -102,7 +97,6 @@ export default {
   TASK,
   MODELS,
   GENERAL_FALLBACK_MODEL,
-  MODEL_PROVIDER,
   getProviderForModel,
   PRIMARY_MODEL,
   ROUTER_MODEL,
