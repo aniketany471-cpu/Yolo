@@ -9,7 +9,7 @@
 import { route } from "../router/router.js";
 import { normalizeContextMessages } from "../providers/iamhcProvider.js";
 import { routedChatCompletion as chatCompletion } from "./providerGateway.js";
-import { PRIMARY_MODEL, GENERAL_FALLBACK_MODEL, MODELS, TASK } from "../config/models.js";
+import { MODELS, TASK, getTextModelChain } from "../config/models.js";
 import { logModelFallback } from "../utils/logger.js";
 
 const TEXT_MODELS = new Set([MODELS[TASK.GENERAL], MODELS[TASK.CODING]]);
@@ -20,8 +20,11 @@ const TEXT_MODELS = new Set([MODELS[TASK.GENERAL], MODELS[TASK.CODING]]);
  * router's decision without calling a text model — the caller should then
  * invoke the corresponding dedicated service.
  *
- * Never throws and never surfaces raw model/API errors to the caller —
- * on any text-model failure it retries once with PRIMARY_MODEL.
+ * Never throws and never surfaces raw model/API errors to the caller. If
+ * the router's chosen model fails, walks that task's ordered fallback
+ * chain (config/models.js: getTextModelChain) trying each next-best model
+ * in turn until one succeeds or the chain is exhausted — never just
+ * retries the same broken model.
  */
 export async function getRoutedResponse({ text, context = [], systemInstruction, attachments = {}, apiKey } = {}) {
   const decision = await route({ text, attachments, apiKey });
@@ -33,21 +36,23 @@ export async function getRoutedResponse({ text, context = [], systemInstruction,
   }
 
   const messages = normalizeContextMessages(text, context, systemInstruction);
-  let result = await chatCompletion({ model: decision.model, messages, apiKey });
+  const chain = getTextModelChain(decision.model);
 
-  if (!result.ok && decision.model === PRIMARY_MODEL) {
-    // DeepSeek (the general/primary model) failed — try the GPT model
-    // instead of retrying the same model that just failed.
-    logModelFallback({ from: decision.model, to: GENERAL_FALLBACK_MODEL, cause: result.error || `status_${result.status}` });
-    result = await chatCompletion({ model: GENERAL_FALLBACK_MODEL, messages, apiKey });
-  } else if (!result.ok && decision.model !== PRIMARY_MODEL) {
-    logModelFallback({ from: decision.model, to: PRIMARY_MODEL, cause: result.error || `status_${result.status}` });
-    result = await chatCompletion({ model: PRIMARY_MODEL, messages, apiKey });
+  let result = null;
+  for (let i = 0; i < chain.length; i++) {
+    const model = chain[i];
+    result = await chatCompletion({ model, messages, apiKey });
+    if (result.ok) break;
+    const nextModel = chain[i + 1];
+    if (nextModel) {
+      logModelFallback({ from: model, to: nextModel, cause: result.error || `status_${result.status}` });
+    }
   }
 
-  if (!result.ok) {
-    // Never expose model errors to the user — return null, caller shows a
-    // generic "couldn't get that" message like the rest of the bot does.
+  if (!result || !result.ok) {
+    // Every model in the chain failed — never expose raw model errors to
+    // the user, return null so the caller shows a generic "couldn't get
+    // that" message like the rest of the bot does.
     return { handled: true, decision, content: null };
   }
 
