@@ -2375,7 +2375,55 @@ async function performWeatherGrounding(query, config, geminiKey) {
   }
   return null;
 }
+// ── Identity-leak guard ───────────────────────────────────────────────────
+// Catches responses where the underlying model ignores the system prompt and
+// self-identifies as MiMo, DeepSeek, etc. — even on simple greetings like
+// "hi". Runs before any other cleanup, regardless of cleanupEnabled.
+const IDENTITY_LEAK_PATTERNS = [
+  /\bI'?m\s+MiMo\b/i,
+  /\bI\s+am\s+MiMo\b/i,
+  /\bMiMo[,.]?\s+a\s+large\s+language/i,
+  /\bI'?m\s+DeepSeek\b/i,
+  /\bI\s+am\s+DeepSeek\b/i,
+  /\bDeepSeek[,.]?\s+an\s+AI/i,
+  /Xiaomi\s+LLM\s+Core\s+Team/i,
+  /developed\s+by\s+(?:the\s+)?Xiaomi/i,
+  /developed\s+by\s+DeepSeek/i,
+  /developed\s+by\s+(?:OpenAI|Anthropic|Google|Meta|Mistral)/i,
+  /\bI\s+(?:was\s+)?(?:created|developed|trained|built|made)\s+by\s+(?:Xiaomi|DeepSeek|OpenAI|Anthropic|Google|Meta)/i,
+  /\bI'?m\s+(?:Claude|Gemini|GPT-?\d*|ChatGPT|Llama|Qwen|Grok|Copilot)\b/i,
+  /\bI\s+am\s+(?:Claude|Gemini|GPT-?\d*|ChatGPT|Llama|Qwen|Grok|Copilot)\b/i,
+  /\bI'?m\s+an?\s+AI\s+(?:assistant|model|language\s+model)\b/i,
+  /\bI\s+am\s+an?\s+AI\s+(?:assistant|model|language\s+model)\b/i,
+  /\ba\s+large\s+language\s+model\b/i,
+  /\bmy\s+(?:training\s+data|knowledge)\s+(?:cutoff|cut-off|goes\s+up\s+to)\b/i,
+  /How\s+can\s+I\s+(?:help|assist)\s+you\s+today\s*\?/i,
+];
+
+const DONNA_FALLBACKS = [
+  "yo 😊",
+  "hey, what's up?",
+  "hi 👋 what do you need?",
+  "hey! what's good?",
+  "sup 😄",
+  "heyy, wassup?",
+];
+
+let _fallbackIdx = 0;
+function sanitizeIdentityLeak(text) {
+  if (!text) return text;
+  const leaked = IDENTITY_LEAK_PATTERNS.some((p) => p.test(text));
+  if (!leaked) return text;
+  console.warn("[identity-guard] Blocked identity leak in model response.");
+  const reply = DONNA_FALLBACKS[_fallbackIdx % DONNA_FALLBACKS.length];
+  _fallbackIdx++;
+  return reply;
+}
+
 function cleanAIResponse(text, config) {
+  // Always run identity guard first, even if cleanupEnabled is off
+  text = sanitizeIdentityLeak(text);
+  if (!text) return text;
   if (config.cleanupEnabled !== 1) return text;
   let cleaned = text;
   const fillers = [
@@ -4612,7 +4660,7 @@ async function startServer() {
 
         if (routed.handled) {
           // General chat / coding — router's own text-model call already ran.
-          replyText = routed.content;
+          replyText = sanitizeIdentityLeak(routed.content);
         } else if (routed.decision?.model === MODELS[TASK.VISION]) {
           const vision = await analyzeTelegramImage(client2, visionSourceMessage, message.__requestId || `msg-${message.id}`);
           if (!vision) {
