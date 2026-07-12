@@ -117,10 +117,11 @@ export async function route({ text = "", attachments = {}, apiKey } = {}) {
     const routerPrompt = [
       "You are a routing classifier. Do NOT answer the user's message.",
       "Choose exactly one model for handling this request from this list:",
-      `- ${MODELS[TASK.GENERAL]} (general chat, reasoning, planning, writing, fallback)`,
+      `- ${MODELS[TASK.GENERAL]} (general chat, reasoning, planning, writing, casual talk, flirting, NSFW/sexual/adult/explicit conversation, fallback)`,
       `- ${MODELS[TASK.VISION]} (image understanding, screenshots, OCR, documents)`,
       `- ${MODELS[TASK.CODING]} (coding, debugging, code generation, refactoring)`,
-      `- ${MODELS[TASK.IMAGE_GEN]} (image generation and editing)`,
+      `- ${MODELS[TASK.IMAGE_GEN]} (image generation and editing — only when the user explicitly asks to CREATE or GENERATE a new image)`,
+      "IMPORTANT: NSFW, sexual, adult, explicit, or flirty messages are GENERAL — they are normal text chat, not a special task.",
       "Respond with ONLY compact JSON, no prose, no markdown fences:",
       '{"model": "<one of the above>", "confidence": <0.00-1.00>, "reason": "<short reason>"}',
       "",
