@@ -1,12 +1,27 @@
 /**
- * Image generation service
- * Sole provider: Zimage Turbo (https://zimageturbo.ai) — used for every
- * generate/edit request. Grok Imagine (via the old Bluesminds API) has been
- * removed entirely.
- * DISABLED: OpenAI GPT-Image-1 — never used under any circumstances
+ * Image generation service.
+ *
+ * PRIMARY:  step-image-edit-2 on the iamhc gateway (api.iamhc.cn) — verified
+ *           working directly against the provider on 2026-07-12.
+ * FALLBACK: Zimage Turbo (https://zimageturbo.ai) — used automatically if
+ *           step-image-edit-2 fails.
+ *
+ * Both api17 and zyloo were checked for a working image-generation model on
+ * 2026-07-12: api17 has no image endpoint at all (404), and every image
+ * model zyloo advertises in its catalog ("gpt-image-1", "dall-e-3",
+ * "qwen-image-*", "doubao-seedream-*", "mj_*", etc.) returned "Unknown
+ * model" — none are actually enabled on that key/plan despite being listed.
+ * Grok Imagine (via the old Bluesminds API) has been removed entirely.
+ * DISABLED: OpenAI GPT-Image-1 — never used under any circumstances.
+ *
+ * Callers can force a specific provider via options.forceProvider
+ * ("step" | "zimage"), which is also how the "step:"/"zimage:" prompt
+ * keywords below resolve — see parseImageModelKeyword().
  */
+import { IAMHC_BASE_URL, getIamhcApiKey } from "../config/models.js";
 
 const ZIMAGE_GENERATE_URL = "https://zimageturbo.ai/api/generate";
+const STEP_IMAGE_MODEL = "step-image-edit-2";
 
 const PROVIDER_TIMEOUT_MS  = 90_000;
 const DOWNLOAD_TIMEOUT_MS  = 30_000;
@@ -34,7 +49,41 @@ async function downloadImageBuffer(url, extraHeaders = {}) {
   return Buffer.from(await res.arrayBuffer());
 }
 
-// ── Zimage Turbo ──────────────────────────────────────────────────────────────
+// ── step-image-edit-2 (iamhc) — PRIMARY ────────────────────────────────────
+async function stepImageEdit2(prompt, options = {}) {
+  const apiKey = getIamhcApiKey(options.apiKey);
+  if (!apiKey) throw new Error("IAMHC_API_KEY not set in environment");
+
+  const body = {
+    model: STEP_IMAGE_MODEL,
+    prompt: sanitizePrompt(prompt),
+    n: 1,
+    size: options.size || "1024x1024",
+  };
+
+  const res = await fetchWithTimeout(
+    `${IAMHC_BASE_URL}/images/generations`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify(body),
+    },
+    PROVIDER_TIMEOUT_MS
+  );
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(`step-image-edit-2 API error ${res.status}: ${JSON.stringify(data).slice(0, 200)}`);
+  }
+
+  const item = data?.data?.[0];
+  const imageUrl = item?.url;
+  if (imageUrl) return downloadImageBuffer(imageUrl);
+  if (item?.b64_json) return Buffer.from(item.b64_json, "base64");
+  throw new Error(`step-image-edit-2 returned no image. Response: ${JSON.stringify(data).slice(0, 300)}`);
+}
+
+// ── Zimage Turbo — FALLBACK ─────────────────────────────────────────────────
 async function zimageTurbo(prompt, options = {}) {
   const apiKey = process.env.ZIMAGE_API_KEY;
   if (!apiKey) throw new Error("ZIMAGE_API_KEY not set in environment");
@@ -72,17 +121,25 @@ async function zimageTurbo(prompt, options = {}) {
 }
 
 /**
- * Parse model preference keyword from a user prompt.
- * Zimage Turbo is the only generator now, so "use zimage" is accepted (and is
- * the default anyway); "use grok" is no longer a valid option and is left
- * in the prompt text rather than silently stripped.
- * Returns { cleanPrompt, forceProvider: "zimage"|null }
+ * Parse model preference keyword from a user prompt, so a user can pick
+ * which working image model to use directly in their message, e.g.
+ * "step: a red car" or "generate a car using zimage".
+ * step-image-edit-2 is the default/primary anyway, so this is only needed
+ * to force Zimage Turbo (the fallback) explicitly, or to be explicit about
+ * wanting step. Any other provider name (gpt, groq, dall-e, etc.) is left
+ * in the prompt text rather than silently stripped, since none of those
+ * are actually wired to a working model.
+ * Returns { cleanPrompt, forceProvider: "step"|"zimage"|null }
  */
 export function parseImageModelKeyword(text) {
   const t = String(text || "");
 
+  const stepRe = /^step\s*:\s*|(?:^|\s)(?:use|using|with|via)\s+step\b/i;
   const zimageRe = /^zimage\s*:\s*|(?:^|\s)(?:use|using|with|via)\s+zimage\b/i;
 
+  if (stepRe.test(t)) {
+    return { cleanPrompt: t.replace(stepRe, " ").trim(), forceProvider: "step" };
+  }
   if (zimageRe.test(t)) {
     return { cleanPrompt: t.replace(zimageRe, " ").trim(), forceProvider: "zimage" };
   }
@@ -169,8 +226,13 @@ export function buildImagePromptFromVision(visionResult) {
 /**
  * Generate an image for the given prompt.
  *
- * Sole provider: Zimage Turbo. GPT-Image-1 is disabled and never called.
- * The user's prompt is sent exactly as provided — never modified or enhanced.
+ * PRIMARY:  step-image-edit-2 (iamhc). FALLBACK: Zimage Turbo, tried
+ * automatically if step-image-edit-2 fails. GPT-Image-1 is disabled and
+ * never called. The user's prompt is sent exactly as provided — never
+ * modified or enhanced.
+ *
+ * options.forceProvider: "step" | "zimage" — skips the fallback chain and
+ * uses exactly the requested provider (throws if that one fails).
  *
  * Returns { buffer: Buffer, provider: string }
  */
@@ -183,13 +245,36 @@ export async function generateImage(prompt, config = {}, options = {}) {
     throw new Error("GPT-Image-1 is disabled and cannot be used.");
   }
 
-  console.log("[img] provider=zimage-turbo");
-  try {
+  if (force === "zimage") {
+    console.log("[img] provider=zimage-turbo (forced)");
     const buffer = await zimageTurbo(prompt, options);
     console.log("[img] generation_success=true provider=zimage-turbo");
     return { buffer, provider: "zimage-turbo" };
+  }
+
+  if (force === "step") {
+    console.log("[img] provider=step-image-edit-2 (forced)");
+    const buffer = await stepImageEdit2(prompt, options);
+    console.log("[img] generation_success=true provider=step-image-edit-2");
+    return { buffer, provider: "step-image-edit-2" };
+  }
+
+  // Default: step-image-edit-2 primary, Zimage Turbo fallback.
+  console.log("[img] provider=step-image-edit-2");
+  try {
+    const buffer = await stepImageEdit2(prompt, options);
+    console.log("[img] generation_success=true provider=step-image-edit-2");
+    return { buffer, provider: "step-image-edit-2" };
+  } catch (e) {
+    console.warn(`[img] step-image-edit-2 failed: ${e.message}, falling back to zimage-turbo`);
+  }
+
+  try {
+    const buffer = await zimageTurbo(prompt, options);
+    console.log("[img] generation_success=true provider=zimage-turbo (fallback)");
+    return { buffer, provider: "zimage-turbo" };
   } catch (e) {
     console.warn(`[img] zimage-turbo failed: ${e.message}`);
-    throw new Error(`Zimage image generation failed: ${e.message}`);
+    throw new Error(`Image generation failed on both step-image-edit-2 and zimage-turbo: ${e.message}`);
   }
 }
