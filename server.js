@@ -4887,6 +4887,38 @@ async function startServer() {
         if (routed.handled) {
           // General chat / coding — router's own text-model call already ran.
           replyText = sanitizeIdentityLeak(routed.content);
+
+          // Safety net: the router (router/router.js) and the chat model's
+          // own system prompt are two independent decision points about
+          // whether a message is an image request. When they disagree —
+          // router says "general chat" but the model still emits the
+          // [IMAGE_GENERATION] tag it was told to use for visual asks — the
+          // raw tag text used to leak straight into the chat instead of
+          // producing an image. Catch that here and honor the model's
+          // intent instead of showing broken tag text.
+          const leakedTag = replyText && replyText.match(/\[IMAGE_GENERATION\]([\s\S]*?)\[\/IMAGE_GENERATION\]/i);
+          if (leakedTag) {
+            const leakedPrompt = leakedTag[1].trim();
+            console.warn("[img] leaked_tag_intercepted=true reason=router_model_mismatch");
+            if (ziGenerateImage && leakedPrompt) {
+              try {
+                const { cleanPrompt, forceProvider } = ziParseImageModelKeyword
+                  ? ziParseImageModelKeyword(leakedPrompt)
+                  : { cleanPrompt: leakedPrompt, forceProvider: null };
+                const generated = await ziGenerateImage(cleanPrompt, config, { forceProvider });
+                imageBuffer = generated.buffer;
+                imageProvider = generated.provider;
+                replyText = null;
+              } catch (e) {
+                console.warn(`[img] leaked_tag_generation_failed: ${e.message}`);
+                replyText = replyText.replace(/\[IMAGE_GENERATION\][\s\S]*?\[\/IMAGE_GENERATION\]/i, "").trim()
+                  || "Couldn't get that image put together — try asking again in a sec.";
+              }
+            } else {
+              replyText = replyText.replace(/\[IMAGE_GENERATION\][\s\S]*?\[\/IMAGE_GENERATION\]/i, "").trim()
+                || "Couldn't get that image put together — try asking again in a sec.";
+            }
+          }
         } else if (routed.decision?.model === MODELS[TASK.VISION]) {
           const vision = await analyzeTelegramImage(client2, visionSourceMessage, message.__requestId || `msg-${message.id}`);
           if (!vision) {
