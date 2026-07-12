@@ -6,16 +6,20 @@
 // ──────────────────────────────────────────────────────────────────────────
 import { chatCompletion as iamhcChatCompletion } from "../providers/iamhcProvider.js";
 import { chatCompletion as api17ChatCompletion } from "../providers/api17Provider.js";
+import { chatCompletion as zylooChatCompletion } from "../providers/zylooProvider.js";
 import { getProviderForModel } from "../config/models.js";
 
 /**
  * Same signature/return shape as the individual provider chatCompletion()
  * functions — { ok, content, status, error, broken }. `apiKey` (an
- * optional override) only applies to the iamhc gateway; api17 always uses
- * its own dedicated API17_API_KEY secret.
+ * optional override) only applies to the iamhc gateway; api17 and zyloo
+ * always use their own dedicated API key secrets.
  */
 export async function routedChatCompletion({ model, apiKey, ...rest }) {
   const provider = getProviderForModel(model);
+  if (provider === "zyloo") {
+    return zylooChatCompletion({ model, ...rest });
+  }
   if (provider === "api17") {
     return api17ChatCompletion({ model, ...rest });
   }
