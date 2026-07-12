@@ -4,17 +4,20 @@
 // Switching a model = change a value here, nothing else.
 //
 // PROVIDER ROUTING — automatic, name-based:
-//   "owner/model"  (contains "/") → api.17.wtf  (API17_API_KEY)
-//   "BareModelName" (no "/")      → api.iamhc.cn (IAMHC_API_KEY)
+//   "zyloo/model"  (starts with "zyloo/") → api.zyloo.io  (ZYLOO_API_KEY)
+//   "owner/model"  (other "/")            → api.17.wtf    (API17_API_KEY)
+//   "BareModelName" (no "/")              → api.iamhc.cn  (IAMHC_API_KEY)
 //
-// NORMAL CHAT FALLBACK ORDER — both DeepSeek Flash providers first:
-//   1. posiden/deepseek-v4-flash  — api17 gateway  (primary)
-//   2. DeepSeek-V4-Flash          — iamhc gateway  (same model, second provider)
-//   3. posiden/mimo-v2.5          — api17 fallback  (first non-DeepSeek)
-//   4. posiden/hy3                — api17 fallback
-//   5. posiden/nemotron-3-ultra   — api17 fallback
+// NORMAL CHAT FALLBACK ORDER:
+//   1. zyloo/deepseek-v3.2        — zyloo gateway  (primary)
+//   2. posiden/deepseek-v4-flash  — api17 gateway
+//   3. DeepSeek-V4-Flash          — iamhc gateway
+//   4. posiden/mimo-v2.5          — api17 fallback
+//   5. posiden/hy3                — api17 fallback
+//   6. posiden/nemotron-3-ultra   — api17 fallback
 // ──────────────────────────────────────────────────────────────────────────
 
+export const ZYLOO_BASE_URL = (process.env.ZYLOO_BASE_URL || "https://api.zyloo.io/v1").replace(/\/+$/, "");
 export const IAMHC_BASE_URL = (process.env.IAMHC_BASE_URL || "https://api.iamhc.cn/v1").replace(/\/+$/, "");
 export const API17_BASE_URL = (process.env.API17_BASE_URL || "https://api.17.wtf/v1").replace(/\/+$/, "");
 
@@ -24,6 +27,10 @@ function apiKey() {
 
 function api17Key() {
   return (process.env.API17_API_KEY || "").trim();
+}
+
+function zylooKey() {
+  return (process.env.ZYLOO_API_KEY || "").trim();
 }
 
 // Task categories the router can select between.
@@ -39,7 +46,7 @@ export const TASK = {
 // ── Primary model per task ─────────────────────────────────────────────────
 // Change a value here (or set the matching env var on Railway) to swap models.
 export const MODELS = {
-  [TASK.GENERAL]:   process.env.MODEL_GENERAL   || "posiden/deepseek-v4-flash", // api17
+  [TASK.GENERAL]:   process.env.MODEL_GENERAL   || "zyloo/deepseek-v3.2",        // zyloo (primary)
   [TASK.VISION]:    process.env.MODEL_VISION    || "posiden/mimo-v2.5",          // api17
   [TASK.CODING]:    process.env.MODEL_CODING    || "kat-coder-pro-v2",           // iamhc
   [TASK.IMAGE_GEN]: process.env.MODEL_IMAGE_GEN || "step-image-edit-2",
@@ -76,16 +83,21 @@ function dedupe(arr) {
 //
 // getTextModelChain() always prepends the actual router-chosen model so any
 // env-var override is tried first even if it doesn't appear in this list.
+// api17 DeepSeek Flash — second in the general chain after zyloo primary
+const DEEPSEEK_API17 = process.env.MODEL_DEEPSEEK_API17 || "posiden/deepseek-v4-flash";
+
 const TEXT_MODEL_CHAINS = {
   [TASK.GENERAL]: dedupe([
-    MODELS[TASK.GENERAL],   // posiden/deepseek-v4-flash (api17)  ← PRIMARY
-    DEEPSEEK_IAMHC,         // DeepSeek-V4-Flash         (iamhc)  ← SECOND DEEPSEEK
+    MODELS[TASK.GENERAL],   // zyloo/deepseek-v3.2        (zyloo)  ← PRIMARY
+    DEEPSEEK_API17,         // posiden/deepseek-v4-flash  (api17)
+    DEEPSEEK_IAMHC,         // DeepSeek-V4-Flash          (iamhc)
     GENERAL_FALLBACK_MODEL, // posiden/mimo-v2.5          (api17)  ← first non-DeepSeek fallback
     ...GENERAL_EXTRA_FALLBACKS,
   ]),
   [TASK.CODING]: dedupe([
     MODELS[TASK.CODING],    // kat-coder-pro-v2           (iamhc)  ← PRIMARY for coding
-    MODELS[TASK.GENERAL],   // posiden/deepseek-v4-flash  (api17)
+    MODELS[TASK.GENERAL],   // zyloo/deepseek-v3.2        (zyloo)
+    DEEPSEEK_API17,         // posiden/deepseek-v4-flash  (api17)
     DEEPSEEK_IAMHC,         // DeepSeek-V4-Flash          (iamhc)
     GENERAL_FALLBACK_MODEL,
     ...GENERAL_EXTRA_FALLBACKS,
@@ -111,6 +123,7 @@ export function getTextModelChain(model) {
  */
 export function getProviderForModel(model) {
   if (!model) return "iamhc";
+  if (model.startsWith("zyloo/")) return "zyloo";
   return model.includes("/") ? "api17" : "iamhc";
 }
 
@@ -134,7 +147,13 @@ export const getApi17ApiKey = (overrideKey) => {
   return clean && clean !== "undefined" && clean !== "null" && clean.length > 5 ? clean : "";
 };
 
+export const getZylooApiKey = (overrideKey) => {
+  const clean = (overrideKey || zylooKey()).trim();
+  return clean && clean !== "undefined" && clean !== "null" && clean.length > 5 ? clean : "";
+};
+
 export default {
+  ZYLOO_BASE_URL,
   IAMHC_BASE_URL,
   API17_BASE_URL,
   TASK,
@@ -147,4 +166,5 @@ export default {
   ROUTER_CONFIDENCE_THRESHOLD,
   getIamhcApiKey,
   getApi17ApiKey,
+  getZylooApiKey,
 };
