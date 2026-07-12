@@ -18,7 +18,12 @@ const RETRY_DELAYS_MS = [1500, 3000, 5000];
 // (e.g. a retired snapshot) would just burn retries for nothing. Set
 // MODEL_VISION_FALLBACK to a real, currently-available vision model on your
 // provider if you want a second option.
-const VISION_FALLBACK_MODELS = (process.env.MODEL_VISION_FALLBACK || "")
+const VISION_FALLBACK_MODELS = (
+  process.env.MODEL_VISION_FALLBACK ||
+  // Qwen VL models as built-in fallbacks — tried in order after the primary.
+  // api17 charges per model tier; if primary (mimo) fails these are next.
+  "posiden/qwen2.5-vl-72b-instruct,posiden/qwen2-vl-72b-instruct,posiden/qwen-vl-max"
+)
   .split(",")
   .map((m) => m.trim())
   .filter(Boolean);
