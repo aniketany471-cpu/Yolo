@@ -132,7 +132,7 @@ export const PRIMARY_MODEL = MODELS[TASK.GENERAL];
 
 // Lightweight router model (for intent classification only — never answers users).
 // Falls back to heuristic routing if unset/unavailable.
-export const ROUTER_MODEL = process.env.MODEL_ROUTER || "sensenova-6.7-flash-lite";
+export const ROUTER_MODEL = process.env.MODEL_ROUTER || "Qwen3.6-35B-A3B";
 
 // Router confidence floor. Below this we always use the primary model.
 export const ROUTER_CONFIDENCE_THRESHOLD = 0.70;
