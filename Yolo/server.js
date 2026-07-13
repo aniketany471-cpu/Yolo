@@ -1588,6 +1588,8 @@ function isRealtimeQuery(query) {
   // Product/tech/specs queries — model training data is often wrong or outdated
   // for specific hardware specs, so always search these.
   if (/\b(vs|versus|compare|comparison|difference|better|spec[s]?|specification[s]?|review|benchmark|processor|chipset|snapdragon|dimensity|helio|exynos|ram|storage|battery|camera|display|amoled|refresh\s*rate|charging|realme|redmi|poco|oneplus|samsung|iphone|apple|vivo|oppo|motorola|nokia|asus|pixel|nothing\s*phone|xiaomi|iqoo|lava|tecno|infinix|micromax|honor|huawei|laptop|macbook|chromebook|tablet|ipad|smartwatch|earbuds|earphone[s]?|headphone[s]?|tws|buds|watch|wearable|router|wifi|5g|4g|lte|modem|gpu|graphics\s*card|rtx|rx\s*\d|geforce|radeon|processor|ryzen|intel|amd|core\s*i\d|celeron|pentium|ssd|nvme|hdd|monitor|keyboard|mouse|mechanical)\b/i.test(q)) return true;
+  // Lyrics / songs — model training data has wrong or incomplete lyrics; always fetch from web
+  if (/\b(lyrics|lyric|gaana|gana|song|songs|antara|mukhda|chorus|bolbol|bol\s*do|words\s*of|full\s*song|song\s*words|song\s*text|bhaag\s*milkha|dilwale|kabir\s*singh|3\s*idiots|sholay|ddlj|kgf|rrr|bahubali|pathaan|jawan|animal\s*movie|movie\s*song|film\s*song|bollywood\s*song|punjabi\s*song|haryanvi\s*song|rap\s*song|english\s*song|hindi\s*song|lata|kishore|rafi|arijit|shreya|neha\s*kakkar|badshah|honey\s*singh|diljit|ap\s*dhillon|imran\s*khan|atif\s*aslam)\b/i.test(q)) return true;
   return false;
 }
 
@@ -1607,6 +1609,14 @@ function buildSearchQuery(userMessage) {
     .trim();
   // Fall back to original if cleaning left too little
   if (cleaned.split(/\s+/).filter(Boolean).length < 2) cleaned = userMessage.trim();
+
+  // Lyrics-specific: append "lyrics" if not already present and looks like a song/lyrics query
+  if (/\b(lyrics|lyric|gaana|gana|song\s+k\s+lyrics|ke\s+lyrics|ki\s+lyrics)\b/i.test(userMessage) && !/\blyrics\b/i.test(cleaned)) {
+    cleaned = cleaned + " lyrics";
+  }
+  // Strip filler connectors specific to lyrics requests ("de", "do", "dena", "chahiye", "batao", "k", "ke", "from")
+  cleaned = cleaned.replace(/\b(de\b|do\b|dena\b|chahiye\b|k\b|ke\b|ki\b|song\s+k|song\s+ke|song\s+ki|gane\s+k|gane\s+ke)\b/gi, " ").replace(/\s+/g, " ").trim();
+
   return cleaned;
 }
 
