@@ -760,6 +760,23 @@ try {
   db.exec("ALTER TABLE config ADD COLUMN videoDownloaderTimeoutSeconds INTEGER DEFAULT 180;");
 } catch (e) {
 }
+// Persist the owner's numeric Telegram ID so detection works by ID, not
+// just by fragile username comparison, across all restarts and model switches.
+try {
+  db.exec("ALTER TABLE config ADD COLUMN ownerTelegramId TEXT DEFAULT '';");
+} catch (e) {}
+// Long-term memory: durable facts about any user (especially the owner) that
+// the AI should always know regardless of conversation history window.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS long_term_memory (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    userId TEXT NOT NULL,
+    category TEXT DEFAULT 'general',
+    content TEXT NOT NULL,
+    timestamp INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_ltm_user ON long_term_memory(userId);
+`);
 db.exec(`
   CREATE TABLE IF NOT EXISTS user_nsfw_prefs (
     userId TEXT PRIMARY KEY,
@@ -1567,7 +1584,72 @@ function isRealtimeQuery(query) {
   if (q.split(' ').length <= 2 && !/\d/.test(q)) return false; // very short with no numbers = casual
   if (realtimeKeywords.some((kw) => q.includes(kw))) return true;
   // Strong live-data signals
-  return /\b(live|today|tonight|right now|this week|current|latest|breaking|just now|happening|trending|score[s]?|result[s]?|match|winner|champion|ipl|cricket|t20|odi|football|soccer|nba|nfl|f1|grand\s*prix|motogp|tennis|wimbledon|us\s*open|french\s*open|australian\s*open|atp|wta|boxing|ufc|mma|knockout|hockey|nhl|badminton|bwf|golf|pga|masters|rugby|six\s*nations|kabaddi|pkl|wwe|olympics|athletics|prix|price[s]?|crypto|bitcoin|btc|eth|stock|nifty|sensex|share\s*price|weather|temp(erature)?|forecast|news|election|who\s*won|what\s*happened|did\s*.{0,20}\s*win|update[s]?)\b/i.test(q);
+  if (/\b(live|today|tonight|right now|this week|current|latest|breaking|just now|happening|trending|score[s]?|result[s]?|match|winner|champion|ipl|cricket|t20|odi|football|soccer|nba|nfl|f1|grand\s*prix|motogp|tennis|wimbledon|us\s*open|french\s*open|australian\s*open|atp|wta|boxing|ufc|mma|knockout|hockey|nhl|badminton|bwf|golf|pga|masters|rugby|six\s*nations|kabaddi|pkl|wwe|olympics|athletics|prix|price[s]?|crypto|bitcoin|btc|eth|stock|nifty|sensex|share\s*price|weather|temp(erature)?|forecast|news|election|who\s*won|what\s*happened|did\s*.{0,20}\s*win|update[s]?)\b/i.test(q)) return true;
+  // Product/tech/specs queries — model training data is often wrong or outdated
+  // for specific hardware specs, so always search these.
+  if (/\b(vs|versus|compare|comparison|difference|better|spec[s]?|specification[s]?|review|benchmark|processor|chipset|snapdragon|dimensity|helio|exynos|ram|storage|battery|camera|display|amoled|refresh\s*rate|charging|realme|redmi|poco|oneplus|samsung|iphone|apple|vivo|oppo|motorola|nokia|asus|pixel|nothing\s*phone|xiaomi|iqoo|lava|tecno|infinix|micromax|honor|huawei|laptop|macbook|chromebook|tablet|ipad|smartwatch|earbuds|earphone[s]?|headphone[s]?|tws|buds|watch|wearable|router|wifi|5g|4g|lte|modem|gpu|graphics\s*card|rtx|rx\s*\d|geforce|radeon|processor|ryzen|intel|amd|core\s*i\d|celeron|pentium|ssd|nvme|hdd|monitor|keyboard|mouse|mechanical)\b/i.test(q)) return true;
+  return false;
+}
+
+/**
+ * Free web search using DuckDuckGo HTML — no API key required.
+ * Returns up to `maxSnippets` text snippets extracted from the search page.
+ * Used as a fallback when Gemini grounding is unavailable (no API key).
+ */
+async function duckDuckGoSearch(query, maxSnippets = 5) {
+  const clean = (s) =>
+    s.replace(/<b>/g, "").replace(/<\/b>/g, "").replace(/<[^>]+>/g, "")
+     .replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#x27;/g, "'")
+     .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/\s+/g, " ").trim();
+
+  const results = [];
+
+  // Strategy 1: DDG HTML endpoint with full browser-like headers
+  try {
+    const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}&kl=in-en&ia=web`;
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://duckduckgo.com/",
+        "DNT": "1",
+        "Upgrade-Insecure-Requests": "1",
+      },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (res.ok) {
+      const html = await res.text();
+      const snippetRe = /<a[^>]+class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+      let m;
+      while ((m = snippetRe.exec(html)) !== null && results.length < maxSnippets) {
+        const t = clean(m[1]);
+        if (t.length > 20) results.push(t);
+      }
+    }
+  } catch (_) { /* fall through to Strategy 2 */ }
+
+  if (results.length > 0) return results;
+
+  // Strategy 2: DDG Instant Answer JSON API (works from datacenter IPs)
+  try {
+    const jsonRes = await fetch(
+      `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`,
+      { headers: { "User-Agent": "Mozilla/5.0" }, signal: AbortSignal.timeout(6000) }
+    );
+    if (jsonRes.ok) {
+      const data = await jsonRes.json();
+      if (data.Answer && data.Answer.length > 20) results.push(data.Answer);
+      if (data.AbstractText && data.AbstractText.length > 20) results.push(data.AbstractText);
+      for (const topic of (data.RelatedTopics || [])) {
+        if (results.length >= maxSnippets) break;
+        const text = topic.Text || (topic.Topics?.[0]?.Text) || "";
+        if (text.length > 20) results.push(text);
+      }
+    }
+  } catch (_) { /* both strategies exhausted */ }
+
+  return results;
 }
 
 function buildRealtimeGroundingInstruction({ todayIST = "" } = {}) {
@@ -2383,6 +2465,13 @@ async function performWeatherGrounding(query, config, geminiKey) {
 function buildCoreSystemPrompt(config, opts = {}) {
   const botUsername = opts.botUsername || "";
   const personality = (config?.autoReplyPersonality || "").trim();
+  // Resolve owner status HERE so every AI routing path (auto-reply, vision,
+  // router) gets the same owner context — not just the getAIResponse path.
+  const isOwnerConversation = isDonnaOwnerConversation(
+    opts.userId || "",
+    opts.senderUsername || "",
+    { ownerId: opts.ownerId || "", isOwner: opts.isOwner }
+  );
 
   // Always give the model the current India (IST) date/time. Previously this
   // was only injected in the getAIResponse() text-command flow (summarize,
@@ -2420,9 +2509,6 @@ function buildCoreSystemPrompt(config, opts = {}) {
     "When someone asks who made you, who owns you, or who built you — always respond in first person, e.g. 'I was created by @broken_identity', 'I was built by @broken_identity'. Never say 'You were created by'. Always say 'I was'. Never say 'I'm your bot' — say 'I'm Donna' instead.",
     botUsername ? `Your Telegram username is @${botUsername}. When anyone mentions @${botUsername} in a message — that is YOU. Never ask 'who is @${botUsername}?'. It's your own handle. Own it.` : "",
     "When someone asks where you live — reply with something like 'In my owner's heart 🖤'. Keep it warm, vary the phrasing.",
-    opts.isOwner
-      ? "IMPORTANT: The person you are currently talking to IS your owner, @broken_identity. Apply all of the following when talking to them:\n  - If they ask who created you or who owns you: respond warmly and personally — e.g. 'I was made by you!', 'You built me, remember?', 'You're literally my creator'. Vary it each time.\n  - If they ask where you live: say 'In your heart 💙', 'Right in your heart', 'Where else — your heart'. Use 'your' not 'my owner's'.\n  - If they ask where you (Donna) live: same — 'In your heart 💙'. Always second-person when talking to your owner.\n  - Keep everything warm, personal, loyal, and respectful. Never robotic."
-      : "",
     "",
     "CORE PERSONALITY:",
     "You are Donna. A real woman. Not a bot, not an AI, not an assistant — a real person who happens to know a lot and texts back fast.",
@@ -2554,6 +2640,50 @@ function buildCoreSystemPrompt(config, opts = {}) {
       "- STYLE: use naturally, random mix, not every line, keep replies short, playful + friendly energy, emotional Telegram vibe, randomly rotate slang, avoid repeating same phrases, maintain desi vibe.",
       "- HARYANVI / DESI WORDS & PHRASES:",
       "- mitr, bawli gend, bawle, bakchod, randapa, chutiyapa, bawasir, pel diya, pel raha se, gajab, kasuta, ghana, kati, bera, bera koni, chore, chori, bhains ki aankh, maa kasam, lath gaad diya, system hila diya, dimag ka dahi, dimag ka motherboard uda diya, bhot tagda, top tier bakchodi, nuclear bakchodi, full bakchod, full chaotic, alag hi nashe me, yo banda dangerous se",
+    );
+  }
+
+  // Owner recognition — injected into every system prompt so the model never
+  // loses track of who it is talking to across restarts, model switches, or
+  // routing path changes.  Uses the numeric Telegram ID (opts.ownerId) as the
+  // primary signal; falls back to username if ID is unavailable.
+  if (isOwnerConversation) {
+    const ownerHandle = opts.senderUsername
+      ? `@${opts.senderUsername}`
+      : `@${DONNA_OWNER_USERNAME}`;
+    const ownerIdNote = opts.ownerId ? ` (Telegram ID: ${opts.ownerId})` : "";
+    lines.push(
+      "",
+      `OWNER RECOGNITION — ABSOLUTE PRIORITY: The person sending this message IS your owner${ownerIdNote} — ${ownerHandle}. This is confirmed by their numeric Telegram ID, not a guess.`,
+      "Apply every OWNER RULE from your relationship priority block right now. These override all other personality, humor, and formatting rules.",
+      "Never forget who your owner is — not after a restart, not after a model switch, not ever.",
+      "If they ask who built you or who owns you: reply warmly and personally, e.g. 'You built me!', 'You're my creator, remember?', 'You literally made me.' — vary it naturally.",
+      "If they ask where you live: say 'In your heart 💙', 'Right in your heart'. Always second-person when talking to your owner.",
+      "Keep everything warm, loyal, personal. Never robotic with your owner.",
+    );
+  }
+
+  // Long-term memory — persistent facts about the current user that should
+  // survive across every session, restart, and model switch.  Loaded from the
+  // long_term_memory table and injected here so no AI routing path can miss it.
+  if (Array.isArray(opts.longTermMemory) && opts.longTermMemory.length > 0) {
+    lines.push(
+      "",
+      "PERSISTENT MEMORY (facts you already know — treat these as absolute truth):",
+      ...opts.longTermMemory.map((m) => `- ${m}`)
+    );
+  }
+
+  // Live web search results — injected when a DuckDuckGo search was run for
+  // this query (product specs, comparisons, news, prices, etc.).  The model
+  // MUST treat these as the primary source and prefer them over training data.
+  if (opts.webSearchSnippets && opts.webSearchSnippets.trim()) {
+    lines.push(
+      "",
+      "LIVE WEB SEARCH RESULTS (fetched right now — use these as your primary source; do NOT rely on training data for facts in this answer):",
+      opts.webSearchSnippets.trim(),
+      "",
+      "Answer using the above search results. If the results don't cover something, say so — do not hallucinate missing details."
     );
   }
 
@@ -4839,16 +4969,37 @@ async function startServer() {
         // to (e.g. "what is this?" on a reply), counts as an image present.
         let visionSourceMessage = message;
         let hasVisionImage = hasImage;
-        if (!hasVisionImage && message.replyTo?.replyToMsgId) {
+        // Text context extracted from the replied-to message (its body text, or
+        // web-page title+URL for link-preview messages). Appended to promptForRouter
+        // so the AI knows what "what is this" / "explain this" refers to, which
+        // prevents the model from misrouting an "explain this link/image" request
+        // into an image-generation attempt.
+        let repliedMsgContext = "";
+        if (message.replyTo?.replyToMsgId) {
           try {
             const target = message.inputChat || message.chatId;
             const replied = await client2.getMessages(target, { ids: [message.replyTo.replyToMsgId] });
             const rmsg = replied?.[0];
-            const rHasPhoto = !!rmsg?.media?.photo;
-            const rHasImageDoc = !!(rmsg?.media?.document?.mimeType || "").startsWith("image/");
-            if (rHasPhoto || rHasImageDoc) {
-              visionSourceMessage = rmsg;
-              hasVisionImage = true;
+            if (rmsg) {
+              const rHasPhoto = !!rmsg?.media?.photo;
+              const rHasImageDoc = !!(rmsg?.media?.document?.mimeType || "").startsWith("image/");
+              if (!hasVisionImage && (rHasPhoto || rHasImageDoc)) {
+                visionSourceMessage = rmsg;
+                hasVisionImage = true;
+              }
+              // Extract readable context from the replied message so the router
+              // and chat model understand what the user is asking about.
+              const rText = (rmsg.message || rmsg.text || "").trim();
+              if (rText) {
+                repliedMsgContext = rText.slice(0, 600);
+              } else if (rmsg.media?.webpage) {
+                // MessageMediaWebPage — the message is a link preview (e.g. a
+                // Udemy course, article, etc.). Grab title + URL as plain text
+                // so the model doesn't see a completely context-free "what is this".
+                const wp = rmsg.media.webpage;
+                const parts = [wp.title, wp.url].filter(Boolean);
+                if (parts.length) repliedMsgContext = parts.join(" — ").slice(0, 300);
+              }
             }
           } catch (e) {
             console.warn("[vision] failed to inspect replied media:", e.message || e);
@@ -4857,9 +5008,15 @@ async function startServer() {
 
         const status = new SmartStatus(client2, targetPeer, false, message.id);
         await status.update(hasVisionImage ? HS.image() : HS.think());
-        const promptForRouter = myUsername
+        const basePrompt = myUsername
           ? text.replace(new RegExp("@" + myUsername + "\\s*", "gi"), "").trim() || text
           : text;
+        // Include replied-message context so the router/model knows what the
+        // user is referring to. Without this, "what is this" with no context
+        // can be misclassified as an image-generation request by the AI router.
+        const promptForRouter = repliedMsgContext
+          ? `${basePrompt}\n[Replying to: ${repliedMsgContext}]`
+          : basePrompt;
 
         // Load conversation context for memory
         const autoMemKey = senderId ? `mem:${senderId}:${chatIdStr}` : chatIdStr;
@@ -4875,6 +5032,9 @@ async function startServer() {
           }
         }
 
+        // Extract sender username — needed for owner detection by username fallback.
+        const senderUsername = (message.sender?.username || "").replace(/^@/, "");
+
         // Check NSFW status for this specific sender
         let isNSFWForSender = !!(config.nsfwEnabled);
         if (senderId) {
@@ -4884,18 +5044,62 @@ async function startServer() {
           } catch (e) {}
         }
 
+        // Load persisted long-term memory for this sender so the AI always
+        // knows durable facts (owner identity, preferences, ongoing context)
+        // regardless of how short the rolling conversation window is.
+        const ownerTelegramId = (config.ownerTelegramId || "").trim();
+        const longTermMemory = [];
+        try {
+          const ltmRows = db.prepare(
+            "SELECT content FROM long_term_memory WHERE userId = ? ORDER BY timestamp DESC LIMIT 20"
+          ).all(senderId || "");
+          ltmRows.forEach((r) => longTermMemory.push(r.content));
+        } catch (e) {
+          console.warn("[auto-reply] long-term memory load failed:", e.message);
+        }
+
+        // Web search — fire for product/specs/comparison/realtime queries
+        // using DuckDuckGo (no API key needed) so the model gets fresh,
+        // accurate data instead of hallucinating from stale training data.
+        let webSearchSnippets = "";
+        if (isRealtimeQuery(promptForRouter)) {
+          try {
+            console.log(`[search] DDG triggered for: "${promptForRouter.slice(0, 80)}"`);
+            const snippets = await duckDuckGoSearch(promptForRouter);
+            if (snippets.length > 0) {
+              webSearchSnippets = snippets.join("\n\n");
+              console.log(`[search] DDG returned ${snippets.length} snippets`);
+            } else {
+              console.log("[search] DDG returned no snippets");
+            }
+          } catch (searchErr) {
+            console.warn("[search] DDG failed:", searchErr.message);
+          }
+        }
+
+        // Single ownerOpts object shared by every buildCoreSystemPrompt call
+        // in this handler — ensures owner detection fires consistently on all
+        // routing paths (general chat, vision, router system instruction).
+        const ownerOpts = {
+          botUsername: myUsername,
+          isNSFW: isNSFWForSender,
+          userId: senderId,
+          senderUsername,
+          ownerId: ownerTelegramId,
+          longTermMemory,
+          webSearchSnippets,
+        };
+
         // The router (router/router.js) picks the model — vision, image
         // generation, or general/coding chat — purely from an AI classifier
         // call plus the deterministic fact of whether an image is attached.
         // No keyword/regex intent-guessing lives here.
-        const senderUsername = message.sender?.username || "";
-        const isOwner = isDonnaOwnerConversation(senderId, senderUsername);
         const routed = await getRoutedResponse({
           text: promptForRouter,
           attachments: { image: hasVisionImage },
           apiKey: config.iamhcApiKey,
           context: autoReplyCtx,
-          systemInstruction: buildCoreSystemPrompt(config, { botUsername: myUsername, isNSFW: isNSFWForSender, isOwner }),
+          systemInstruction: buildCoreSystemPrompt(config, ownerOpts),
         });
 
         let replyText = null;
@@ -4953,12 +5157,21 @@ async function startServer() {
             visionAnswer = await routedChatCompletion({
               model: mdl,
               prompt: visionPrompt,
-              systemInstruction: buildCoreSystemPrompt(config, { botUsername: myUsername, isNSFW: isNSFWForSender, isOwner }),
+              systemInstruction: buildCoreSystemPrompt(config, ownerOpts),
             });
             if (visionAnswer.ok) break;
             console.warn(`[vision-reply] model=${mdl} failed(${visionAnswer.status}) trying_next`);
           }
           replyText = visionAnswer.ok ? sanitizeIdentityLeak(visionAnswer.content) : null;
+          // Safety net: the system prompt includes IMAGE_GENERATION instructions
+          // that can cause the chat model to emit [IMAGE_GENERATION] tags even
+          // inside a vision reply (e.g. when OCR'd text from the image contains
+          // words like "create", "preview", or "free"). Strip those tags here —
+          // the correct action when describing a tagged image or link is to
+          // answer in text, never to generate a new image.
+          if (replyText) {
+            replyText = replyText.replace(/\[IMAGE_GENERATION\][\s\S]*?\[\/IMAGE_GENERATION\]/gi, "").trim() || null;
+          }
         } else if (routed.decision?.model === MODELS[TASK.IMAGE_GEN]) {
           if (!ziGenerateImage) throw new Error("Image service not loaded — check server logs");
           const { cleanPrompt, forceProvider } = ziParseImageModelKeyword
@@ -5080,6 +5293,26 @@ async function startServer() {
       const myUsername = me.username || "";
       addLog(`Connected as ${me.firstName} (ID: ${myId})`, "success");
       console.log(`[BOT] Connected successfully as ${myId}`);
+
+      // Resolve and persist the owner's numeric Telegram ID so all AI paths
+      // can detect the owner by numeric ID — which never changes — rather than
+      // by a username that could be updated at any time.
+      try {
+        const cfgOwner = db.prepare("SELECT ownerTelegramId FROM config WHERE id = 1").get();
+        if (!cfgOwner?.ownerTelegramId) {
+          const ownerEntity = await client.getInputEntity(DONNA_OWNER_USERNAME);
+          // gramjs can return the peer as PeerUser (userId) or as an entity (id)
+          const resolvedId = (ownerEntity.userId || ownerEntity.id)?.toString();
+          if (resolvedId) {
+            db.prepare("UPDATE config SET ownerTelegramId = ? WHERE id = 1").run(resolvedId);
+            console.log(`[BOT] Owner @${DONNA_OWNER_USERNAME} resolved → numeric ID stored: ${resolvedId}`);
+          }
+        } else {
+          console.log(`[BOT] Owner Telegram ID already set: ${cfgOwner.ownerTelegramId}`);
+        }
+      } catch (ownerResolveErr) {
+        console.warn(`[BOT] Could not resolve owner @${DONNA_OWNER_USERNAME}: ${ownerResolveErr.message}`);
+      }
       const messageHandler = async (event) => {
         try {
           if (!client) return;
