@@ -2820,6 +2820,26 @@ function buildCoreSystemPrompt(config, opts = {}) {
     );
   }
 
+  // ── Link / page content (read via Jina AI Reader) ────────────────────────
+  // Injected when the user's message or the replied-to message contained URLs.
+  // The actual page text was fetched and is provided below — use it as the
+  // primary source for answering questions about the link.
+  if (opts.linkContext && opts.linkContext.trim()) {
+    lines.push(
+      "",
+      "━━━━━━━━━━━━━━━━ LINK CONTENT (read from web right now) ━━━━━━━━━━━━━━━━",
+      opts.linkContext.trim(),
+      "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+      "",
+      "HOW TO USE LINK CONTENT:",
+      "• Answer based on what the page actually says — do NOT guess or hallucinate content not in the text above.",
+      "• Summarise clearly: what the page/article is about, key points, any important data.",
+      "• If the user asked a specific question about the link, answer it directly from the content.",
+      "• If the page content is insufficient to answer, say so honestly.",
+      "• Keep Donna's natural tone — structured and accurate but not robotic."
+    );
+  }
+
   // NSFW mode — inject explicit personality when active for this sender
   if (opts.isNSFW) {
     const nsfwPersonality = opts.nsfwPersonality || config.nsfwPersonality || "You are Donna — a bold, seductive, no-limits woman in a private conversation. You talk freely about anything, including sex, fantasies, and adult topics.";
@@ -5108,6 +5128,10 @@ async function startServer() {
         // prevents the model from misrouting an "explain this link/image" request
         // into an image-generation attempt.
         let repliedMsgContext = "";
+        let repliedSenderName = "";
+        let autoReplyLinkContext = "";
+        const _urlRe = /https?:\/\/[^\s<>"{}|\\^`[\]]+/gi;
+
         if (message.replyTo?.replyToMsgId) {
           try {
             const target = message.inputChat || message.chatId;
@@ -5120,23 +5144,65 @@ async function startServer() {
                 visionSourceMessage = rmsg;
                 hasVisionImage = true;
               }
+              // Replied-message sender label (e.g. "@rahul said:" or "Rahul said:")
+              const rSender = rmsg.sender;
+              if (rSender) {
+                repliedSenderName = rSender.username
+                  ? `@${rSender.username}`
+                  : [rSender.firstName, rSender.lastName].filter(Boolean).join(" ") || "";
+              }
               // Extract readable context from the replied message so the router
               // and chat model understand what the user is asking about.
               const rText = (rmsg.message || rmsg.text || "").trim();
+              const repliedUrlsToFetch = new Set();
               if (rText) {
-                repliedMsgContext = rText.slice(0, 600);
-              } else if (rmsg.media?.webpage) {
+                repliedMsgContext = rText.slice(0, 800);
+                // Also collect URLs from replied message text for Jina fetch
+                for (const u of (rText.match(_urlRe) || [])) {
+                  if (!u.includes("t.me") && !u.includes("telegram.me")) repliedUrlsToFetch.add(u);
+                }
+              }
+              if (rmsg.media?.webpage) {
                 // MessageMediaWebPage — the message is a link preview (e.g. a
                 // Udemy course, article, etc.). Grab title + URL as plain text
                 // so the model doesn't see a completely context-free "what is this".
                 const wp = rmsg.media.webpage;
                 const parts = [wp.title, wp.url].filter(Boolean);
-                if (parts.length) repliedMsgContext = parts.join(" — ").slice(0, 300);
+                if (parts.length && !repliedMsgContext) repliedMsgContext = parts.join(" — ").slice(0, 300);
+                if (wp.url && !wp.url.includes("t.me")) repliedUrlsToFetch.add(wp.url);
+              }
+              // Fetch URLs from replied message via Jina (real page content)
+              if (repliedUrlsToFetch.size > 0) {
+                const toFetch = [...repliedUrlsToFetch].slice(0, 2);
+                console.log(`[link] fetching ${toFetch.length} URL(s) from replied message`);
+                const fetched = await Promise.allSettled(toFetch.map(u => fetchPageViaJina(u, 3000)));
+                fetched.forEach((r, i) => {
+                  if (r.status === "fulfilled" && r.value) {
+                    let domain = toFetch[i]; try { domain = new URL(toFetch[i]).hostname.replace(/^www\./, ""); } catch {}
+                    autoReplyLinkContext += (autoReplyLinkContext ? "\n\n---\n\n" : "") + `[Source: ${domain}]\n${r.value}`;
+                  }
+                });
               }
             }
           } catch (e) {
             console.warn("[vision] failed to inspect replied media:", e.message || e);
           }
+        }
+
+        // Fetch URLs in the CURRENT message via Jina (link reading)
+        const currentMsgUrls = (textRaw.match(_urlRe) || [])
+          .filter(u => !u.includes("t.me") && !u.includes("telegram.me"))
+          .slice(0, 2);
+        if (currentMsgUrls.length > 0) {
+          console.log(`[link] fetching ${currentMsgUrls.length} URL(s) from current message`);
+          const fetched = await Promise.allSettled(currentMsgUrls.map(u => fetchPageViaJina(u, 3000)));
+          fetched.forEach((r, i) => {
+            if (r.status === "fulfilled" && r.value) {
+              let domain = currentMsgUrls[i]; try { domain = new URL(currentMsgUrls[i]).hostname.replace(/^www\./, ""); } catch {}
+              autoReplyLinkContext += (autoReplyLinkContext ? "\n\n---\n\n" : "") + `[Source: ${domain}]\n${r.value}`;
+            }
+          });
+          if (autoReplyLinkContext) console.log(`[link] fetched link content, ${autoReplyLinkContext.length} chars`);
         }
 
         const status = new SmartStatus(client2, targetPeer, false, message.id);
@@ -5147,9 +5213,11 @@ async function startServer() {
         // Include replied-message context so the router/model knows what the
         // user is referring to. Without this, "what is this" with no context
         // can be misclassified as an image-generation request by the AI router.
-        const promptForRouter = repliedMsgContext
-          ? `${basePrompt}\n[Replying to: ${repliedMsgContext}]`
-          : basePrompt;
+        const _replyLabel = repliedSenderName ? `${repliedSenderName} said` : "Replying to";
+        const promptForRouter = [
+          basePrompt,
+          repliedMsgContext ? `[${_replyLabel}: ${repliedMsgContext}]` : "",
+        ].filter(Boolean).join("\n");
 
         // Load conversation context for memory
         const autoMemKey = senderId ? `mem:${senderId}:${chatIdStr}` : chatIdStr;
@@ -5225,6 +5293,7 @@ async function startServer() {
           longTermMemory,
           webSearchSnippets,
           searchAttempted,
+          linkContext: autoReplyLinkContext,
         };
 
         // The router (router/router.js) picks the model — vision, image
