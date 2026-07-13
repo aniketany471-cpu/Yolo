@@ -4836,16 +4836,37 @@ async function startServer() {
         // to (e.g. "what is this?" on a reply), counts as an image present.
         let visionSourceMessage = message;
         let hasVisionImage = hasImage;
-        if (!hasVisionImage && message.replyTo?.replyToMsgId) {
+        // Text context extracted from the replied-to message (its body text, or
+        // web-page title+URL for link-preview messages). Appended to promptForRouter
+        // so the AI knows what "what is this" / "explain this" refers to, which
+        // prevents the model from misrouting an "explain this link/image" request
+        // into an image-generation attempt.
+        let repliedMsgContext = "";
+        if (message.replyTo?.replyToMsgId) {
           try {
             const target = message.inputChat || message.chatId;
             const replied = await client2.getMessages(target, { ids: [message.replyTo.replyToMsgId] });
             const rmsg = replied?.[0];
-            const rHasPhoto = !!rmsg?.media?.photo;
-            const rHasImageDoc = !!(rmsg?.media?.document?.mimeType || "").startsWith("image/");
-            if (rHasPhoto || rHasImageDoc) {
-              visionSourceMessage = rmsg;
-              hasVisionImage = true;
+            if (rmsg) {
+              const rHasPhoto = !!rmsg?.media?.photo;
+              const rHasImageDoc = !!(rmsg?.media?.document?.mimeType || "").startsWith("image/");
+              if (!hasVisionImage && (rHasPhoto || rHasImageDoc)) {
+                visionSourceMessage = rmsg;
+                hasVisionImage = true;
+              }
+              // Extract readable context from the replied message so the router
+              // and chat model understand what the user is asking about.
+              const rText = (rmsg.message || rmsg.text || "").trim();
+              if (rText) {
+                repliedMsgContext = rText.slice(0, 600);
+              } else if (rmsg.media?.webpage) {
+                // MessageMediaWebPage — the message is a link preview (e.g. a
+                // Udemy course, article, etc.). Grab title + URL as plain text
+                // so the model doesn't see a completely context-free "what is this".
+                const wp = rmsg.media.webpage;
+                const parts = [wp.title, wp.url].filter(Boolean);
+                if (parts.length) repliedMsgContext = parts.join(" — ").slice(0, 300);
+              }
             }
           } catch (e) {
             console.warn("[vision] failed to inspect replied media:", e.message || e);
@@ -4854,9 +4875,15 @@ async function startServer() {
 
         const status = new SmartStatus(client2, targetPeer, false, message.id);
         await status.update(hasVisionImage ? HS.image() : HS.think());
-        const promptForRouter = myUsername
+        const basePrompt = myUsername
           ? text.replace(new RegExp("@" + myUsername + "\\s*", "gi"), "").trim() || text
           : text;
+        // Include replied-message context so the router/model knows what the
+        // user is referring to. Without this, "what is this" with no context
+        // can be misclassified as an image-generation request by the AI router.
+        const promptForRouter = repliedMsgContext
+          ? `${basePrompt}\n[Replying to: ${repliedMsgContext}]`
+          : basePrompt;
 
         // Load conversation context for memory
         const autoMemKey = senderId ? `mem:${senderId}:${chatIdStr}` : chatIdStr;
@@ -4954,6 +4981,15 @@ async function startServer() {
             console.warn(`[vision-reply] model=${mdl} failed(${visionAnswer.status}) trying_next`);
           }
           replyText = visionAnswer.ok ? sanitizeIdentityLeak(visionAnswer.content) : null;
+          // Safety net: the system prompt includes IMAGE_GENERATION instructions
+          // that can cause the chat model to emit [IMAGE_GENERATION] tags even
+          // inside a vision reply (e.g. when OCR'd text from the image contains
+          // words like "create", "preview", or "free"). Strip those tags here —
+          // the correct action when describing a tagged image or link is to
+          // answer in text, never to generate a new image.
+          if (replyText) {
+            replyText = replyText.replace(/\[IMAGE_GENERATION\][\s\S]*?\[\/IMAGE_GENERATION\]/gi, "").trim() || null;
+          }
         } else if (routed.decision?.model === MODELS[TASK.IMAGE_GEN]) {
           if (!ziGenerateImage) throw new Error("Image service not loaded — check server logs");
           const { cleanPrompt, forceProvider } = ziParseImageModelKeyword
