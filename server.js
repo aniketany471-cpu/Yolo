@@ -1584,7 +1584,65 @@ function isRealtimeQuery(query) {
   if (q.split(' ').length <= 2 && !/\d/.test(q)) return false; // very short with no numbers = casual
   if (realtimeKeywords.some((kw) => q.includes(kw))) return true;
   // Strong live-data signals
-  return /\b(live|today|tonight|right now|this week|current|latest|breaking|just now|happening|trending|score[s]?|result[s]?|match|winner|champion|ipl|cricket|t20|odi|football|soccer|nba|nfl|f1|grand\s*prix|motogp|tennis|wimbledon|us\s*open|french\s*open|australian\s*open|atp|wta|boxing|ufc|mma|knockout|hockey|nhl|badminton|bwf|golf|pga|masters|rugby|six\s*nations|kabaddi|pkl|wwe|olympics|athletics|prix|price[s]?|crypto|bitcoin|btc|eth|stock|nifty|sensex|share\s*price|weather|temp(erature)?|forecast|news|election|who\s*won|what\s*happened|did\s*.{0,20}\s*win|update[s]?)\b/i.test(q);
+  if (/\b(live|today|tonight|right now|this week|current|latest|breaking|just now|happening|trending|score[s]?|result[s]?|match|winner|champion|ipl|cricket|t20|odi|football|soccer|nba|nfl|f1|grand\s*prix|motogp|tennis|wimbledon|us\s*open|french\s*open|australian\s*open|atp|wta|boxing|ufc|mma|knockout|hockey|nhl|badminton|bwf|golf|pga|masters|rugby|six\s*nations|kabaddi|pkl|wwe|olympics|athletics|prix|price[s]?|crypto|bitcoin|btc|eth|stock|nifty|sensex|share\s*price|weather|temp(erature)?|forecast|news|election|who\s*won|what\s*happened|did\s*.{0,20}\s*win|update[s]?)\b/i.test(q)) return true;
+  // Product/tech/specs queries — model training data is often wrong or outdated
+  // for specific hardware specs, so always search these.
+  if (/\b(vs|versus|compare|comparison|difference|better|spec[s]?|specification[s]?|review|benchmark|processor|chipset|snapdragon|dimensity|helio|exynos|ram|storage|battery|camera|display|amoled|refresh\s*rate|charging|realme|redmi|poco|oneplus|samsung|iphone|apple|vivo|oppo|motorola|nokia|asus|pixel|nothing\s*phone|xiaomi|iqoo|lava|tecno|infinix|micromax|honor|huawei|laptop|macbook|chromebook|tablet|ipad|smartwatch|earbuds|earphone[s]?|headphone[s]?|tws|buds|watch|wearable|router|wifi|5g|4g|lte|modem|gpu|graphics\s*card|rtx|rx\s*\d|geforce|radeon|processor|ryzen|intel|amd|core\s*i\d|celeron|pentium|ssd|nvme|hdd|monitor|keyboard|mouse|mechanical)\b/i.test(q)) return true;
+  return false;
+}
+
+/**
+ * Free web search using DuckDuckGo HTML — no API key required.
+ * Returns up to `maxSnippets` text snippets extracted from the search page.
+ * Used as a fallback when Gemini grounding is unavailable (no API key).
+ */
+async function duckDuckGoSearch(query, maxSnippets = 5) {
+  const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}&kl=in-en`;
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      "Accept-Language": "en-US,en;q=0.9",
+    },
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!res.ok) throw new Error(`DDG HTTP ${res.status}`);
+  const html = await res.text();
+
+  const results = [];
+
+  // Extract (title, snippet, url) triples from DDG's HTML result blocks
+  // DDG wraps each result in <div class="result results_links ...">
+  const blockRe = /<div[^>]+class="[^"]*result[^"]*"[^>]*>([\s\S]*?)<\/div>\s*<\/div>/g;
+  let block;
+  while ((block = blockRe.exec(html)) !== null && results.length < maxSnippets) {
+    const chunk = block[1];
+
+    const titleMatch = chunk.match(/<a[^>]+class="result__a"[^>]*>([\s\S]*?)<\/a>/);
+    const snippetMatch = chunk.match(/<a[^>]+class="result__snippet"[^>]*>([\s\S]*?)<\/a>/);
+
+    const clean = (s) =>
+      s.replace(/<b>/g, "").replace(/<\/b>/g, "").replace(/<[^>]+>/g, "").replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#x27;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/\s+/g, " ").trim();
+
+    const title = titleMatch ? clean(titleMatch[1]) : "";
+    const snippet = snippetMatch ? clean(snippetMatch[1]) : "";
+
+    if (snippet && snippet.length > 20) {
+      results.push(title ? `${title}: ${snippet}` : snippet);
+    }
+  }
+
+  // Fallback: grab any snippet-class elements if the block regex found nothing
+  if (results.length === 0) {
+    const fallbackRe = /<a[^>]+class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+    let m;
+    const clean = (s) => s.replace(/<[^>]+>/g, "").replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/\s+/g, " ").trim();
+    while ((m = fallbackRe.exec(html)) !== null && results.length < maxSnippets) {
+      const t = clean(m[1]);
+      if (t.length > 20) results.push(t);
+    }
+  }
+
+  return results;
 }
 
 function buildRealtimeGroundingInstruction({ todayIST = "" } = {}) {
@@ -2606,6 +2664,19 @@ function buildCoreSystemPrompt(config, opts = {}) {
       "",
       "PERSISTENT MEMORY (facts you already know — treat these as absolute truth):",
       ...opts.longTermMemory.map((m) => `- ${m}`)
+    );
+  }
+
+  // Live web search results — injected when a DuckDuckGo search was run for
+  // this query (product specs, comparisons, news, prices, etc.).  The model
+  // MUST treat these as the primary source and prefer them over training data.
+  if (opts.webSearchSnippets && opts.webSearchSnippets.trim()) {
+    lines.push(
+      "",
+      "LIVE WEB SEARCH RESULTS (fetched right now — use these as your primary source; do NOT rely on training data for facts in this answer):",
+      opts.webSearchSnippets.trim(),
+      "",
+      "Answer using the above search results. If the results don't cover something, say so — do not hallucinate missing details."
     );
   }
 
@@ -4980,6 +5051,25 @@ async function startServer() {
           console.warn("[auto-reply] long-term memory load failed:", e.message);
         }
 
+        // Web search — fire for product/specs/comparison/realtime queries
+        // using DuckDuckGo (no API key needed) so the model gets fresh,
+        // accurate data instead of hallucinating from stale training data.
+        let webSearchSnippets = "";
+        if (isRealtimeQuery(promptForRouter)) {
+          try {
+            console.log(`[search] DDG triggered for: "${promptForRouter.slice(0, 80)}"`);
+            const snippets = await duckDuckGoSearch(promptForRouter);
+            if (snippets.length > 0) {
+              webSearchSnippets = snippets.join("\n\n");
+              console.log(`[search] DDG returned ${snippets.length} snippets`);
+            } else {
+              console.log("[search] DDG returned no snippets");
+            }
+          } catch (searchErr) {
+            console.warn("[search] DDG failed:", searchErr.message);
+          }
+        }
+
         // Single ownerOpts object shared by every buildCoreSystemPrompt call
         // in this handler — ensures owner detection fires consistently on all
         // routing paths (general chat, vision, router system instruction).
@@ -4990,6 +5080,7 @@ async function startServer() {
           senderUsername,
           ownerId: ownerTelegramId,
           longTermMemory,
+          webSearchSnippets,
         };
 
         // The router (router/router.js) picks the model — vision, image
