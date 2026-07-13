@@ -1610,65 +1610,150 @@ function buildSearchQuery(userMessage) {
   return cleaned;
 }
 
-/**
- * Free web search using DuckDuckGo HTML — no API key required.
- * Returns up to `maxSnippets` text snippets extracted from the search page.
- * Used as a fallback when Gemini grounding is unavailable (no API key).
- */
-async function duckDuckGoSearch(query, maxSnippets = 5) {
-  const clean = (s) =>
-    s.replace(/<b>/g, "").replace(/<\/b>/g, "").replace(/<[^>]+>/g, "")
-     .replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#x27;/g, "'")
-     .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/\s+/g, " ").trim();
+// ── Multi-source web search pipeline ────────────────────────────────────────
+// Step 1: DDG search → get snippets + real URLs
+// Step 2: Fetch top URLs via Jina AI Reader (free, no key, any IP) in parallel
+// Step 3: Combine into structured context block for the model
+// ─────────────────────────────────────────────────────────────────────────────
 
-  const results = [];
+const DDG_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+  "Accept-Language": "en-US,en;q=0.9",
+  "Referer": "https://duckduckgo.com/",
+  "DNT": "1",
+  "Upgrade-Insecure-Requests": "1",
+};
 
-  // Strategy 1: DDG HTML endpoint with full browser-like headers
+function cleanHtml(s) {
+  return s
+    .replace(/<b>/g, "").replace(/<\/b>/g, "").replace(/<[^>]+>/g, "")
+    .replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#x27;/g, "'")
+    .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/\s+/g, " ").trim();
+}
+
+/** Step 1a — DDG HTML: returns { snippets, urls } */
+async function ddgHtmlSearch(query, max = 5) {
+  const snippets = [], urls = [];
+  const res = await fetch(
+    `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}&kl=in-en&ia=web`,
+    { headers: DDG_HEADERS, signal: AbortSignal.timeout(8000) }
+  );
+  if (!res.ok) return { snippets, urls };
+  const html = await res.text();
+
+  // Extract snippet + URL together from each result block.
+  // DDG encodes real URL as uddg= param inside the snippet anchor href.
+  const re = /<a[^>]+class="result__snippet"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/g;
+  let m;
+  while ((m = re.exec(html)) !== null && snippets.length < max) {
+    const snippet = cleanHtml(m[2]);
+    if (snippet.length < 20) continue;
+    snippets.push(snippet);
+    try {
+      const uddg = m[1].match(/uddg=([^&"]+)/);
+      if (uddg) {
+        const realUrl = decodeURIComponent(uddg[1]);
+        if (realUrl.startsWith("http") && !realUrl.includes("duckduckgo.com")) urls.push(realUrl);
+      }
+    } catch {}
+  }
+
+  // Fallback: snippet-only if block regex missed
+  if (snippets.length === 0) {
+    const re2 = /<a[^>]+class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+    while ((m = re2.exec(html)) !== null && snippets.length < max) {
+      const t = cleanHtml(m[1]);
+      if (t.length > 20) snippets.push(t);
+    }
+  }
+  return { snippets, urls };
+}
+
+/** Step 1b — DDG JSON instant-answer API (works from any IP including datacenter) */
+async function ddgJsonSearch(query, max = 5) {
+  const snippets = [], urls = [];
+  const res = await fetch(
+    `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`,
+    { headers: { "User-Agent": "Mozilla/5.0" }, signal: AbortSignal.timeout(6000) }
+  );
+  if (!res.ok) return { snippets, urls };
+  const data = await res.json();
+  if (data.Answer?.length > 20) snippets.push(data.Answer);
+  if (data.AbstractText?.length > 20) { snippets.push(data.AbstractText); if (data.AbstractURL) urls.push(data.AbstractURL); }
+  for (const t of (data.RelatedTopics || [])) {
+    if (snippets.length >= max) break;
+    const text = t.Text || t.Topics?.[0]?.Text || "";
+    const url  = t.FirstURL || t.Topics?.[0]?.FirstURL || "";
+    if (text.length > 20) snippets.push(text);
+    if (url.startsWith("http")) urls.push(url);
+  }
+  return { snippets, urls };
+}
+
+/** Step 2 — Fetch a single URL via Jina AI Reader (free, no auth, any IP) */
+async function fetchPageViaJina(url, maxChars = 2500) {
   try {
-    const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}&kl=in-en&ia=web`;
-    const res = await fetch(url, {
+    const res = await fetch(`https://r.jina.ai/${url}`, {
       headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://duckduckgo.com/",
-        "DNT": "1",
-        "Upgrade-Insecure-Requests": "1",
+        "Accept": "text/plain",
+        "X-Return-Format": "text",
+        "X-No-Cache": "true",
+        "User-Agent": "Mozilla/5.0",
       },
-      signal: AbortSignal.timeout(8000),
+      signal: AbortSignal.timeout(10000),
     });
-    if (res.ok) {
-      const html = await res.text();
-      const snippetRe = /<a[^>]+class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
-      let m;
-      while ((m = snippetRe.exec(html)) !== null && results.length < maxSnippets) {
-        const t = clean(m[1]);
-        if (t.length > 20) results.push(t);
+    if (!res.ok) return null;
+    const text = await res.text();
+    return text.replace(/\n{3,}/g, "\n\n").trim().slice(0, maxChars);
+  } catch { return null; }
+}
+
+/** Step 3 — Full pipeline: DDG (HTML + JSON in parallel) → Jina page fetches → combined output */
+async function multiSourceWebSearch(query, { maxSources = 3, maxCharsPerSource = 2500 } = {}) {
+  // Fire DDG HTML and JSON searches in parallel
+  const [htmlResult, jsonResult] = await Promise.allSettled([
+    ddgHtmlSearch(query),
+    ddgJsonSearch(query),
+  ]);
+
+  const htmlData = htmlResult.status === "fulfilled" ? htmlResult.value : { snippets: [], urls: [] };
+  const jsonData = jsonResult.status === "fulfilled" ? jsonResult.value : { snippets: [], urls: [] };
+
+  // Merge, dedupe snippets and URLs
+  const seenSnippets = new Set();
+  const snippets = [];
+  for (const s of [...htmlData.snippets, ...jsonData.snippets]) {
+    if (!seenSnippets.has(s)) { seenSnippets.add(s); snippets.push(s); }
+  }
+  const seenUrls = new Set();
+  const urls = [];
+  for (const u of [...htmlData.urls, ...jsonData.urls]) {
+    if (!seenUrls.has(u)) { seenUrls.add(u); urls.push(u); }
+  }
+
+  console.log(`[search] DDG: ${snippets.length} snippets, ${urls.length} URLs`);
+
+  // Fetch top N pages via Jina in parallel
+  const topUrls = urls.slice(0, maxSources);
+  let pageSections = [];
+  if (topUrls.length > 0) {
+    const fetched = await Promise.allSettled(topUrls.map(u => fetchPageViaJina(u, maxCharsPerSource)));
+    fetched.forEach((r, i) => {
+      if (r.status === "fulfilled" && r.value) {
+        let domain = topUrls[i];
+        try { domain = new URL(topUrls[i]).hostname.replace(/^www\./, ""); } catch {}
+        pageSections.push(`[Source: ${domain}]\n${r.value}`);
       }
-    }
-  } catch (_) { /* fall through to Strategy 2 */ }
+    });
+    console.log(`[search] Jina: fetched ${pageSections.length}/${topUrls.length} pages`);
+  }
 
-  if (results.length > 0) return results;
-
-  // Strategy 2: DDG Instant Answer JSON API (works from datacenter IPs)
-  try {
-    const jsonRes = await fetch(
-      `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`,
-      { headers: { "User-Agent": "Mozilla/5.0" }, signal: AbortSignal.timeout(6000) }
-    );
-    if (jsonRes.ok) {
-      const data = await jsonRes.json();
-      if (data.Answer && data.Answer.length > 20) results.push(data.Answer);
-      if (data.AbstractText && data.AbstractText.length > 20) results.push(data.AbstractText);
-      for (const topic of (data.RelatedTopics || [])) {
-        if (results.length >= maxSnippets) break;
-        const text = topic.Text || (topic.Topics?.[0]?.Text) || "";
-        if (text.length > 20) results.push(text);
-      }
-    }
-  } catch (_) { /* both strategies exhausted */ }
-
-  return results;
+  // Build final combined context
+  const parts = [];
+  if (snippets.length > 0) parts.push("=== Search Result Snippets ===\n" + snippets.join("\n\n"));
+  if (pageSections.length > 0) parts.push("=== Full Source Content ===\n" + pageSections.join("\n\n---\n\n"));
+  return parts.join("\n\n");
 }
 
 function buildRealtimeGroundingInstruction({ todayIST = "" } = {}) {
@@ -5115,16 +5200,16 @@ async function startServer() {
           searchAttempted = true;
           const searchQuery = buildSearchQuery(promptForRouter);
           try {
-            console.log(`[search] DDG triggered — query: "${searchQuery.slice(0, 80)}"`);
-            const snippets = await duckDuckGoSearch(searchQuery);
-            if (snippets.length > 0) {
-              webSearchSnippets = snippets.join("\n\n");
-              console.log(`[search] DDG returned ${snippets.length} snippets`);
+            console.log(`[search] multi-source triggered — query: "${searchQuery.slice(0, 80)}"`);
+            const result = await multiSourceWebSearch(searchQuery, { maxSources: 3, maxCharsPerSource: 2500 });
+            if (result && result.trim().length > 0) {
+              webSearchSnippets = result;
+              console.log(`[search] multi-source complete — ${result.length} chars`);
             } else {
-              console.log("[search] DDG returned no snippets");
+              console.log("[search] multi-source returned nothing");
             }
           } catch (searchErr) {
-            console.warn("[search] DDG failed:", searchErr.message);
+            console.warn("[search] multi-source failed:", searchErr.message);
           }
         }
 
