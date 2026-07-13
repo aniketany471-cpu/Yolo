@@ -1592,6 +1592,25 @@ function isRealtimeQuery(query) {
 }
 
 /**
+ * Extracts a clean, search-friendly English query from a raw user message
+ * that may be in Hinglish, contain filler words, or be conversational.
+ * Strips common Hinglish filler words and punctuation so DDG gets a
+ * focused query rather than a literal Hinglish sentence.
+ */
+function buildSearchQuery(userMessage) {
+  // Strip common Hinglish filler/conversational words that hurt search quality
+  const filler = /\b(bhai|bro|yaar|yrr|yr|mitr|arey|arre|haan|hna|mujhe|muje|meko|kuch|bata|batao|bol|bolo|dekh|dekho|sun|suno|please|plz|pls|toh|nahi|nhi|kar|karo|raha|rahi|lagta|lagti|iska|uska|konsa|konsi|kaun|kab|kahan|wala|wali|wale|accha|acha|thik|theek|sahi|bilkul|zaroor|abhi|baad|pehle|phir|fir|matlab|mtlb|iska|uski|unka|unki|aapka|tumhara|mera|tera|humara)\b/gi;
+  let cleaned = userMessage
+    .replace(filler, " ")
+    .replace(/[?!।,।]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  // Fall back to original if cleaning left too little
+  if (cleaned.split(/\s+/).filter(Boolean).length < 2) cleaned = userMessage.trim();
+  return cleaned;
+}
+
+/**
  * Free web search using DuckDuckGo HTML — no API key required.
  * Returns up to `maxSnippets` text snippets extracted from the search page.
  * Used as a fallback when Gemini grounding is unavailable (no API key).
@@ -2674,16 +2693,45 @@ function buildCoreSystemPrompt(config, opts = {}) {
     );
   }
 
-  // Live web search results — injected when a DuckDuckGo search was run for
-  // this query (product specs, comparisons, news, prices, etc.).  The model
-  // MUST treat these as the primary source and prefer them over training data.
+  // ── Anti-hallucination baseline (always active) ─────────────────────────
+  // Prevent the model from inventing specs, prices, scores, or facts it
+  // doesn't actually know — regardless of whether search data is present.
+  lines.push(
+    "",
+    "ANTI-HALLUCINATION RULE (mandatory, no exceptions):",
+    "For ANY factual claim — phone specs, product prices, sports scores, news events, release dates, benchmark numbers — ONLY state what you are certain of.",
+    "If you are not sure of a specific number or detail, say so clearly: 'I don't have confirmed info on that' or 'I couldn't find the exact spec right now'.",
+    "NEVER invent or estimate RAM, storage, battery, chipset, price, score, or any measurable fact. A wrong spec is worse than admitting uncertainty."
+  );
+
+  // ── Live web search results ───────────────────────────────────────────────
+  // Injected when DDG search fired and returned snippets. Model MUST treat
+  // these as the only authoritative source for this answer.
   if (opts.webSearchSnippets && opts.webSearchSnippets.trim()) {
     lines.push(
       "",
-      "LIVE WEB SEARCH RESULTS (fetched right now — use these as your primary source; do NOT rely on training data for facts in this answer):",
+      "━━━━━━━━━━━━━━━━ LIVE WEB DATA (retrieved just now) ━━━━━━━━━━━━━━━━",
       opts.webSearchSnippets.trim(),
+      "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
       "",
-      "Answer using the above search results. If the results don't cover something, say so — do not hallucinate missing details."
+      "HOW TO USE THE ABOVE DATA:",
+      "• This is your ONLY source. Do NOT fill gaps with training-data guesses.",
+      "• For comparisons (X vs Y): structure the reply clearly — key specs side-by-side, then a short verdict. Use bullet points or a simple table.",
+      "• For prices: state exactly what the data says. Missing price → say 'couldn't find current price'.",
+      "• For specs: bullet-point the key specs. Do not invent specs not present in the results.",
+      "• For news/scores: report what the data says, don't embellish.",
+      "• If results don't directly answer the question: say 'I couldn't find exact info on this right now' — never fill gaps with guesses.",
+      "• Keep Donna's natural Hinglish tone — but the facts must be structured, accurate, and straight from the data above."
+    );
+  } else if (opts.searchAttempted) {
+    // Search was triggered (factual/product query) but DDG returned nothing.
+    // Tell the model to admit it rather than hallucinate.
+    lines.push(
+      "",
+      "SEARCH ATTEMPTED — NO RESULTS FOUND:",
+      "A web search was attempted for this query but returned no usable data.",
+      "Do NOT fall back to training data to guess specs, prices, or facts.",
+      "Tell the user honestly: 'I searched but couldn't find reliable info on this right now — check GSMArena / official site for accurate specs.' Keep it short and in Donna's tone."
     );
   }
 
@@ -5062,10 +5110,13 @@ async function startServer() {
         // using DuckDuckGo (no API key needed) so the model gets fresh,
         // accurate data instead of hallucinating from stale training data.
         let webSearchSnippets = "";
+        let searchAttempted = false;
         if (isRealtimeQuery(promptForRouter)) {
+          searchAttempted = true;
+          const searchQuery = buildSearchQuery(promptForRouter);
           try {
-            console.log(`[search] DDG triggered for: "${promptForRouter.slice(0, 80)}"`);
-            const snippets = await duckDuckGoSearch(promptForRouter);
+            console.log(`[search] DDG triggered — query: "${searchQuery.slice(0, 80)}"`);
+            const snippets = await duckDuckGoSearch(searchQuery);
             if (snippets.length > 0) {
               webSearchSnippets = snippets.join("\n\n");
               console.log(`[search] DDG returned ${snippets.length} snippets`);
@@ -5088,6 +5139,7 @@ async function startServer() {
           ownerId: ownerTelegramId,
           longTermMemory,
           webSearchSnippets,
+          searchAttempted,
         };
 
         // The router (router/router.js) picks the model — vision, image
