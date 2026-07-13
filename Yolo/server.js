@@ -1727,6 +1727,48 @@ async function fetchPageViaJina(url, maxChars = 2500) {
   } catch { return null; }
 }
 
+/**
+ * Dedicated lyrics fetcher using lyrics.ovh (free, no key, works from any IP).
+ * Tries to extract artist/title from the query, fetches full lyrics text.
+ * Falls back to null so the caller can try DDG → Jina instead.
+ */
+async function fetchLyricsAPI(query) {
+  try {
+    // Step 1: search lyrics.ovh suggest endpoint to resolve song title + artist
+    const suggestRes = await fetch(
+      `https://api.lyrics.ovh/suggest/${encodeURIComponent(query)}`,
+      { headers: { "User-Agent": "Mozilla/5.0" }, signal: AbortSignal.timeout(8000) }
+    );
+    if (!suggestRes.ok) return null;
+    const suggestData = await suggestRes.json();
+    const hits = suggestData?.data || [];
+    if (hits.length === 0) return null;
+
+    // Pick the best hit (first result)
+    const { title, artist } = hits[0];
+    const artistName = artist?.name || "";
+    if (!title || !artistName) return null;
+
+    console.log(`[lyrics-api] found: "${title}" by "${artistName}"`);
+
+    // Step 2: fetch full lyrics
+    const lyricsRes = await fetch(
+      `https://api.lyrics.ovh/v1/${encodeURIComponent(artistName)}/${encodeURIComponent(title)}`,
+      { headers: { "User-Agent": "Mozilla/5.0" }, signal: AbortSignal.timeout(8000) }
+    );
+    if (!lyricsRes.ok) return null;
+    const lyricsData = await lyricsRes.json();
+    const lyricsText = lyricsData?.lyrics?.trim();
+    if (!lyricsText || lyricsText.length < 50) return null;
+
+    console.log(`[lyrics-api] fetched ${lyricsText.length} chars of lyrics`);
+    return `Song: ${title}\nArtist: ${artistName}\n\nLyrics:\n${lyricsText.slice(0, 4000)}`;
+  } catch (e) {
+    console.warn(`[lyrics-api] failed: ${e.message}`);
+    return null;
+  }
+}
+
 /** Step 3 — Full pipeline: DDG (HTML + JSON in parallel) → Jina page fetches → combined output */
 async function multiSourceWebSearch(query, { maxSources = 3, maxCharsPerSource = 2500 } = {}) {
   // Fire DDG HTML and JSON searches in parallel
@@ -5282,20 +5324,41 @@ async function startServer() {
         // accurate data instead of hallucinating from stale training data.
         let webSearchSnippets = "";
         let searchAttempted = false;
-        if (isRealtimeQuery(promptForRouter)) {
+        const _isRealtime = isRealtimeQuery(promptForRouter);
+        console.log(`[search] isRealtimeQuery="${_isRealtime}" prompt="${promptForRouter.slice(0, 100)}"`);
+        if (_isRealtime) {
           searchAttempted = true;
           const searchQuery = buildSearchQuery(promptForRouter);
+          const _isLyricsQuery = /\b(lyrics|lyric)\b/i.test(promptForRouter);
           try {
-            console.log(`[search] multi-source triggered — query: "${searchQuery.slice(0, 80)}"`);
-            const result = await multiSourceWebSearch(searchQuery, { maxSources: 3, maxCharsPerSource: 2500 });
-            if (result && result.trim().length > 0) {
-              webSearchSnippets = result;
-              console.log(`[search] multi-source complete — ${result.length} chars`);
+            if (_isLyricsQuery) {
+              // For lyrics: use dedicated lyrics.ovh API (always returns real lyrics,
+              // works from any IP, no key needed). Fall back to multi-source only if API fails.
+              console.log(`[lyrics] API fetch — query: "${searchQuery.slice(0, 80)}"`);
+              const lyricsResult = await fetchLyricsAPI(searchQuery);
+              if (lyricsResult) {
+                webSearchSnippets = lyricsResult;
+                console.log(`[lyrics] API success — ${lyricsResult.length} chars`);
+              } else {
+                console.log("[lyrics] API returned nothing — falling back to multi-source search");
+                const result = await multiSourceWebSearch(searchQuery, { maxSources: 3, maxCharsPerSource: 2500 });
+                if (result && result.trim().length > 0) {
+                  webSearchSnippets = result;
+                  console.log(`[lyrics] multi-source fallback — ${result.length} chars`);
+                }
+              }
             } else {
-              console.log("[search] multi-source returned nothing");
+              console.log(`[search] multi-source triggered — query: "${searchQuery.slice(0, 80)}"`);
+              const result = await multiSourceWebSearch(searchQuery, { maxSources: 3, maxCharsPerSource: 2500 });
+              if (result && result.trim().length > 0) {
+                webSearchSnippets = result;
+                console.log(`[search] multi-source complete — ${result.length} chars`);
+              } else {
+                console.log("[search] multi-source returned nothing");
+              }
             }
           } catch (searchErr) {
-            console.warn("[search] multi-source failed:", searchErr.message);
+            console.warn("[search] failed:", searchErr.message);
           }
         }
 
