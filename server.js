@@ -760,6 +760,23 @@ try {
   db.exec("ALTER TABLE config ADD COLUMN videoDownloaderTimeoutSeconds INTEGER DEFAULT 180;");
 } catch (e) {
 }
+// Persist the owner's numeric Telegram ID so detection works by ID, not
+// just by fragile username comparison, across all restarts and model switches.
+try {
+  db.exec("ALTER TABLE config ADD COLUMN ownerTelegramId TEXT DEFAULT '';");
+} catch (e) {}
+// Long-term memory: durable facts about any user (especially the owner) that
+// the AI should always know regardless of conversation history window.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS long_term_memory (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    userId TEXT NOT NULL,
+    category TEXT DEFAULT 'general',
+    content TEXT NOT NULL,
+    timestamp INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_ltm_user ON long_term_memory(userId);
+`);
 db.exec(`
   CREATE TABLE IF NOT EXISTS user_nsfw_prefs (
     userId TEXT PRIMARY KEY,
@@ -2383,6 +2400,13 @@ async function performWeatherGrounding(query, config, geminiKey) {
 function buildCoreSystemPrompt(config, opts = {}) {
   const botUsername = opts.botUsername || "";
   const personality = (config?.autoReplyPersonality || "").trim();
+  // Resolve owner status HERE so every AI routing path (auto-reply, vision,
+  // router) gets the same owner context — not just the getAIResponse path.
+  const isOwnerConversation = isDonnaOwnerConversation(
+    opts.userId || "",
+    opts.senderUsername || "",
+    { ownerId: opts.ownerId || "", isOwner: opts.isOwner }
+  );
 
   // Always give the model the current India (IST) date/time. Previously this
   // was only injected in the getAIResponse() text-command flow (summarize,
@@ -2551,6 +2575,37 @@ function buildCoreSystemPrompt(config, opts = {}) {
       "- STYLE: use naturally, random mix, not every line, keep replies short, playful + friendly energy, emotional Telegram vibe, randomly rotate slang, avoid repeating same phrases, maintain desi vibe.",
       "- HARYANVI / DESI WORDS & PHRASES:",
       "- mitr, bawli gend, bawle, bakchod, randapa, chutiyapa, bawasir, pel diya, pel raha se, gajab, kasuta, ghana, kati, bera, bera koni, chore, chori, bhains ki aankh, maa kasam, lath gaad diya, system hila diya, dimag ka dahi, dimag ka motherboard uda diya, bhot tagda, top tier bakchodi, nuclear bakchodi, full bakchod, full chaotic, alag hi nashe me, yo banda dangerous se",
+    );
+  }
+
+  // Owner recognition — injected into every system prompt so the model never
+  // loses track of who it is talking to across restarts, model switches, or
+  // routing path changes.  Uses the numeric Telegram ID (opts.ownerId) as the
+  // primary signal; falls back to username if ID is unavailable.
+  if (isOwnerConversation) {
+    const ownerHandle = opts.senderUsername
+      ? `@${opts.senderUsername}`
+      : `@${DONNA_OWNER_USERNAME}`;
+    const ownerIdNote = opts.ownerId ? ` (Telegram ID: ${opts.ownerId})` : "";
+    lines.push(
+      "",
+      `OWNER RECOGNITION — ABSOLUTE PRIORITY: The person sending this message IS your owner${ownerIdNote} — ${ownerHandle}. This is confirmed by their numeric Telegram ID, not a guess.`,
+      "Apply every OWNER RULE from your relationship priority block right now. These override all other personality, humor, and formatting rules.",
+      "Never forget who your owner is — not after a restart, not after a model switch, not ever.",
+      "If they ask who built you or who owns you: reply warmly and personally, e.g. 'You built me!', 'You're my creator, remember?', 'You literally made me.' — vary it naturally.",
+      "If they ask where you live: say 'In your heart 💙', 'Right in your heart'. Always second-person when talking to your owner.",
+      "Keep everything warm, loyal, personal. Never robotic with your owner.",
+    );
+  }
+
+  // Long-term memory — persistent facts about the current user that should
+  // survive across every session, restart, and model switch.  Loaded from the
+  // long_term_memory table and injected here so no AI routing path can miss it.
+  if (Array.isArray(opts.longTermMemory) && opts.longTermMemory.length > 0) {
+    lines.push(
+      "",
+      "PERSISTENT MEMORY (facts you already know — treat these as absolute truth):",
+      ...opts.longTermMemory.map((m) => `- ${m}`)
     );
   }
 
@@ -4899,6 +4954,9 @@ async function startServer() {
           }
         }
 
+        // Extract sender username — needed for owner detection by username fallback.
+        const senderUsername = (message.sender?.username || "").replace(/^@/, "");
+
         // Check NSFW status for this specific sender
         let isNSFWForSender = !!(config.nsfwEnabled);
         if (senderId) {
@@ -4907,6 +4965,32 @@ async function startServer() {
             if (senderNsfw) isNSFWForSender = !!(senderNsfw.nsfwEnabled);
           } catch (e) {}
         }
+
+        // Load persisted long-term memory for this sender so the AI always
+        // knows durable facts (owner identity, preferences, ongoing context)
+        // regardless of how short the rolling conversation window is.
+        const ownerTelegramId = (config.ownerTelegramId || "").trim();
+        const longTermMemory = [];
+        try {
+          const ltmRows = db.prepare(
+            "SELECT content FROM long_term_memory WHERE userId = ? ORDER BY timestamp DESC LIMIT 20"
+          ).all(senderId || "");
+          ltmRows.forEach((r) => longTermMemory.push(r.content));
+        } catch (e) {
+          console.warn("[auto-reply] long-term memory load failed:", e.message);
+        }
+
+        // Single ownerOpts object shared by every buildCoreSystemPrompt call
+        // in this handler — ensures owner detection fires consistently on all
+        // routing paths (general chat, vision, router system instruction).
+        const ownerOpts = {
+          botUsername: myUsername,
+          isNSFW: isNSFWForSender,
+          userId: senderId,
+          senderUsername,
+          ownerId: ownerTelegramId,
+          longTermMemory,
+        };
 
         // The router (router/router.js) picks the model — vision, image
         // generation, or general/coding chat — purely from an AI classifier
@@ -4917,7 +5001,7 @@ async function startServer() {
           attachments: { image: hasVisionImage },
           apiKey: config.iamhcApiKey,
           context: autoReplyCtx,
-          systemInstruction: buildCoreSystemPrompt(config, { botUsername: myUsername, isNSFW: isNSFWForSender }),
+          systemInstruction: buildCoreSystemPrompt(config, ownerOpts),
         });
 
         let replyText = null;
@@ -4975,7 +5059,7 @@ async function startServer() {
             visionAnswer = await routedChatCompletion({
               model: mdl,
               prompt: visionPrompt,
-              systemInstruction: buildCoreSystemPrompt(config, { botUsername: myUsername, isNSFW: isNSFWForSender }),
+              systemInstruction: buildCoreSystemPrompt(config, ownerOpts),
             });
             if (visionAnswer.ok) break;
             console.warn(`[vision-reply] model=${mdl} failed(${visionAnswer.status}) trying_next`);
@@ -5111,6 +5195,26 @@ async function startServer() {
       const myUsername = me.username || "";
       addLog(`Connected as ${me.firstName} (ID: ${myId})`, "success");
       console.log(`[BOT] Connected successfully as ${myId}`);
+
+      // Resolve and persist the owner's numeric Telegram ID so all AI paths
+      // can detect the owner by numeric ID — which never changes — rather than
+      // by a username that could be updated at any time.
+      try {
+        const cfgOwner = db.prepare("SELECT ownerTelegramId FROM config WHERE id = 1").get();
+        if (!cfgOwner?.ownerTelegramId) {
+          const ownerEntity = await client.getInputEntity(DONNA_OWNER_USERNAME);
+          // gramjs can return the peer as PeerUser (userId) or as an entity (id)
+          const resolvedId = (ownerEntity.userId || ownerEntity.id)?.toString();
+          if (resolvedId) {
+            db.prepare("UPDATE config SET ownerTelegramId = ? WHERE id = 1").run(resolvedId);
+            console.log(`[BOT] Owner @${DONNA_OWNER_USERNAME} resolved → numeric ID stored: ${resolvedId}`);
+          }
+        } else {
+          console.log(`[BOT] Owner Telegram ID already set: ${cfgOwner.ownerTelegramId}`);
+        }
+      } catch (ownerResolveErr) {
+        console.warn(`[BOT] Could not resolve owner @${DONNA_OWNER_USERNAME}: ${ownerResolveErr.message}`);
+      }
       const messageHandler = async (event) => {
         try {
           if (!client) return;
