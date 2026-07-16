@@ -1,5 +1,6 @@
 import { execSync, spawn } from "child_process";
 import express from "express";
+import { moderateMessage } from "./services/moderation.js";
 import Database from "better-sqlite3";
 import { TelegramClient, Api } from "telegram";
 import { StringSession } from "telegram/sessions/index.js";
@@ -500,8 +501,29 @@ db.exec(`
     chatId TEXT PRIMARY KEY,
     publicCommandsEnabled INTEGER DEFAULT 1,
     cooldownOverride INTEGER DEFAULT NULL,
+    moderationMode TEXT DEFAULT 'off',
     updatedAt INTEGER
   );
+
+  CREATE TABLE IF NOT EXISTS moderation_violations (
+    userId TEXT NOT NULL,
+    chatId TEXT NOT NULL,
+    reason TEXT,
+    count INTEGER DEFAULT 1,
+    lastAt INTEGER,
+    PRIMARY KEY (userId, chatId)
+  );
+
+  CREATE TABLE IF NOT EXISTS moderation_logs (
+    id TEXT PRIMARY KEY,
+    timestamp INTEGER,
+    userId TEXT,
+    chatId TEXT,
+    reason TEXT,
+    action TEXT,
+    messageText TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_modlog_chat ON moderation_logs(chatId, timestamp);
 
   CREATE TABLE IF NOT EXISTS command_stats (
     command TEXT,
@@ -4452,6 +4474,48 @@ async function startServer() {
     }
   });
 
+  // ── Moderation API ────────────────────────────────────────────────────────
+  app.get("/api/moderation/mode/:chatId", (req, res) => {
+    const { chatId } = req.params;
+    const row = db.prepare("SELECT moderationMode FROM group_settings WHERE chatId = ?").get(chatId);
+    res.json({ chatId, mode: row?.moderationMode || "off" });
+  });
+  app.post("/api/moderation/mode/:chatId", (req, res) => {
+    const { chatId } = req.params;
+    const { mode } = req.body || {};
+    if (!["off", "soft", "hard"].includes(mode)) return res.status(400).json({ error: "mode must be off, soft, or hard" });
+    db.prepare(`
+      INSERT INTO group_settings (chatId, moderationMode, updatedAt) VALUES (?, ?, ?)
+      ON CONFLICT(chatId) DO UPDATE SET moderationMode = excluded.moderationMode, updatedAt = excluded.updatedAt
+    `).run(chatId, mode, Date.now());
+    res.json({ success: true, chatId, mode });
+  });
+  app.get("/api/moderation/logs/:chatId", (req, res) => {
+    const { chatId } = req.params;
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    const logs = db.prepare(
+      "SELECT * FROM moderation_logs WHERE chatId = ? ORDER BY timestamp DESC LIMIT ?"
+    ).all(chatId, limit);
+    res.json({ logs });
+  });
+  app.get("/api/moderation/violations/:chatId", (req, res) => {
+    const { chatId } = req.params;
+    const rows = db.prepare(
+      "SELECT * FROM moderation_violations WHERE chatId = ? ORDER BY count DESC"
+    ).all(chatId);
+    res.json({ violations: rows });
+  });
+  app.delete("/api/moderation/violations/:chatId/:userId", (req, res) => {
+    const { chatId, userId } = req.params;
+    db.prepare("DELETE FROM moderation_violations WHERE chatId = ? AND userId = ?").run(chatId, userId);
+    res.json({ success: true });
+  });
+  app.delete("/api/moderation/logs/:chatId", (req, res) => {
+    const { chatId } = req.params;
+    db.prepare("DELETE FROM moderation_logs WHERE chatId = ?").run(chatId);
+    res.json({ success: true });
+  });
+
   app.use("/api/*", (req, res) => {
     res.status(404).json({ error: `API route ${req.originalUrl} not found` });
   });
@@ -5311,12 +5375,77 @@ async function startServer() {
           if (!client) return;
           const message = event.message;
           const textRaw = normalizeMessageText(message);
-          if (!message || !textRaw) return;
+          const hasMedia = !!(message?.media?.photo || message?.media?.document || message?.media?.video);
+          // Allow media-only messages through so moderation can inspect images/videos
+          if (!message || (!textRaw && !hasMedia)) return;
           const senderId = message.senderId?.toString();
           const isMe = message.out || (myId && senderId === myId);
           if (isMe) return;
           const config2 = db.prepare("SELECT * FROM config WHERE id = 1").get();
-          await maybeHandleAutoReply(client, message, config2, myId, myUsername);
+
+          // ── /modmode command (owner/admin only, works from Telegram) ────────
+          if (textRaw && /^[\/\.]modmode\b/i.test(textRaw.trim())) {
+            const parts = textRaw.trim().split(/\s+/);
+            const newMode = (parts[1] || "").toLowerCase();
+            const chatIdStr = message.chatId?.toString();
+            const isOwner = senderId === myId || senderId === (db.prepare("SELECT ownerTelegramId FROM config WHERE id = 1").get()?.ownerTelegramId);
+            if (!isOwner) {
+              // Only bot owner can change moderation mode
+              await client.sendMessage(message.chatId, { message: "🔒 Only the bot owner can change moderation mode.", replyTo: message.id });
+              return;
+            }
+            const validModes = ["off", "soft", "hard"];
+            if (!newMode || !validModes.includes(newMode)) {
+              const current = db.prepare("SELECT moderationMode FROM group_settings WHERE chatId = ?").get(chatIdStr)?.moderationMode || "off";
+              await client.sendMessage(message.chatId, {
+                message: `🛡️ **Moderation Mode**\n\nCurrent: \`${current}\`\n\nUsage: \`/modmode soft\` | \`/modmode hard\` | \`/modmode off\`\n\n🟢 **soft** — removes porn/explicit content only, warns user\n🔴 **hard** — removes porn + harassment + hate + threats + spam + scams, escalates to mute/kick/ban\n⚫ **off** — no moderation`,
+                replyTo: message.id,
+              });
+              return;
+            }
+            db.prepare(`
+              INSERT INTO group_settings (chatId, moderationMode, updatedAt)
+              VALUES (?, ?, ?)
+              ON CONFLICT(chatId) DO UPDATE SET moderationMode = excluded.moderationMode, updatedAt = excluded.updatedAt
+            `).run(chatIdStr, newMode, Date.now());
+            const icons = { off: "⚫", soft: "🟢", hard: "🔴" };
+            await client.sendMessage(message.chatId, {
+              message: `${icons[newMode]} Moderation mode set to **${newMode}** for this group.`,
+              replyTo: message.id,
+            });
+            return;
+          }
+
+          // ── /modstats — show violation counts in this group (owner only) ───
+          if (textRaw && /^[\/\.]modstats\b/i.test(textRaw.trim())) {
+            const chatIdStr = message.chatId?.toString();
+            const isOwner = senderId === myId || senderId === (db.prepare("SELECT ownerTelegramId FROM config WHERE id = 1").get()?.ownerTelegramId);
+            if (!isOwner) return;
+            const rows = db.prepare(
+              "SELECT userId, reason, count, lastAt FROM moderation_violations WHERE chatId = ? ORDER BY count DESC LIMIT 10"
+            ).all(chatIdStr);
+            const logs = db.prepare(
+              "SELECT action, reason, COUNT(*) as n FROM moderation_logs WHERE chatId = ? GROUP BY action, reason ORDER BY n DESC"
+            ).all(chatIdStr);
+            if (!rows.length) {
+              await client.sendMessage(message.chatId, { message: "✅ No violations recorded in this group.", replyTo: message.id });
+              return;
+            }
+            const lines = rows.map(r => `• User ${r.userId} — ${r.reason} × ${r.count}`).join("\n");
+            const summary = logs.map(l => `${l.action}: ${l.n}`).join(" | ");
+            await client.sendMessage(message.chatId, {
+              message: `📊 **Moderation Stats**\n\n${lines}\n\n_Actions: ${summary || "none"}_`,
+              replyTo: message.id,
+            });
+            return;
+          }
+
+          // Moderation runs before AI reply — inspects all message types (text + media)
+          await moderateMessage({ client, message, db, config: config2, myId });
+          // Auto-reply only runs for text messages (existing behaviour preserved)
+          if (textRaw) {
+            await maybeHandleAutoReply(client, message, config2, myId, myUsername);
+          }
         } catch (err) {
           console.error("[BOT] Error in messageHandler:", err);
           addLog("Handler Error: " + (err.message || String(err)), "error");
