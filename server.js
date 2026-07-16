@@ -1069,11 +1069,28 @@ async function maybeHandleFastSaver({ client, message, config, myId }) {
   if (!textRaw) return false;
   const apiKey = (config?.fastSaverKey || process.env.FASTSAVER_API_KEY || "").trim();
 
-  const ytUrl  = extractYouTubeUrl(textRaw);
-  const igUrl  = extractInstagramUrl(textRaw);
+  let ytUrl  = extractYouTubeUrl(textRaw);
+  let igUrl  = extractInstagramUrl(textRaw);
   const limits = getVideoDownloaderLimits(config);
 
   const hasIntent = hasDownloaderIntent(textRaw);
+
+  // If no URL in current message but user has download intent (e.g. "download this",
+  // "downloadkaro" while replying to an Instagram/YouTube message), pull the URL from
+  // the replied-to message so we can still act on it.
+  if (!ytUrl && !igUrl && hasIntent && message.replyTo?.replyToMsgId) {
+    try {
+      const replied = await client.getMessages(message.chatId, { ids: [message.replyTo.replyToMsgId] });
+      const rmsg = replied?.[0];
+      const rText = (rmsg?.message || rmsg?.text || "").trim();
+      if (rText) {
+        ytUrl = extractYouTubeUrl(rText);
+        igUrl = extractInstagramUrl(rText);
+      }
+    } catch (e) {
+      console.warn("[FastSaver] Could not fetch replied message for URL:", e.message);
+    }
+  }
 
   // ── Case 1: YouTube URL + explicit download intent → FastSaver API ──────────
   // Only triggers when user explicitly asks to download (not on every URL share).
@@ -5301,12 +5318,13 @@ async function startServer() {
           }
         }
 
-        // Jina AI URL fetch — runs when message contains a URL but user is NOT
-        // asking to download (download requests are handled by maybeHandleFastSaver
-        // before this point and never reach here).
+        // Jina AI URL fetch — runs when message contains a regular URL but user is NOT
+        // asking to download. Instagram/YouTube URLs are skip — they need the download
+        // handler, not a content fetch (and Instagram always blocks Jina with auth errors).
         let linkContext = "";
         const urlsInMsg = (promptForRouter.match(/https?:\/\/[^\s)>\]"']+/gi) || []);
-        if (urlsInMsg.length > 0 && !hasDownloaderIntent(promptForRouter) && !hasVisionImage) {
+        const hasMediaUrl = urlsInMsg.some(u => /instagram\.com|youtu\.be|youtube\.com|youtu\.be/i.test(u));
+        if (urlsInMsg.length > 0 && !hasDownloaderIntent(promptForRouter) && !hasVisionImage && !hasMediaUrl) {
           try {
             console.log(`[jina] detected ${urlsInMsg.length} URL(s), fetching...`);
             linkContext = await buildLinkContext(promptForRouter, 2);
