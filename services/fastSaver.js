@@ -149,6 +149,49 @@ export function isMusicByNameRequest(text = "") {
   return stripped.length > 3;
 }
 
+/**
+ * Download a video/reel via cobalt.tools (free, no key needed).
+ * Supports Instagram reels/posts, YouTube, TikTok, Twitter/X, and more.
+ * Returns { downloadUrl, filename } — call streamToFile() to save it.
+ */
+export async function cobaltDownload(url, { quality = "720", timeoutMs = 25000 } = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const resp = await fetch("https://api.cobalt.tools/", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "Donna-Bot/1.0",
+      },
+      body: JSON.stringify({ url, videoQuality: quality, filenameStyle: "nerdy", downloadMode: "auto" }),
+      signal: controller.signal,
+    });
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => "");
+      throw new Error(`Cobalt API HTTP ${resp.status}: ${body.slice(0, 120)}`);
+    }
+    const data = await resp.json();
+    // status: "tunnel" | "redirect" | "stream" | "picker" | "error"
+    if (data.status === "error") {
+      throw new Error(`Cobalt error: ${data.error?.code || JSON.stringify(data.error).slice(0, 100)}`);
+    }
+    if (data.status === "picker") {
+      // Carousel / multiple items — pick first video, fall back to first item
+      const item = data.picker?.find(p => p.type === "video") || data.picker?.[0];
+      if (!item?.url) throw new Error("Cobalt picker returned no downloadable item");
+      return { downloadUrl: item.url, filename: item.filename || "video.mp4" };
+    }
+    if (data.url) {
+      return { downloadUrl: data.url, filename: data.filename || "video.mp4" };
+    }
+    throw new Error("Cobalt returned no download URL");
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** Extract the song/artist name from a download-by-name request */
 export function extractSongQuery(text = "") {
   return text
