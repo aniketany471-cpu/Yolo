@@ -38,7 +38,7 @@ import { buildLinkContext } from "./services/linkReader.js";
 import { fetchSportsContext } from "./services/sportsReader.js";
 import { DEFAULT_TTS_CONFIG, generateTTSFile } from "./services/tts.js";
 import { VIDEO_DOWNLOADER_MESSAGES, downloadAudioWithYtDlp, downloadVideoWithYtDlp, extractSupportedVideoUrl, extractUrls, hasDownloaderIntent } from "./services/videoDownloader.js";
-import { ytInfo, ytSearch, ytDownloadUrl, streamToFile, pickVideoFormat, extractYouTubeUrl, extractInstagramUrl, isMusicByNameRequest, extractSongQuery } from "./services/fastSaver.js";
+import { ytInfo, ytSearch, ytDownloadUrl, streamToFile, pickVideoFormat, extractYouTubeUrl, extractInstagramUrl, isMusicByNameRequest, extractSongQuery, cobaltDownload } from "./services/fastSaver.js";
 // Image service — loaded dynamically so a missing/broken module never crashes the bot
 let ziGenerateImage = null;
 let ziParseImageModelKeyword = null;
@@ -1073,79 +1073,88 @@ async function maybeHandleFastSaver({ client, message, config, myId }) {
   const igUrl  = extractInstagramUrl(textRaw);
   const limits = getVideoDownloaderLimits(config);
 
-  // ── Case 1: YouTube URL pasted → auto-download ─────────────────────────────
-  if (ytUrl && apiKey) {
+  const hasIntent = hasDownloaderIntent(textRaw);
+
+  // ── Case 1: YouTube URL + explicit download intent → FastSaver API ──────────
+  // Only triggers when user explicitly asks to download (not on every URL share).
+  // Falls back to cobalt.tools if FastSaver fails — no yt-dlp used.
+  if (ytUrl && hasIntent) {
     const status = new SmartStatus(client, message.chatId, false, message.id);
     try {
       await status.update("⬇️ Fetching video info...", { parseMode: undefined });
-      const info = await ytInfo(ytUrl, apiKey);
-      const fmt = pickVideoFormat(info.formats || [], limits.maxFileSizeMb);
-      await status.update(`⬇️ Downloading **${(info.title || "video").slice(0, 60)}** (${fmt})...`, { parseMode: "markdown" });
-      const tunnelUrl = await ytDownloadUrl(ytUrl, fmt, apiKey);
-      const tmpPath = path.join(videoDir, `yt_${Date.now()}.mp4`);
-      await streamToFile(tunnelUrl, tmpPath);
-      const targetPeer = await status.getChat();
-      try { if (status.messageId) await client.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch (_) {}
-      await client.sendFile(targetPeer, {
-        file: tmpPath,
-        caption: `🎬 **${(info.title || "").slice(0, 200)}**\n👤 ${info.author || ""} · ⏱ ${Math.floor((info.duration || 0) / 60)}:${String((info.duration || 0) % 60).padStart(2, "0")}`,
-        parseMode: "markdown",
-        replyTo: message.id,
-        forceDocument: false,
-      });
-      fs.remove(tmpPath).catch(() => {});
-      addLog(`[FastSaver] YT video sent: ${(info.title || ytUrl).slice(0, 60)}`, "success");
-      return true;
-    } catch (e) {
-      console.warn("[FastSaver] YT video failed, trying yt-dlp fallback:", e?.message);
-      // Fall through to yt-dlp below
-      try { await status.update("⬇️ Trying alternate method...", { parseMode: undefined }); } catch (_) {}
-      try {
-        await verifyVideoDownloaderRuntime({ installIfMissing: true });
-        const result = await downloadVideoWithYtDlp({
-          url: ytUrl,
-          ytdlpPath: YTDLP_BIN,
-          ffmpegPath: detectFfmpegPath(),
-          outputRoot: videoDir,
-          cookiesPath: getUserYtCookiesPath(),
-          maxFileSizeMb: limits.maxFileSizeMb,
-          timeoutMs: limits.timeoutMs,
-          onLog: (() => {
-            let lastPct = -15;
-            return (line) => {
-              const m = line?.match(/\[download\]\s+([\d.]+)%\s+of\s+([\d.]+\s*[GMKi]?B)/i);
-              if (m) {
-                const pct = Math.floor(parseFloat(m[1]));
-                if (pct - lastPct >= 15) { lastPct = pct; status.update(`⬇️ Downloading... ${pct}% of ${m[2]}`, { parseMode: undefined }).catch(() => {}); }
-              }
-            };
-          })(),
-        });
+      if (apiKey) {
+        const info = await ytInfo(ytUrl, apiKey);
+        const fmt = pickVideoFormat(info.formats || [], limits.maxFileSizeMb);
+        await status.update(`⬇️ Downloading **${(info.title || "video").slice(0, 60)}** (${fmt})...`, { parseMode: "markdown" });
+        const tunnelUrl = await ytDownloadUrl(ytUrl, fmt, apiKey);
+        const tmpPath = path.join(videoDir, `yt_${Date.now()}.mp4`);
+        await streamToFile(tunnelUrl, tmpPath);
         const targetPeer = await status.getChat();
         try { if (status.messageId) await client.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch (_) {}
         await client.sendFile(targetPeer, {
-          file: result.filePath,
+          file: tmpPath,
+          caption: `🎬 **${(info.title || "").slice(0, 200)}**\n👤 ${info.author || ""} · ⏱ ${Math.floor((info.duration || 0) / 60)}:${String((info.duration || 0) % 60).padStart(2, "0")}`,
+          parseMode: "markdown",
+          replyTo: message.id,
+          forceDocument: false,
+        });
+        fs.remove(tmpPath).catch(() => {});
+        addLog(`[FastSaver] YT video sent: ${(info.title || ytUrl).slice(0, 60)}`, "success");
+        return true;
+      }
+      // No FastSaver key — try cobalt directly
+      throw new Error("No FastSaver key, using cobalt fallback");
+    } catch (e) {
+      console.warn("[FastSaver] YT primary failed, trying cobalt:", e?.message);
+      try { await status.update("⬇️ Trying alternate method...", { parseMode: undefined }); } catch (_) {}
+      try {
+        const { downloadUrl, filename } = await cobaltDownload(ytUrl, { quality: "720" });
+        const tmpPath = path.join(videoDir, `yt_cobalt_${Date.now()}.mp4`);
+        await streamToFile(downloadUrl, tmpPath);
+        const targetPeer = await status.getChat();
+        try { if (status.messageId) await client.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch (_) {}
+        await client.sendFile(targetPeer, {
+          file: tmpPath,
           caption: VIDEO_DOWNLOADER_MESSAGES.success,
           replyTo: message.id,
           forceDocument: false,
         });
-        fs.remove(result.workDir || result.filePath).catch(() => {});
+        fs.remove(tmpPath).catch(() => {});
+        addLog(`[cobalt] YT video sent: ${ytUrl.slice(0, 60)}`, "success");
         return true;
       } catch (e2) {
+        console.error("[cobalt] YT fallback failed:", e2?.message);
         await status.finish("❌ Could not download this video. It may be age-restricted or unavailable.", { parseMode: undefined, replyTo: message.id });
         return true;
       }
     }
   }
 
-  // ── Case 1b: YouTube URL but no API key → direct yt-dlp ───────────────────
-  if (ytUrl && !apiKey) {
-    return maybeHandleVideoDownloader({ client, message, config });
-  }
-
-  // ── Case 2: Instagram URL + download intent → yt-dlp ──────────────────────
-  if (igUrl && hasDownloaderIntent(textRaw)) {
-    return maybeHandleVideoDownloader({ client, message, config });
+  // ── Case 2: Instagram URL + explicit download intent → cobalt.tools ─────────
+  // No yt-dlp. cobalt.tools supports Instagram reels and posts natively.
+  if (igUrl && hasIntent) {
+    const status = new SmartStatus(client, message.chatId, false, message.id);
+    try {
+      await status.update(VIDEO_DOWNLOADER_MESSAGES.downloading, { parseMode: undefined });
+      const { downloadUrl, filename } = await cobaltDownload(igUrl, { quality: "720" });
+      const tmpPath = path.join(videoDir, `ig_${Date.now()}.mp4`);
+      await streamToFile(downloadUrl, tmpPath);
+      const targetPeer = await status.getChat();
+      try { if (status.messageId) await client.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch (_) {}
+      await client.sendFile(targetPeer, {
+        file: tmpPath,
+        caption: VIDEO_DOWNLOADER_MESSAGES.success,
+        replyTo: message.id,
+        forceDocument: false,
+      });
+      fs.remove(tmpPath).catch(() => {});
+      addLog(`[cobalt] Instagram video sent: ${igUrl.slice(0, 60)}`, "success");
+      return true;
+    } catch (e) {
+      console.error("[cobalt] Instagram download failed:", e?.message);
+      await status.finish(VIDEO_DOWNLOADER_MESSAGES.failure, { parseMode: undefined, replyTo: message.id });
+      return true;
+    }
   }
 
   // ── Case 3: "download X song" (no URL) → FastSaver music search ────────────
