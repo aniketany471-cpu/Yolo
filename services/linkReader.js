@@ -150,12 +150,16 @@ export async function readLink(url) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), JINA_TIMEOUT_MS);
   try {
+    const jinaKey = (process.env.JINA_API_KEY || "").trim();
+    const jinaHeaders = {
+      Accept: "text/plain, text/markdown",
+      "X-No-Cache": "true",
+      "X-Return-Format": "markdown",
+      "X-With-Generated-Alt": "true",
+    };
+    if (jinaKey) jinaHeaders["Authorization"] = `Bearer ${jinaKey}`;
     const res = await fetch(jinaUrl, {
-      headers: {
-        Accept: "text/plain, text/markdown",
-        "X-No-Cache": "true",
-        "X-Return-Format": "markdown",
-      },
+      headers: jinaHeaders,
       signal: controller.signal,
     });
     const raw = await res.text();
