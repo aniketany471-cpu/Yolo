@@ -50,7 +50,15 @@ export function extractSupportedVideoUrl(text = "") {
 }
 
 export function hasDownloaderIntent(text = "") {
-  return /(^|\s)(download|save|yt|youtube|ig|insta|instagram|reel|video)(\s|$)/i.test(String(text || ""));
+  const t = String(text || "");
+  // "download" as a prefix catches "downloadker", "downloadkaro", "downloadkr", etc. (Hinglish variants)
+  if (/\bdownload\w*/i.test(t)) return true;
+  // Explicit standalone keywords
+  if (/(^|\s)(save|dl)(\s|$)/i.test(t)) return true;
+  // Hinglish intent phrases around media words
+  if (/\b(reel|video|mp4|mp3)\b.{0,30}\b(lelo|le\s*lo|karo|karna|bhej|bhejo|send|chahiye|dedo|de\s*do)\b/i.test(t)) return true;
+  if (/\b(lelo|le\s*lo|bhej|bhejo|send|dedo|de\s*do).{0,30}\b(reel|video|mp4|mp3)\b/i.test(t)) return true;
+  return false;
 }
 
 function waitForProcess(cmd, args, { cwd, timeoutMs, onLog } = {}) {
