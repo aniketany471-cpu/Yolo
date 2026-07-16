@@ -38,6 +38,7 @@ import { buildLinkContext } from "./services/linkReader.js";
 import { fetchSportsContext } from "./services/sportsReader.js";
 import { DEFAULT_TTS_CONFIG, generateTTSFile } from "./services/tts.js";
 import { VIDEO_DOWNLOADER_MESSAGES, downloadAudioWithYtDlp, downloadVideoWithYtDlp, extractSupportedVideoUrl, extractUrls, hasDownloaderIntent } from "./services/videoDownloader.js";
+import { ytInfo, ytSearch, ytDownloadUrl, streamToFile, pickVideoFormat, extractYouTubeUrl, extractInstagramUrl, isMusicByNameRequest, extractSongQuery } from "./services/fastSaver.js";
 // Image service — loaded dynamically so a missing/broken module never crashes the bot
 let ziGenerateImage = null;
 let ziParseImageModelKeyword = null;
@@ -782,6 +783,9 @@ try {
   db.exec("ALTER TABLE config ADD COLUMN videoDownloaderTimeoutSeconds INTEGER DEFAULT 180;");
 } catch (e) {
 }
+try {
+  db.exec("ALTER TABLE config ADD COLUMN fastSaverKey TEXT DEFAULT '';");
+} catch (e) {}
 // Persist the owner's numeric Telegram ID so detection works by ID, not
 // just by fragile username comparison, across all restarts and model switches.
 try {
@@ -867,7 +871,8 @@ db.exec(`
     activeModel = COALESCE(activeModel, 'deepseek.v3.2'),
     tts = COALESCE(tts, '{"primaryProvider":"elevenlabs","model":"eleven_multilingual_v2"}'),
     videoDownloaderMaxMb = COALESCE(videoDownloaderMaxMb, 50),
-    videoDownloaderTimeoutSeconds = COALESCE(videoDownloaderTimeoutSeconds, 180)
+    videoDownloaderTimeoutSeconds = COALESCE(videoDownloaderTimeoutSeconds, 180),
+    fastSaverKey = COALESCE(fastSaverKey, '')
   WHERE id = 1;
 `);
 
@@ -1049,6 +1054,139 @@ async function maybeHandleVideoDownloader({ client, message, config }) {
     if (workDir) await fs.remove(workDir).catch(() => {});
     cleanupVideoDownloaderFiles().catch(() => {});
   }
+}
+
+// ── FastSaver download handler ────────────────────────────────────────────────
+// Called from messageHandler before the AI auto-reply.
+// Handles three cases:
+//   1. YouTube URL in message → auto-download video (no intent needed)
+//   2. Instagram URL + download keyword → download via yt-dlp fallback
+//   3. "download X song" (no URL) → FastSaver music search + audio download
+//
+// Returns true if the message was fully handled (no further processing needed).
+async function maybeHandleFastSaver({ client, message, config, myId }) {
+  const textRaw = normalizeMessageText(message);
+  if (!textRaw) return false;
+  const apiKey = (config?.fastSaverKey || process.env.FASTSAVER_API_KEY || "").trim();
+
+  const ytUrl  = extractYouTubeUrl(textRaw);
+  const igUrl  = extractInstagramUrl(textRaw);
+  const limits = getVideoDownloaderLimits(config);
+
+  // ── Case 1: YouTube URL pasted → auto-download ─────────────────────────────
+  if (ytUrl && apiKey) {
+    const status = new SmartStatus(client, message.chatId, false, message.id);
+    try {
+      await status.update("⬇️ Fetching video info...", { parseMode: undefined });
+      const info = await ytInfo(ytUrl, apiKey);
+      const fmt = pickVideoFormat(info.formats || [], limits.maxFileSizeMb);
+      await status.update(`⬇️ Downloading **${(info.title || "video").slice(0, 60)}** (${fmt})...`, { parseMode: "markdown" });
+      const tunnelUrl = await ytDownloadUrl(ytUrl, fmt, apiKey);
+      const tmpPath = path.join(videoDir, `yt_${Date.now()}.mp4`);
+      await streamToFile(tunnelUrl, tmpPath);
+      const targetPeer = await status.getChat();
+      try { if (status.messageId) await client.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch (_) {}
+      await client.sendFile(targetPeer, {
+        file: tmpPath,
+        caption: `🎬 **${(info.title || "").slice(0, 200)}**\n👤 ${info.author || ""} · ⏱ ${Math.floor((info.duration || 0) / 60)}:${String((info.duration || 0) % 60).padStart(2, "0")}`,
+        parseMode: "markdown",
+        replyTo: message.id,
+        forceDocument: false,
+      });
+      fs.remove(tmpPath).catch(() => {});
+      addLog(`[FastSaver] YT video sent: ${(info.title || ytUrl).slice(0, 60)}`, "success");
+      return true;
+    } catch (e) {
+      console.warn("[FastSaver] YT video failed, trying yt-dlp fallback:", e?.message);
+      // Fall through to yt-dlp below
+      try { await status.update("⬇️ Trying alternate method...", { parseMode: undefined }); } catch (_) {}
+      try {
+        await verifyVideoDownloaderRuntime({ installIfMissing: true });
+        const result = await downloadVideoWithYtDlp({
+          url: ytUrl,
+          ytdlpPath: YTDLP_BIN,
+          ffmpegPath: detectFfmpegPath(),
+          outputRoot: videoDir,
+          cookiesPath: getUserYtCookiesPath(),
+          maxFileSizeMb: limits.maxFileSizeMb,
+          timeoutMs: limits.timeoutMs,
+          onLog: (() => {
+            let lastPct = -15;
+            return (line) => {
+              const m = line?.match(/\[download\]\s+([\d.]+)%\s+of\s+([\d.]+\s*[GMKi]?B)/i);
+              if (m) {
+                const pct = Math.floor(parseFloat(m[1]));
+                if (pct - lastPct >= 15) { lastPct = pct; status.update(`⬇️ Downloading... ${pct}% of ${m[2]}`, { parseMode: undefined }).catch(() => {}); }
+              }
+            };
+          })(),
+        });
+        const targetPeer = await status.getChat();
+        try { if (status.messageId) await client.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch (_) {}
+        await client.sendFile(targetPeer, {
+          file: result.filePath,
+          caption: VIDEO_DOWNLOADER_MESSAGES.success,
+          replyTo: message.id,
+          forceDocument: false,
+        });
+        fs.remove(result.workDir || result.filePath).catch(() => {});
+        return true;
+      } catch (e2) {
+        await status.finish("❌ Could not download this video. It may be age-restricted or unavailable.", { parseMode: undefined, replyTo: message.id });
+        return true;
+      }
+    }
+  }
+
+  // ── Case 1b: YouTube URL but no API key → direct yt-dlp ───────────────────
+  if (ytUrl && !apiKey) {
+    return maybeHandleVideoDownloader({ client, message, config });
+  }
+
+  // ── Case 2: Instagram URL + download intent → yt-dlp ──────────────────────
+  if (igUrl && hasDownloaderIntent(textRaw)) {
+    return maybeHandleVideoDownloader({ client, message, config });
+  }
+
+  // ── Case 3: "download X song" (no URL) → FastSaver music search ────────────
+  if (!ytUrl && !igUrl && isMusicByNameRequest(textRaw) && apiKey) {
+    const query = extractSongQuery(textRaw);
+    if (!query || query.length < 2) return false;
+    const status = new SmartStatus(client, message.chatId, false, message.id);
+    try {
+      await status.update(`🔍 Searching for **${query.slice(0, 60)}**...`, { parseMode: "markdown" });
+      const results = await ytSearch(query, apiKey);
+      if (!results || results.length === 0) {
+        await status.finish(`❌ No results found for "${query}".`, { parseMode: undefined, replyTo: message.id });
+        return true;
+      }
+      const top = results[0];
+      const videoUrl = `https://www.youtube.com/watch?v=${top.video_id}`;
+      await status.update(`⬇️ Downloading **${(top.title || query).slice(0, 60)}**...`, { parseMode: "markdown" });
+      const tunnelUrl = await ytDownloadUrl(videoUrl, "audio", apiKey);
+      const tmpPath = path.join(musicDir, `fs_${Date.now()}.mp3`);
+      await streamToFile(tunnelUrl, tmpPath);
+      const targetPeer = await status.getChat();
+      try { if (status.messageId) await client.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch (_) {}
+      await client.sendFile(targetPeer, {
+        file: tmpPath,
+        caption: `🎵 **${(top.title || query).slice(0, 200)}**\n⏱ ${top.duration || ""}`,
+        parseMode: "markdown",
+        replyTo: message.id,
+        forceDocument: false,
+      });
+      fs.remove(tmpPath).catch(() => {});
+      addLog(`[FastSaver] Music sent: ${(top.title || query).slice(0, 60)}`, "success");
+      return true;
+    } catch (e) {
+      console.error("[FastSaver] Music by name failed:", e?.message);
+      // Don't show error — let AI reply handle it naturally
+      try { await status.finish("", { parseMode: undefined }); } catch (_) {}
+      return false;
+    }
+  }
+
+  return false;
 }
 
 async function sendTTSVoiceOrText({ client, targetPeer, message, status, text, config = {}, logPrefix = "[tts]" }) {
@@ -4080,7 +4218,8 @@ async function startServer() {
       "maintenanceMode",
       "tts",
       "videoDownloaderMaxMb",
-      "videoDownloaderTimeoutSeconds"
+      "videoDownloaderTimeoutSeconds",
+      "fastSaverKey"
     ];
     // Read current creds BEFORE saving so we can detect actual changes
     const prevCreds = db.prepare(
@@ -4514,6 +4653,25 @@ async function startServer() {
     const { chatId } = req.params;
     db.prepare("DELETE FROM moderation_logs WHERE chatId = ?").run(chatId);
     res.json({ success: true });
+  });
+
+  // ── FastSaver API config ──────────────────────────────────────────────────
+  app.get("/api/fastsaver/status", (req, res) => {
+    const row = db.prepare("SELECT fastSaverKey FROM config WHERE id = 1").get();
+    const key = (row?.fastSaverKey || "").trim();
+    res.json({ configured: key.length > 0, keyPrefix: key ? key.slice(0, 8) + "..." : null });
+  });
+  // Test the FastSaver key by fetching a known video's info
+  app.get("/api/fastsaver/test", async (req, res) => {
+    const row = db.prepare("SELECT fastSaverKey FROM config WHERE id = 1").get();
+    const key = (row?.fastSaverKey || "").trim();
+    if (!key) return res.status(400).json({ error: "No FastSaver API key configured" });
+    try {
+      const info = await ytInfo("https://www.youtube.com/watch?v=dQw4w9WgXcQ", key);
+      res.json({ ok: true, title: info.title, formats: (info.formats || []).map(f => f.format) });
+    } catch (e) {
+      res.status(400).json({ ok: false, error: e.message });
+    }
   });
 
   app.use("/api/*", (req, res) => {
@@ -5442,9 +5600,14 @@ async function startServer() {
 
           // Moderation runs before AI reply — inspects all message types (text + media)
           await moderateMessage({ client, message, db, config: config2, myId });
-          // Auto-reply only runs for text messages (existing behaviour preserved)
+
+          // FastSaver: YouTube auto-download, Instagram intent-download, music-by-name.
+          // Returns true if the message was fully handled → skip AI reply.
           if (textRaw) {
-            await maybeHandleAutoReply(client, message, config2, myId, myUsername);
+            const handled = await maybeHandleFastSaver({ client, message, config: config2, myId });
+            if (!handled) {
+              await maybeHandleAutoReply(client, message, config2, myId, myUsername);
+            }
           }
         } catch (err) {
           console.error("[BOT] Error in messageHandler:", err);
