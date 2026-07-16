@@ -5301,6 +5301,25 @@ async function startServer() {
           }
         }
 
+        // Jina AI URL fetch — runs when message contains a URL but user is NOT
+        // asking to download (download requests are handled by maybeHandleFastSaver
+        // before this point and never reach here).
+        let linkContext = "";
+        const urlsInMsg = (promptForRouter.match(/https?:\/\/[^\s)>\]"']+/gi) || []);
+        if (urlsInMsg.length > 0 && !hasDownloaderIntent(promptForRouter) && !hasVisionImage) {
+          try {
+            console.log(`[jina] detected ${urlsInMsg.length} URL(s), fetching...`);
+            linkContext = await buildLinkContext(promptForRouter, 2);
+            if (linkContext) {
+              console.log(`[jina] fetched ${linkContext.length} chars of link content`);
+            } else {
+              console.log("[jina] fetch returned empty (blocked/private page)");
+            }
+          } catch (le) {
+            console.warn(`[jina] fetch failed: ${le.message}`);
+          }
+        }
+
         // Single ownerOpts object shared by every buildCoreSystemPrompt call
         // in this handler — ensures owner detection fires consistently on all
         // routing paths (general chat, vision, router system instruction).
@@ -5314,6 +5333,13 @@ async function startServer() {
           webSearchSnippets,
         };
 
+        // Build base system instruction, then append Jina link content if present
+        // so the model has the fetched page as context when answering URL questions.
+        const baseSystemInstruction = buildCoreSystemPrompt(config, ownerOpts);
+        const systemInstruction = linkContext
+          ? `${baseSystemInstruction}\n\n${linkContext}`
+          : baseSystemInstruction;
+
         // The router (router/router.js) picks the model — vision, image
         // generation, or general/coding chat — purely from an AI classifier
         // call plus the deterministic fact of whether an image is attached.
@@ -5323,7 +5349,7 @@ async function startServer() {
           attachments: { image: hasVisionImage },
           apiKey: config.iamhcApiKey,
           context: autoReplyCtx,
-          systemInstruction: buildCoreSystemPrompt(config, ownerOpts),
+          systemInstruction,
         });
 
         let replyText = null;
