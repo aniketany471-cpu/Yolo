@@ -23,8 +23,6 @@ async function getPDF() {
   return _PDFDocument;
 }
 import fs from "fs-extra";
-import yts from "yt-search";
-import youtubedl from "youtube-dl-exec";
 import { analyzeTelegramImage, buildVisionPrompt } from "./services/vision.js";
 import { getRoutedResponse } from "./services/aiRouterService.js";
 import { classifyImageGenerationIntent, classifyRealtimeGroundingIntent } from "./router/router.js";
@@ -37,8 +35,7 @@ import { getAccuWeather } from "./services/weather.js";
 import { buildLinkContext } from "./services/linkReader.js";
 import { fetchSportsContext } from "./services/sportsReader.js";
 import { DEFAULT_TTS_CONFIG, generateTTSFile } from "./services/tts.js";
-import { VIDEO_DOWNLOADER_MESSAGES, downloadAudioWithYtDlp, downloadVideoWithYtDlp, extractSupportedVideoUrl, extractUrls, hasDownloaderIntent } from "./services/videoDownloader.js";
-import { ytInfo, ytSearch, ytDownloadUrl, streamToFile, pickVideoFormat, extractYouTubeUrl, extractInstagramUrl, isMusicByNameRequest, extractSongQuery, cobaltDownload } from "./services/fastSaver.js";
+import { ytInfo, ytSearch, ytDownloadUrl, streamToFile, pickVideoFormat, extractYouTubeUrl, extractInstagramUrl, igFetch, hasDownloadIntent, isMusicByNameRequest, extractSongQuery } from "./services/fastSaver.js";
 // Image service — loaded dynamically so a missing/broken module never crashes the bot
 let ziGenerateImage = null;
 let ziParseImageModelKeyword = null;
@@ -990,186 +987,103 @@ async function cleanupVideoDownloaderFiles(maxAgeMs = 60 * 60 * 1000) {
   }
 }
 
-async function maybeHandleVideoDownloader({ client, message, config }) {
-  const textRaw = normalizeMessageText(message);
-  const supportedUrl = extractSupportedVideoUrl(textRaw);
-  const urls = extractUrls(textRaw);
-  if (!supportedUrl) {
-    if (urls.length > 0 && hasDownloaderIntent(textRaw)) {
-      await client.sendMessage(message.chatId, {
-        message: VIDEO_DOWNLOADER_MESSAGES.failure,
-        replyTo: message.id,
-      }).catch(() => {});
-      return true;
-    }
-    return false;
-  }
-
-  const status = new SmartStatus(client, message.chatId, false, message.id);
-  let workDir = null;
-  try {
-    await verifyVideoDownloaderRuntime({ installIfMissing: true });
-    await status.update(VIDEO_DOWNLOADER_MESSAGES.downloading, { parseMode: undefined });
-    const limits = getVideoDownloaderLimits(config);
-    const result = await downloadVideoWithYtDlp({
-      url: supportedUrl,
-      ytdlpPath: YTDLP_BIN,
-      ffmpegPath: detectFfmpegPath(),
-      outputRoot: videoDir,
-      cookiesPath: getUserYtCookiesPath(),
-      maxFileSizeMb: limits.maxFileSizeMb,
-      timeoutMs: limits.timeoutMs,
-      onLog: (() => {
-        let lastPct = -15;
-        return (line) => {
-          if (line) console.log(`[videoDL] ${line.slice(0, 220)}`);
-          const m = line?.match(/\[download\]\s+([\d.]+)%\s+of\s+([\d.]+\s*[GMKi]?B)/i);
-          if (m) {
-            const pct = Math.floor(parseFloat(m[1]));
-            if (pct - lastPct >= 15) {
-              lastPct = pct;
-              status.update(`⬇️ Downloading... ${pct}% of ${m[2]}`, { parseMode: undefined }).catch(() => {});
-            }
-          }
-        };
-      })(),
-    });
-    workDir = result.workDir;
-    const targetPeer = await status.getChat();
-    try { if (status.messageId) await client.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch (_) {}
-    await client.sendFile(targetPeer, {
-      file: result.filePath,
-      caption: VIDEO_DOWNLOADER_MESSAGES.success,
-      replyTo: message.id,
-      forceDocument: false,
-    });
-    addLog(`[videoDL] Sent downloaded video (${Math.round(result.size / 1024 / 1024)} MB) from ${supportedUrl}`, "success");
-    return true;
-  } catch (e) {
-    console.error("[videoDL] Download failed:", e?.message || e);
-    addLog(`[videoDL] Failed: ${String(e?.message || e).slice(0, 160)}`, "error");
-    await status.finish(VIDEO_DOWNLOADER_MESSAGES.failure, { parseMode: undefined, replyTo: message.id });
-    return true;
-  } finally {
-    if (workDir) await fs.remove(workDir).catch(() => {});
-    cleanupVideoDownloaderFiles().catch(() => {});
-  }
-}
-
 // ── FastSaver download handler ────────────────────────────────────────────────
-// Called from messageHandler before the AI auto-reply.
-// Handles three cases:
-//   1. YouTube URL in message → auto-download video (no intent needed)
-//   2. Instagram URL + download keyword → download via yt-dlp fallback
-//   3. "download X song" (no URL) → FastSaver music search + audio download
+// Single source of truth for ALL downloads — FastSaver API only, no yt-dlp.
+//   1. YouTube URL → always auto-download video (no intent keyword needed)
+//   2. Instagram URL + download intent → FastSaver /fetch endpoint
+//   3. "download X song" (no URL) → FastSaver search + audio download
+//   4. Replying to a message with a URL + intent → pull URL from replied msg
 //
-// Returns true if the message was fully handled (no further processing needed).
+// Returns true if the message was fully handled (caller skips AI reply).
 async function maybeHandleFastSaver({ client, message, config, myId }) {
   const textRaw = normalizeMessageText(message);
   if (!textRaw) return false;
   const apiKey = (config?.fastSaverKey || process.env.FASTSAVER_API_KEY || "").trim();
 
-  let ytUrl  = extractYouTubeUrl(textRaw);
-  let igUrl  = extractInstagramUrl(textRaw);
+  let ytUrl = extractYouTubeUrl(textRaw);
+  let igUrl = extractInstagramUrl(textRaw);
   const limits = getVideoDownloaderLimits(config);
+  const hasIntent = hasDownloadIntent(textRaw);
 
-  const hasIntent = hasDownloaderIntent(textRaw);
-
-  // If no URL in current message but user has download intent (e.g. "download this",
-  // "downloadkaro" while replying to an Instagram/YouTube message), pull the URL from
-  // the replied-to message so we can still act on it.
+  // Pull URL from the message being replied to when user says "download this" etc.
   if (!ytUrl && !igUrl && hasIntent && message.replyTo?.replyToMsgId) {
     try {
       const replied = await client.getMessages(message.chatId, { ids: [message.replyTo.replyToMsgId] });
-      const rmsg = replied?.[0];
-      const rText = (rmsg?.message || rmsg?.text || "").trim();
-      if (rText) {
-        ytUrl = extractYouTubeUrl(rText);
-        igUrl = extractInstagramUrl(rText);
-      }
-    } catch (e) {
-      console.warn("[FastSaver] Could not fetch replied message for URL:", e.message);
-    }
+      const rText = (replied?.[0]?.message || "").trim();
+      if (rText) { ytUrl = extractYouTubeUrl(rText); igUrl = extractInstagramUrl(rText); }
+    } catch (_) {}
   }
 
-  // ── Case 1: YouTube URL + explicit download intent → FastSaver API ──────────
-  // Only triggers when user explicitly asks to download (not on every URL share).
-  // Falls back to cobalt.tools if FastSaver fails — no yt-dlp used.
-  if (ytUrl && hasIntent) {
+  // ── Case 1: YouTube URL → auto-download video ─────────────────────────────
+  if (ytUrl) {
+    if (!apiKey) {
+      await client.sendMessage(message.chatId, {
+        message: "⚙️ FastSaver API key not configured. Set `fastSaverKey` in Settings to enable downloads.",
+        replyTo: message.id,
+      }).catch(() => {});
+      return true;
+    }
     const status = new SmartStatus(client, message.chatId, false, message.id);
     try {
       await status.update("⬇️ Fetching video info...", { parseMode: undefined });
-      if (apiKey) {
-        const info = await ytInfo(ytUrl, apiKey);
-        const fmt = pickVideoFormat(info.formats || [], limits.maxFileSizeMb);
-        await status.update(`⬇️ Downloading **${(info.title || "video").slice(0, 60)}** (${fmt})...`, { parseMode: "markdown" });
-        const tunnelUrl = await ytDownloadUrl(ytUrl, fmt, apiKey);
-        const tmpPath = path.join(videoDir, `yt_${Date.now()}.mp4`);
-        await streamToFile(tunnelUrl, tmpPath);
-        const targetPeer = await status.getChat();
-        try { if (status.messageId) await client.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch (_) {}
-        await client.sendFile(targetPeer, {
-          file: tmpPath,
-          caption: `🎬 **${(info.title || "").slice(0, 200)}**\n👤 ${info.author || ""} · ⏱ ${Math.floor((info.duration || 0) / 60)}:${String((info.duration || 0) % 60).padStart(2, "0")}`,
-          parseMode: "markdown",
-          replyTo: message.id,
-          forceDocument: false,
-        });
-        fs.remove(tmpPath).catch(() => {});
-        addLog(`[FastSaver] YT video sent: ${(info.title || ytUrl).slice(0, 60)}`, "success");
-        return true;
-      }
-      // No FastSaver key — try cobalt directly
-      throw new Error("No FastSaver key, using cobalt fallback");
-    } catch (e) {
-      console.warn("[FastSaver] YT primary failed, trying cobalt:", e?.message);
-      try { await status.update("⬇️ Trying alternate method...", { parseMode: undefined }); } catch (_) {}
-      try {
-        const { downloadUrl, filename } = await cobaltDownload(ytUrl, { quality: "720" });
-        const tmpPath = path.join(videoDir, `yt_cobalt_${Date.now()}.mp4`);
-        await streamToFile(downloadUrl, tmpPath);
-        const targetPeer = await status.getChat();
-        try { if (status.messageId) await client.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch (_) {}
-        await client.sendFile(targetPeer, {
-          file: tmpPath,
-          caption: VIDEO_DOWNLOADER_MESSAGES.success,
-          replyTo: message.id,
-          forceDocument: false,
-        });
-        fs.remove(tmpPath).catch(() => {});
-        addLog(`[cobalt] YT video sent: ${ytUrl.slice(0, 60)}`, "success");
-        return true;
-      } catch (e2) {
-        console.error("[cobalt] YT fallback failed:", e2?.message);
-        await status.finish("❌ Could not download this video. It may be age-restricted or unavailable.", { parseMode: undefined, replyTo: message.id });
-        return true;
-      }
-    }
-  }
-
-  // ── Case 2: Instagram URL + explicit download intent → cobalt.tools ─────────
-  // No yt-dlp. cobalt.tools supports Instagram reels and posts natively.
-  if (igUrl && hasIntent) {
-    const status = new SmartStatus(client, message.chatId, false, message.id);
-    try {
-      await status.update(VIDEO_DOWNLOADER_MESSAGES.downloading, { parseMode: undefined });
-      const { downloadUrl, filename } = await cobaltDownload(igUrl, { quality: "720" });
-      const tmpPath = path.join(videoDir, `ig_${Date.now()}.mp4`);
-      await streamToFile(downloadUrl, tmpPath);
+      const info = await ytInfo(ytUrl, apiKey);
+      const fmt = pickVideoFormat(info.formats || [], limits.maxFileSizeMb);
+      await status.update(`⬇️ Downloading **${(info.title || "video").slice(0, 60)}** (${fmt})...`, { parseMode: "markdown" });
+      const tunnelUrl = await ytDownloadUrl(ytUrl, fmt, apiKey);
+      const tmpPath = path.join(videoDir, `yt_${Date.now()}.mp4`);
+      await streamToFile(tunnelUrl, tmpPath);
       const targetPeer = await status.getChat();
       try { if (status.messageId) await client.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch (_) {}
+      const dur = info.duration || 0;
       await client.sendFile(targetPeer, {
         file: tmpPath,
-        caption: VIDEO_DOWNLOADER_MESSAGES.success,
+        caption: `🎬 **${(info.title || "").slice(0, 200)}**\n👤 ${info.author || ""} · ⏱ ${Math.floor(dur / 60)}:${String(dur % 60).padStart(2, "0")}`,
+        parseMode: "markdown",
         replyTo: message.id,
         forceDocument: false,
       });
       fs.remove(tmpPath).catch(() => {});
-      addLog(`[cobalt] Instagram video sent: ${igUrl.slice(0, 60)}`, "success");
+      addLog(`[FastSaver] YT video sent: ${(info.title || ytUrl).slice(0, 60)}`, "success");
       return true;
     } catch (e) {
-      console.error("[cobalt] Instagram download failed:", e?.message);
-      await status.finish(VIDEO_DOWNLOADER_MESSAGES.failure, { parseMode: undefined, replyTo: message.id });
+      console.error("[FastSaver] YT download failed:", e?.message);
+      await status.finish(`❌ Download failed: ${(e?.message || "unknown error").slice(0, 100)}`, { parseMode: undefined, replyTo: message.id });
+      return true;
+    }
+  }
+
+  // ── Case 2: Instagram URL + download intent → FastSaver /fetch ────────────
+  if (igUrl && hasIntent) {
+    if (!apiKey) {
+      await client.sendMessage(message.chatId, {
+        message: "⚙️ FastSaver API key not configured. Set `fastSaverKey` in Settings to enable downloads.",
+        replyTo: message.id,
+      }).catch(() => {});
+      return true;
+    }
+    const status = new SmartStatus(client, message.chatId, false, message.id);
+    try {
+      await status.update("⬇️ Fetching Instagram video...", { parseMode: undefined });
+      const data = await igFetch(igUrl, apiKey);
+      // FastSaver returns either a direct url or an array of urls
+      const videoUrl = data.url || (Array.isArray(data.urls) ? data.urls.find(u => u.url)?.url : null);
+      if (!videoUrl) throw new Error("No video URL in FastSaver response");
+      const tmpPath = path.join(videoDir, `ig_${Date.now()}.mp4`);
+      await streamToFile(videoUrl, tmpPath);
+      const targetPeer = await status.getChat();
+      try { if (status.messageId) await client.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch (_) {}
+      await client.sendFile(targetPeer, {
+        file: tmpPath,
+        caption: `📸 ${data.title || "Instagram video"}`.slice(0, 200),
+        replyTo: message.id,
+        forceDocument: false,
+      });
+      fs.remove(tmpPath).catch(() => {});
+      addLog(`[FastSaver] Instagram video sent: ${igUrl.slice(0, 60)}`, "success");
+      return true;
+    } catch (e) {
+      console.error("[FastSaver] Instagram download failed:", e?.message);
+      await status.finish(`❌ ${(e?.message || "Could not download Instagram video").slice(0, 120)}`, { parseMode: undefined, replyTo: message.id });
       return true;
     }
   }
@@ -4514,22 +4428,26 @@ async function startServer() {
       res.json({ success: true, id, filename });
     }
   );
+  // ── Music download via FastSaver (dashboard) ─────────────────────────────
   app.post("/api/music/download", async (req, res) => {
     const { query } = req.body;
     if (!query) return res.status(400).json({ error: "No query provided" });
+    const cfg = db.prepare("SELECT fastSaverKey FROM config WHERE id = 1").get();
+    const apiKey = (cfg?.fastSaverKey || process.env.FASTSAVER_API_KEY || "").trim();
+    if (!apiKey) return res.status(503).json({ error: "FastSaver API key not configured. Set fastSaverKey in Settings." });
     try {
-      const searchString = query.toLowerCase().includes("audio") || query.toLowerCase().includes("lyric") ? query : query + " audio";
-      const r = await yts(searchString);
-      const video = r.videos.find(
-        (v) => !v.title.toLowerCase().includes("music video") && !v.title.toLowerCase().includes("official video")
-      ) || r.videos[0];
+      const results = await ytSearch(query, apiKey);
+      const video = results[0];
       if (!video) return res.status(404).json({ error: "No results found" });
+      const videoUrl = `https://www.youtube.com/watch?v=${video.video_id}`;
       const id = Math.random().toString(36).substring(2);
       const filename = `music_${id}.mp3`;
       const filepath = path.join(musicDir, filename);
-      taskQueue.add(async () => {
+      // Kick off async download — client gets the id immediately
+      (async () => {
         try {
-          await downloadYoutube(video.url, filepath);
+          const tunnelUrl = await ytDownloadUrl(videoUrl, "audio", apiKey);
+          await streamToFile(tunnelUrl, filepath);
           db.prepare(
             "INSERT INTO exports (id, filename, filepath, createdAt, type, status) VALUES (?, ?, ?, ?, ?, ?)"
           ).run(id, filename, filepath, Date.now(), "music", "success");
@@ -4538,41 +4456,23 @@ async function startServer() {
             const defaultTarget = db.prepare("SELECT name FROM targets LIMIT 1").get();
             if (defaultTarget) {
               try {
-                await client.sendMessage(defaultTarget.name, {
-                  message: `\u{1F3B5} **${video.title}**
-\u{1F464} ${video.author.name}`,
+                await client.sendFile(defaultTarget.name, {
                   file: filepath,
-                  attributes: [
-                    new Api.DocumentAttributeAudio({
-                      title: video.title,
-                      performer: video.author.name,
-                      duration: video.duration.seconds,
-                      voice: false
-                    })
-                  ]
+                  caption: `🎵 **${video.title}**\n⏱ ${video.duration || ""}`,
                 });
-              } catch (e) {
-              }
+              } catch (_) {}
             }
           }
         } catch (err) {
-          const msg = err?.message || String(err);
-          addLog(`Music dashboard download error: ${msg}`, "error");
+          addLog(`Music dashboard download error: ${err?.message || err}`, "error");
           db.prepare(
             "INSERT INTO exports (id, filename, filepath, createdAt, type, status) VALUES (?, ?, ?, ?, ?, ?)"
           ).run(id, filename, filepath, Date.now(), "music", "failed");
         }
-      });
-      res.json({
-        success: true,
-        id,
-        filename,
-        title: video.title,
-        author: video.author.name,
-        thumbnail: video.image
-      });
+      })();
+      res.json({ success: true, id, filename, title: video.title, thumbnail: video.thumbnail_url });
     } catch (e) {
-      console.error(e);
+      console.error("[api/music/download]", e);
       res.status(500).json({ error: String(e) });
     }
   });
@@ -4590,38 +4490,21 @@ async function startServer() {
     db.prepare("DELETE FROM sudo_users WHERE id = ?").run(req.params.id);
     res.json({ success: true });
   });
+  // ── FastSaver status (replaces old yt-dlp check) ─────────────────────────
   app.get("/api/youtubedl/check", async (req, res) => {
+    const cfg = db.prepare("SELECT fastSaverKey FROM config WHERE id = 1").get();
+    const apiKey = (cfg?.fastSaverKey || process.env.FASTSAVER_API_KEY || "").trim();
+    if (!apiKey) return res.json({ ok: false, provider: "fastsaver", error: "API key not configured" });
     try {
-      await verifyVideoDownloaderRuntime({ installIfMissing: false });
+      const info = await ytInfo("https://www.youtube.com/watch?v=dQw4w9WgXcQ", apiKey);
+      res.json({ ok: true, provider: "fastsaver", test: info.title });
     } catch (e) {
-      ytdlpStartupStatus = { found: false, path: YTDLP_BIN, version: null, error: e?.message || String(e) };
+      res.status(500).json({ ok: false, provider: "fastsaver", error: e?.message });
     }
-    const runtime = getVideoDownloaderRuntimeStatus();
-    const ok = runtime.ytdlp.found;
-    res.status(ok ? 200 : 500).json({
-      ok,
-      ytdlp: runtime.ytdlp.version || "not found",
-      ytdlpPath: runtime.ytdlp.path,
-      ffmpeg: runtime.ffmpeg.version || (runtime.ffmpeg.found ? "found" : "not found"),
-      ffmpegPath: runtime.ffmpeg.path,
-      cookiesFile: fs.existsSync(youtubeCookiesPath),
-      runtime,
-    });
   });
-
-  app.post("/api/youtubedl/update", async (req, res) => {
-    try {
-      const before = ytdlpStartupStatus.version || null;
-      await downloadYtdlpBinary(YTDLP_INSTALL_PATHS[0]);
-      YTDLP_BIN = resolveExecutablePath(YTDLP_INSTALL_PATHS[0]) || YTDLP_INSTALL_PATHS[0];
-      await verifyVideoDownloaderRuntime({ installIfMissing: false });
-      const after = ytdlpStartupStatus.version;
-      const updated = after !== before;
-      addLog(`yt-dlp ${updated ? `updated ${before || "unknown"} → ${after}` : `already up-to-date (${after})`} at ${YTDLP_BIN}`, "success");
-      res.json({ ok: true, before, after, updated, path: YTDLP_BIN });
-    } catch (e) {
-      res.status(500).json({ ok: false, error: e?.message });
-    }
+  app.post("/api/youtubedl/update", (req, res) => {
+    // yt-dlp is no longer used — FastSaver API is the only download backend
+    res.json({ ok: true, message: "yt-dlp removed. Downloads are handled by FastSaver API." });
   });
   app.post("/api/live-search", async (req, res) => {
     const { query } = req.body || {};
@@ -4737,260 +4620,74 @@ async function startServer() {
   let lastConnectFailTime = 0;
   let authDupRetries = 0;
   let retryTimer = null;
-  /**
-   * Download a YouTube video as MP3 audio using yt-dlp.
-   *
-   * Strategy order (2026 — tested against current YouTube bot detection):
-   *   1. mediaconnect  — embedded TV player, bypasses most bot checks
-   *   2. mweb_earlybird — mobile early-access client, lower detection rate
-   *   3. ios            — iOS client with bundled user-agent
-   *   4. tv_embedded    — TV embedded player
-   *   5. default        — standard web player (works with fresh yt-dlp)
-   *   6. @distube/ytdl-core — pure-JS fallback, no yt-dlp binary needed
-   *
-   * Each attempt logs its own failure reason so the dashboard shows
-   * exactly which strategy and error occurred.
-   */
-  const downloadYoutube = async (url, output) => {
-    const vidId = url.match(/[?&]v=([^&]+)/)?.[1] || url.match(/youtu\.be\/([^?&]+)/)?.[1];
-    const cleanUrl = vidId ? `https://www.youtube.com/watch?v=${vidId}` : url;
-
-    const base = {
-      extractAudio: true,
-      audioFormat: "mp3",
-      audioQuality: 0,
-      noPlaylist: true,
-      noCheckCertificates: true,
-      noCheckFormats: true,        // skip format probe — reduces bot-detection footprint
-      geoBypass: true,
-      retries: 2,
-      socketTimeout: 30,
-      output
-    };
-    if (fs.existsSync(youtubeCookiesPath)) base.cookies = youtubeCookiesPath;
-
-    // ── Client strategy table ────────────────────────────────────────────────
-    // NOTE: mediaconnect and mweb_earlybird require Python 3 (yt-dlp jsinterp).
-    // Prioritise iOS/Android clients — they use native API responses, no JS eval needed.
-    const strategies = [
-      {
-        // android — confirmed working without cookies or PO token (tested May 2026)
-        name: "android",
-        opts: {
-          extractorArgs: "youtube:player_client=android",
-          userAgent: "com.google.android.youtube/19.44.34 (Linux; U; Android 14) gzip",
-          format: "bestaudio/best"
-        }
-      },
-      {
-        name: "android_testsuite",
-        opts: {
-          extractorArgs: "youtube:player_client=android_testsuite",
-          format: "bestaudio/best"
-        }
-      },
-      {
-        name: "ios",
-        opts: {
-          extractorArgs: "youtube:player_client=ios",
-          userAgent: "com.google.ios.youtube/19.45.4 (iPhone17,2; U; CPU iPhone OS 18_1 like Mac OS X;)",
-          format: "bestaudio[ext=m4a]/bestaudio/best"
-        }
-      },
-      {
-        name: "tv_embedded",
-        opts: {
-          extractorArgs: "youtube:player_client=tv_embedded",
-          format: "bestaudio/best"
-        }
-      },
-      {
-        name: "web_embedded",
-        opts: {
-          extractorArgs: "youtube:player_client=web_embedded",
-          format: "bestaudio[ext=webm]/bestaudio/best"
-        }
-      }
-    ];
-
-    const errors = [];
-    for (const { name, opts } of strategies) {
-      try {
-        addLog(`[ytdlp] Trying client: ${name}`, "info");
-        await runYtdlpDirect(cleanUrl, { ...base, ...opts });
-        addLog(`[ytdlp] Success with client: ${name}`, "success");
-        return; // done
-      } catch (e) {
-        const msg = e?.stderr || e?.message || String(e);
-        const short = msg.replace(/\s+/g, " ").slice(0, 120);
-        addLog(`[ytdlp] ${name} failed: ${short}`, "warn");
-        errors.push(`${name}: ${short}`);
-      }
-    }
-
-    // ── Fallback: @distube/ytdl-core (pure JS, no binary) ──────────────────
-    // Only works for non-age-restricted, publicly available videos.
-    addLog(`[ytdlp] All yt-dlp strategies failed. Trying ytdl-core fallback...`, "warn");
-    try {
-      const ytdlCore = await import("@distube/ytdl-core");
-      const ytdl = ytdlCore.default || ytdlCore;
-      await new Promise((resolve, reject) => {
-        const stream = ytdl(cleanUrl, {
-          quality: "highestaudio",
-          filter: "audioonly"
-        });
-        const outStream = fs.createWriteStream(output);
-        stream.pipe(outStream);
-        stream.on("error", reject);
-        outStream.on("finish", resolve);
-        outStream.on("error", reject);
-      });
-      addLog(`[ytdlp] ytdl-core fallback succeeded`, "success");
-      return;
-    } catch (fallbackErr) {
-      const fbMsg = fallbackErr?.message || String(fallbackErr);
-      errors.push(`ytdl-core: ${fbMsg.slice(0, 120)}`);
-      addLog(`[ytdlp] ytdl-core fallback failed: ${fbMsg.slice(0, 120)}`, "error");
-    }
-
-    // All strategies exhausted — throw combined error summary
-    throw new Error(
-      `All download strategies failed:\n${errors.map((e, i) => `  ${i + 1}. ${e}`).join("\n")}`
-    );
-  };
-  const statusUpdate = async (chatId, messageId, text) => {
-    try {
-      await client?.editMessage(chatId, { message: messageId, text });
-    } catch (e) {
-      console.error("Failed to edit message:", e);
-    }
-  };
+  // ── FastSaver music/video handlers (called from dashboard & command dispatch) ─
   async function handleMusicCommand(message, text, status) {
     const query = text.split(" ").slice(1).join(" ").trim();
     if (!query) {
-      if (status) {
-        await status.fail("Usage: /music <song name>");
-      } else {
-        await client?.sendMessage(message.chatId, {
-          message: "\u274C Usage: /music <song name>"
-        });
-      }
+      if (status) await status.fail("Usage: /music <song name>");
+      else await client?.sendMessage(message.chatId, { message: "❌ Usage: /music <song name>" });
       return;
     }
+    const cfg = db.prepare("SELECT fastSaverKey FROM config WHERE id = 1").get();
+    const apiKey = (cfg?.fastSaverKey || process.env.FASTSAVER_API_KEY || "").trim();
     const effectiveStatus = status || new SmartStatus(client, message.chatId);
-    if (!status && client) await effectiveStatus.update(HS.music());
+    if (!apiKey) { await effectiveStatus.fail("⚙️ FastSaver API key not configured. Set `fastSaverKey` in Settings."); return; }
     try {
-      const searchString = query.toLowerCase().includes("audio") || query.toLowerCase().includes("lyric") ? query : query + " audio";
-      const r = await yts(searchString);
-      const video = r.videos.find(
-        (v) => !v.title.toLowerCase().includes("music video") && !v.title.toLowerCase().includes("official video")
-      ) || r.videos[0];
-      if (!video) {
-        await effectiveStatus.fail("No results found.");
-        return;
-      }
-      await effectiveStatus.update(HS.queue());
-      await taskQueue.add(async () => {
-        await effectiveStatus.update(HS.musicDl());
-        try {
-          await verifyVideoDownloaderRuntime({ installIfMissing: true });
-          const result = await downloadAudioWithYtDlp({
-            url: video.url,
-            ytdlpPath: YTDLP_BIN,
-            ffmpegPath: detectFfmpegPath(),
-            outputRoot: musicDir,
-            cookiesPath: getUserYtCookiesPath(),
-            timeoutMs: 120000,
-            onLog: (() => {
-              let lastPct = -15;
-              return (line) => {
-                if (line) console.log(`[musicDL] ${line.slice(0, 220)}`);
-                const m = line?.match(/\[download\]\s+([\d.]+)%\s+of\s+([\d.]+\s*[GMKi]?B)/i);
-                if (m) {
-                  const pct = Math.floor(parseFloat(m[1]));
-                  if (pct - lastPct >= 15) {
-                    lastPct = pct;
-                    effectiveStatus.update(`⬇️ Downloading... ${pct}% of ${m[2]}`, { parseMode: undefined }).catch(() => {});
-                  }
-                }
-              };
-            })(),
-          });
-          await effectiveStatus.update(HS.musicProcess());
-          const targetPeer = await effectiveStatus.getChat();
-          try { if (effectiveStatus.messageId) await client.deleteMessages(targetPeer, [effectiveStatus.messageId], { revoke: true }); } catch (_) {}
-          await client?.sendFile(targetPeer, {
-            file: result.filePath,
-            caption: `🎵 **${video.title}**\n👤 ${video.author?.name || ""}\n⏱ ${video.timestamp || ""}`,
-            replyTo: message.id,
-            forceDocument: false,
-          });
-          addLog(`Downloaded music: ${video.title}`, "success");
-          setTimeout(() => fs.remove(result.workDir).catch(() => {}), 10000);
-        } catch (downloadErr) {
-          const msg = downloadErr?.message || String(downloadErr);
-          addLog(`Music download error: ${msg}`, "error");
-          await effectiveStatus.fail(`Download failed: ${msg.slice(0, 120)}`);
-        }
+      await effectiveStatus.update(HS.music());
+      const results = await ytSearch(query, apiKey);
+      const top = results[0];
+      if (!top) { await effectiveStatus.fail("No results found."); return; }
+      const videoUrl = `https://www.youtube.com/watch?v=${top.video_id}`;
+      await effectiveStatus.update(HS.musicDl());
+      const tunnelUrl = await ytDownloadUrl(videoUrl, "audio", apiKey);
+      const tmpPath = path.join(musicDir, `music_${Date.now()}.mp3`);
+      await streamToFile(tunnelUrl, tmpPath);
+      await effectiveStatus.update(HS.musicProcess());
+      const targetPeer = await effectiveStatus.getChat();
+      try { if (effectiveStatus.messageId) await client.deleteMessages(targetPeer, [effectiveStatus.messageId], { revoke: true }); } catch (_) {}
+      await client?.sendFile(targetPeer, {
+        file: tmpPath,
+        caption: `🎵 **${top.title}**\n⏱ ${top.duration || ""}`,
+        replyTo: message.id,
+        forceDocument: false,
       });
+      fs.remove(tmpPath).catch(() => {});
+      addLog(`[FastSaver] Music sent: ${top.title}`, "success");
     } catch (e) {
-      await effectiveStatus.fail("Search failed.");
+      addLog(`[FastSaver] Music command error: ${e?.message}`, "error");
+      await effectiveStatus.fail(`❌ ${(e?.message || "Download failed").slice(0, 100)}`);
     }
   }
   async function handleSongVideoCommand(message, query, status, cfg) {
+    const dbCfg = db.prepare("SELECT fastSaverKey FROM config WHERE id = 1").get();
+    const apiKey = (dbCfg?.fastSaverKey || process.env.FASTSAVER_API_KEY || "").trim();
     const effectiveStatus = status || new SmartStatus(client, message.chatId);
-    if (!status) await effectiveStatus.update(HS.music());
+    if (!apiKey) { await effectiveStatus.fail("⚙️ FastSaver API key not configured. Set `fastSaverKey` in Settings."); return; }
     try {
-      const r = await yts(query);
-      const video = r.videos[0];
-      if (!video) { await effectiveStatus.fail("No results found."); return; }
-      await effectiveStatus.update(HS.queue());
-      await taskQueue.add(async () => {
-        await effectiveStatus.update(`⬇️ Downloading **${video.title}** as MP4...`);
-        try {
-          await verifyVideoDownloaderRuntime({ installIfMissing: true });
-          const limits = getVideoDownloaderLimits(cfg || {});
-          const result = await downloadVideoWithYtDlp({
-            url: video.url,
-            ytdlpPath: YTDLP_BIN,
-            ffmpegPath: detectFfmpegPath(),
-            outputRoot: videoDir,
-            cookiesPath: getUserYtCookiesPath(),
-            maxFileSizeMb: limits.maxFileSizeMb,
-            timeoutMs: limits.timeoutMs,
-            onLog: (() => {
-              let lastPct = -15;
-              return (line) => {
-                if (line) console.log(`[songDL] ${line.slice(0, 220)}`);
-                const m = line?.match(/\[download\]\s+([\d.]+)%\s+of\s+([\d.]+\s*[GMKi]?B)/i);
-                if (m) {
-                  const pct = Math.floor(parseFloat(m[1]));
-                  if (pct - lastPct >= 15) {
-                    lastPct = pct;
-                    effectiveStatus.update(`⬇️ Downloading... ${pct}% of ${m[2]}`, { parseMode: undefined }).catch(() => {});
-                  }
-                }
-              };
-            })(),
-          });
-          const targetPeer = await effectiveStatus.getChat();
-          try { if (effectiveStatus.messageId) await client.deleteMessages(targetPeer, [effectiveStatus.messageId], { revoke: true }); } catch (_) {}
-          await client.sendFile(targetPeer, {
-            file: result.filePath,
-            caption: `🎬 **${video.title}**\n👤 ${video.author?.name || ""}\n⏱ ${video.timestamp || ""}`,
-            replyTo: message.id,
-            forceDocument: false,
-          });
-          addLog(`Downloaded song video: ${video.title}`, "success");
-          await fs.remove(result.workDir).catch(() => {});
-        } catch (e) {
-          const msg = e?.message || String(e);
-          addLog(`Song video download error: ${msg}`, "error");
-          await effectiveStatus.fail(`Download failed: ${msg.slice(0, 120)}`);
-        }
+      await effectiveStatus.update(HS.music());
+      const results = await ytSearch(query, apiKey);
+      const top = results[0];
+      if (!top) { await effectiveStatus.fail("No results found."); return; }
+      const videoUrl = `https://www.youtube.com/watch?v=${top.video_id}`;
+      const limits = getVideoDownloaderLimits(cfg || {});
+      await effectiveStatus.update(`⬇️ Downloading **${top.title}**...`, { parseMode: "markdown" });
+      const fmt = "720p"; // default for song video
+      const tunnelUrl = await ytDownloadUrl(videoUrl, fmt, apiKey);
+      const tmpPath = path.join(videoDir, `songvid_${Date.now()}.mp4`);
+      await streamToFile(tunnelUrl, tmpPath);
+      const targetPeer = await effectiveStatus.getChat();
+      try { if (effectiveStatus.messageId) await client.deleteMessages(targetPeer, [effectiveStatus.messageId], { revoke: true }); } catch (_) {}
+      await client.sendFile(targetPeer, {
+        file: tmpPath,
+        caption: `🎬 **${top.title}**\n⏱ ${top.duration || ""}`,
+        replyTo: message.id,
+        forceDocument: false,
       });
+      fs.remove(tmpPath).catch(() => {});
+      addLog(`[FastSaver] Song video sent: ${top.title}`, "success");
     } catch (e) {
-      await effectiveStatus.fail("Search failed.");
+      addLog(`[FastSaver] Song video error: ${e?.message}`, "error");
+      await effectiveStatus.fail(`❌ ${(e?.message || "Download failed").slice(0, 100)}`);
     }
   }
   async function handleStickerCommand(client2, message, status) {
@@ -5324,7 +5021,7 @@ async function startServer() {
         let linkContext = "";
         const urlsInMsg = (promptForRouter.match(/https?:\/\/[^\s)>\]"']+/gi) || []);
         const hasMediaUrl = urlsInMsg.some(u => /instagram\.com|youtu\.be|youtube\.com|youtu\.be/i.test(u));
-        if (urlsInMsg.length > 0 && !hasDownloaderIntent(promptForRouter) && !hasVisionImage && !hasMediaUrl) {
+        if (urlsInMsg.length > 0 && !hasDownloadIntent(promptForRouter) && !hasVisionImage && !hasMediaUrl) {
           try {
             console.log(`[jina] detected ${urlsInMsg.length} URL(s), fetching...`);
             linkContext = await buildLinkContext(promptForRouter, 2);
