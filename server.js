@@ -1098,6 +1098,56 @@ async function maybeHandleFastSaver({ client, message, config, myId }) {
     }
   }
 
+  // ── Case 3a: "download X song in video/mp4" → search + mp4 download ─────────
+  const wantsSongVideo = !ytUrl && !igUrl && /\b(video|mp4|clip)\b/i.test(textRaw) && isMusicByNameRequest(textRaw) && apiKey;
+  if (wantsSongVideo) {
+    const query = extractSongQuery(textRaw);
+    if (query && query.length >= 2) {
+      const status = new SmartStatus(client, message.chatId, false, message.id);
+      try {
+        await status.update(`🔍 Searching for **${query.slice(0, 60)}**...`, { parseMode: "markdown" });
+        const results = await ytSearch(query, apiKey);
+        if (!results || results.length === 0) {
+          await status.finish(`❌ No results found for "${query}".`, { parseMode: undefined, replyTo: message.id });
+          return true;
+        }
+        const top = results[0];
+        const videoUrl = `https://www.youtube.com/watch?v=${top.video_id}`;
+        await status.update(`⬇️ Downloading **${(top.title || query).slice(0, 50)}** 0%...`, { parseMode: "markdown" });
+        let tunnelUrl;
+        try {
+          tunnelUrl = await payperksFetch(videoUrl, "mp4", "1440p", {
+            onProgress: async (pct) => {
+              try { await status.update(`⬇️ Downloading **${(top.title || query).slice(0, 50)}** ${pct}%...`, { parseMode: "markdown" }); } catch {}
+            },
+          });
+        } catch (pe) {
+          console.error("[Payperks] Song-video by name failed, trying FastSaver:", pe?.message);
+          tunnelUrl = await ytDownloadUrl(videoUrl, "720p", apiKey);
+        }
+        const tmpPath = path.join(videoDir, `songvid_${Date.now()}.mp4`);
+        await status.update("📦 Saving video...", { parseMode: undefined });
+        await streamToFile(tunnelUrl, tmpPath);
+        const targetPeer = await status.getChat();
+        try { if (status.messageId) await client.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch (_) {}
+        await client.sendFile(targetPeer, {
+          file: tmpPath,
+          caption: `🎬 **${(top.title || query).slice(0, 200)}**\n⏱ ${top.duration || ""}`,
+          parseMode: "markdown",
+          replyTo: message.id,
+          forceDocument: false,
+        });
+        fs.remove(tmpPath).catch(() => {});
+        addLog(`[Payperks] Song video sent: ${(top.title || query).slice(0, 60)}`, "success");
+        return true;
+      } catch (e) {
+        console.error("[Payperks] Song video by name failed:", e?.message);
+        try { await status.finish("", { parseMode: undefined }); } catch (_) {}
+        return false;
+      }
+    }
+  }
+
   // ── Case 3: "download X song" (no URL) → FastSaver music search ────────────
   if (!ytUrl && !igUrl && isMusicByNameRequest(textRaw) && apiKey) {
     const query = extractSongQuery(textRaw);
@@ -1112,11 +1162,15 @@ async function maybeHandleFastSaver({ client, message, config, myId }) {
       }
       const top = results[0];
       const videoUrl = `https://www.youtube.com/watch?v=${top.video_id}`;
-      await status.update(`⬇️ Downloading **${(top.title || query).slice(0, 60)}**...`, { parseMode: "markdown" });
+      await status.update(`⬇️ Downloading **${(top.title || query).slice(0, 50)}** 0%...`, { parseMode: "markdown" });
       let tunnelUrl;
       // Primary: Payperks API
       try {
-        tunnelUrl = await payperksFetch(videoUrl, "mp3");
+        tunnelUrl = await payperksFetch(videoUrl, "mp3", "1440p", {
+          onProgress: async (pct) => {
+            try { await status.update(`⬇️ Downloading **${(top.title || query).slice(0, 50)}** ${pct}%...`, { parseMode: "markdown" }); } catch {}
+          },
+        });
       } catch (pe) {
         console.error("[Payperks] Music by name failed, trying FastSaver:", pe?.message);
         tunnelUrl = await ytDownloadUrl(videoUrl, "audio", apiKey);
@@ -4662,11 +4716,15 @@ async function startServer() {
       const top = results[0];
       if (!top) { await effectiveStatus.fail("No results found."); return; }
       const videoUrl = `https://www.youtube.com/watch?v=${top.video_id}`;
-      await effectiveStatus.update(HS.musicDl());
+      await effectiveStatus.update(`⬇️ Downloading **${top.title.slice(0, 50)}** 0%...`, { parseMode: "markdown" });
       let tunnelUrl;
       // Primary: Payperks API
       try {
-        tunnelUrl = await payperksFetch(videoUrl, "mp3");
+        tunnelUrl = await payperksFetch(videoUrl, "mp3", "1440p", {
+          onProgress: async (pct) => {
+            try { await effectiveStatus.update(`⬇️ Downloading **${top.title.slice(0, 50)}** ${pct}%...`, { parseMode: "markdown" }); } catch {}
+          },
+        });
       } catch (pe) {
         addLog(`[Payperks] Music cmd fallback to FastSaver: ${pe?.message}`, "warn");
         tunnelUrl = await ytDownloadUrl(videoUrl, "audio", apiKey);
@@ -4701,11 +4759,15 @@ async function startServer() {
       if (!top) { await effectiveStatus.fail("No results found."); return; }
       const videoUrl = `https://www.youtube.com/watch?v=${top.video_id}`;
       const limits = getVideoDownloaderLimits(cfg || {});
-      await effectiveStatus.update(`⬇️ Downloading **${top.title}**...`, { parseMode: "markdown" });
+      await effectiveStatus.update(`⬇️ Downloading **${top.title.slice(0, 50)}** 0%...`, { parseMode: "markdown" });
       // Primary: Payperks API; FastSaver fallback
       let tunnelUrl;
       try {
-        tunnelUrl = await payperksFetch(videoUrl, "mp4", "1440p");
+        tunnelUrl = await payperksFetch(videoUrl, "mp4", "1440p", {
+          onProgress: async (pct) => {
+            try { await effectiveStatus.update(`⬇️ Downloading **${top.title.slice(0, 50)}** ${pct}%...`, { parseMode: "markdown" }); } catch {}
+          },
+        });
       } catch (pe) {
         addLog(`[Payperks] Song video fallback to FastSaver: ${pe?.message}`, "warn");
         tunnelUrl = await ytDownloadUrl(videoUrl, "720p", apiKey);
