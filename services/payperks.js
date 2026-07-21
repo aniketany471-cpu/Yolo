@@ -60,13 +60,22 @@ function sleep(ms) {
  * @param {string} [quality]  e.g. "1440p", "720p" (ignored for mp3)
  * @returns {Promise<string>} Direct download URL ready to stream
  */
-export async function payperksFetch(url, fmt = "mp4", quality = "1440p") {
+/**
+ * @param {string} url         Full YouTube URL
+ * @param {"mp3"|"mp4"} fmt    "mp3" for audio, "mp4" for video
+ * @param {string} [quality]   e.g. "1440p", "720p" (ignored for mp3)
+ * @param {object} [opts]
+ * @param {function} [opts.onProgress]  Called with integer 0-100 as job progresses
+ * @returns {Promise<string>} Direct download URL ready to stream
+ */
+export async function payperksFetch(url, fmt = "mp4", quality = "1440p", { onProgress } = {}) {
   const isAudio = fmt === "mp3";
   const qs = isAudio
     ? `url=${encodeURIComponent(url)}&format=mp3&async=1`
     : `url=${encodeURIComponent(url)}&format=mp4&quality=${quality}&async=1`;
   const apiUrl = `${BASE}/api/?${qs}`;
 
+  onProgress?.(5);
   const initRes = await httpGet(apiUrl);
   const init = initRes.body;
 
@@ -79,7 +88,7 @@ export async function payperksFetch(url, fmt = "mp4", quality = "1440p") {
   // Synchronous response — direct download URL (no polling needed)
   if (!init.async) {
     const dlUrl = init.download_url || init.url || init.file_url;
-    if (dlUrl) return dlUrl;
+    if (dlUrl) { onProgress?.(100); return dlUrl; }
     throw new Error("Payperks: sync response missing download_url");
   }
 
@@ -90,6 +99,10 @@ export async function payperksFetch(url, fmt = "mp4", quality = "1440p") {
 
   for (let i = 0; i < MAX_POLLS; i++) {
     await sleep(POLL_INTERVAL_MS);
+    // Report progress: 10 % base + up to 85 % across polls
+    const pct = Math.min(10 + Math.round((i / MAX_POLLS) * 75), 85);
+    onProgress?.(pct);
+
     let pollRes;
     try {
       pollRes = await httpGet(statusUrl);
@@ -103,7 +116,7 @@ export async function payperksFetch(url, fmt = "mp4", quality = "1440p") {
 
     if (status === "completed" || status === "done" || status === "ready" || status === "success") {
       const dlUrl = b.download_url || b.url || b.file_url || b.link;
-      if (dlUrl) return dlUrl;
+      if (dlUrl) { onProgress?.(100); return dlUrl; }
       throw new Error("Payperks: job completed but no download_url in response");
     }
 
