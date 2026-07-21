@@ -197,7 +197,7 @@ export function isMusicByNameRequest(text = "") {
 /** Strip intent/filler words to get the song query from a by-name request. */
 export function extractSongQuery(text = "") {
   return String(text)
-    .replace(/\b(download|mp3|audio|send me|send|play|bajao|bhej|bhejo|gaana|gana|music|song|track|please|plz|pls|kar|karo|de de|dedo|de|do|fast|jaldi)\b/gi, "")
+    .replace(/\b(download|mp3|mp4|audio|video|clip|send me|send|play|bajao|bhej|bhejo|gaana|gana|music|song|track|please|plz|pls|kar|karo|de de|dedo|de|do|fast|jaldi|in|as)\b/gi, "")
     .replace(/https?:\/\/\S+/g, "")
     .trim()
     .replace(/\s+/g, " ");
