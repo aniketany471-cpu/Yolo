@@ -1103,10 +1103,13 @@ async function maybeHandleFastSaver({ client, message, config, myId }) {
   if (wantsSongVideo) {
     const query = extractSongQuery(textRaw);
     if (query && query.length >= 2) {
+      // Append "official video" so search returns the real music video,
+      // not the audio-only / album-art upload that YouTube Music serves.
+      const videoQuery = `${query} official video`;
       const status = new SmartStatus(client, message.chatId, false, message.id);
       try {
         await status.update(`🔍 Searching for **${query.slice(0, 60)}**...`, { parseMode: "markdown" });
-        const results = await ytSearch(query, apiKey);
+        const results = await ytSearch(videoQuery, apiKey);
         if (!results || results.length === 0) {
           await status.finish(`❌ No results found for "${query}".`, { parseMode: undefined, replyTo: message.id });
           return true;
