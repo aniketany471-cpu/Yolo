@@ -1098,36 +1098,29 @@ async function maybeHandleFastSaver({ client, message, config, myId }) {
     }
   }
 
-  // ── Case 3a: "download X song in video/mp4" → search + mp4 download ─────────
+  // ── Case 3a: "download X song in video/mp4" → search + real video download ───
   const wantsSongVideo = !ytUrl && !igUrl && /\b(video|mp4|clip)\b/i.test(textRaw) && isMusicByNameRequest(textRaw) && apiKey;
   if (wantsSongVideo) {
     const query = extractSongQuery(textRaw);
     if (query && query.length >= 2) {
-      // Append "official video" so search returns the real music video,
-      // not the audio-only / album-art upload that YouTube Music serves.
-      const videoQuery = `${query} official video`;
       const status = new SmartStatus(client, message.chatId, false, message.id);
       try {
         await status.update(`🔍 Searching for **${query.slice(0, 60)}**...`, { parseMode: "markdown" });
-        const results = await ytSearch(videoQuery, apiKey);
+        // Search with "official music video" to get real video uploads
+        const results = await ytSearch(`${query} official music video`, apiKey);
         if (!results || results.length === 0) {
           await status.finish(`❌ No results found for "${query}".`, { parseMode: undefined, replyTo: message.id });
           return true;
         }
-        const top = results[0];
+        // Filter out audio-only / lyric-video uploads — these are static-image mp4s
+        const AUDIO_ONLY_RE = /\b(official\s+audio|audio\s+only|lyrics?(\s+video)?|visuali[sz]er|topic)\b/i;
+        const videoResults = results.filter(r => !AUDIO_ONLY_RE.test(r.title || ""));
+        const top = videoResults.length > 0 ? videoResults[0] : results[0];
         const videoUrl = `https://www.youtube.com/watch?v=${top.video_id}`;
-        await status.update(`⬇️ Downloading **${(top.title || query).slice(0, 50)}** 0%...`, { parseMode: "markdown" });
-        let tunnelUrl;
-        try {
-          tunnelUrl = await payperksFetch(videoUrl, "mp4", "1440p", {
-            onProgress: async (pct) => {
-              try { await status.update(`⬇️ Downloading **${(top.title || query).slice(0, 50)}** ${pct}%...`, { parseMode: "markdown" }); } catch {}
-            },
-          });
-        } catch (pe) {
-          console.error("[Payperks] Song-video by name failed, trying FastSaver:", pe?.message);
-          tunnelUrl = await ytDownloadUrl(videoUrl, "720p", apiKey);
-        }
+        await status.update(`⬇️ Downloading **${(top.title || query).slice(0, 50)}**...`, { parseMode: "markdown" });
+        // Use FastSaver video endpoint directly — Payperks mp4 silently returns
+        // audio+thumbnail for music tracks (no error, but wrong output).
+        const tunnelUrl = await ytDownloadUrl(videoUrl, "720p", apiKey);
         const tmpPath = path.join(videoDir, `songvid_${Date.now()}.mp4`);
         await status.update("📦 Saving video...", { parseMode: undefined });
         await streamToFile(tunnelUrl, tmpPath);
@@ -1141,10 +1134,10 @@ async function maybeHandleFastSaver({ client, message, config, myId }) {
           forceDocument: false,
         });
         fs.remove(tmpPath).catch(() => {});
-        addLog(`[Payperks] Song video sent: ${(top.title || query).slice(0, 60)}`, "success");
+        addLog(`[FastSaver] Song video sent: ${(top.title || query).slice(0, 60)}`, "success");
         return true;
       } catch (e) {
-        console.error("[Payperks] Song video by name failed:", e?.message);
+        console.error("[FastSaver] Song video by name failed:", e?.message);
         try { await status.finish("", { parseMode: undefined }); } catch (_) {}
         return false;
       }
