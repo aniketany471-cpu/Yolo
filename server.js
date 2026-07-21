@@ -36,6 +36,7 @@ import { buildLinkContext } from "./services/linkReader.js";
 import { fetchSportsContext } from "./services/sportsReader.js";
 import { DEFAULT_TTS_CONFIG, generateTTSFile } from "./services/tts.js";
 import { ytInfo, ytSearch, ytDownloadUrl, streamToFile, pickVideoFormat, extractYouTubeUrl, extractInstagramUrl, igFetch, hasDownloadIntent, isMusicByNameRequest, extractSongQuery } from "./services/fastSaver.js";
+import { payperksFetch } from "./services/payperks.js";
 // Image service — loaded dynamically so a missing/broken module never crashes the bot
 let ziGenerateImage = null;
 let ziParseImageModelKeyword = null;
@@ -1025,28 +1026,37 @@ async function maybeHandleFastSaver({ client, message, config, myId }) {
     }
     const status = new SmartStatus(client, message.chatId, false, message.id);
     try {
-      await status.update("⬇️ Fetching video info...", { parseMode: undefined });
-      const info = await ytInfo(ytUrl, apiKey);
-      const fmt = pickVideoFormat(info.formats || [], limits.maxFileSizeMb);
-      await status.update(`⬇️ Downloading **${(info.title || "video").slice(0, 60)}** (${fmt})...`, { parseMode: "markdown" });
-      const tunnelUrl = await ytDownloadUrl(ytUrl, fmt, apiKey);
+      await status.update("⬇️ Downloading video...", { parseMode: undefined });
       const tmpPath = path.join(videoDir, `yt_${Date.now()}.mp4`);
+      let tunnelUrl, info;
+      // Primary: Payperks API
+      try {
+        tunnelUrl = await payperksFetch(ytUrl, "mp4", "1440p");
+      } catch (pe) {
+        console.error("[Payperks] YT video failed, trying FastSaver:", pe?.message);
+        if (!apiKey) throw new Error("⚙️ No download API configured. Set fastSaverKey in Settings.");
+        await status.update("⬇️ Fetching video info...", { parseMode: undefined });
+        info = await ytInfo(ytUrl, apiKey);
+        const fmt = pickVideoFormat(info.formats || [], limits.maxFileSizeMb);
+        await status.update(`⬇️ Downloading **${(info.title || "video").slice(0, 60)}** (${fmt})...`, { parseMode: "markdown" });
+        tunnelUrl = await ytDownloadUrl(ytUrl, fmt, apiKey);
+      }
       await streamToFile(tunnelUrl, tmpPath);
       const targetPeer = await status.getChat();
       try { if (status.messageId) await client.deleteMessages(targetPeer, [status.messageId], { revoke: true }); } catch (_) {}
-      const dur = info.duration || 0;
+      const dur = info?.duration || 0;
       await client.sendFile(targetPeer, {
         file: tmpPath,
-        caption: `🎬 **${(info.title || "").slice(0, 200)}**\n👤 ${info.author || ""} · ⏱ ${Math.floor(dur / 60)}:${String(dur % 60).padStart(2, "0")}`,
+        caption: `🎬 **${((info?.title || "Video")).slice(0, 200)}**${info?.author ? `\n👤 ${info.author}` : ""}${dur ? ` · ⏱ ${Math.floor(dur / 60)}:${String(dur % 60).padStart(2, "0")}` : ""}`,
         parseMode: "markdown",
         replyTo: message.id,
         forceDocument: false,
       });
       fs.remove(tmpPath).catch(() => {});
-      addLog(`[FastSaver] YT video sent: ${(info.title || ytUrl).slice(0, 60)}`, "success");
+      addLog(`[Payperks] YT video sent: ${(info?.title || ytUrl).slice(0, 60)}`, "success");
       return true;
     } catch (e) {
-      console.error("[FastSaver] YT download failed:", e?.message);
+      console.error("[Payperks/FastSaver] YT download failed:", e?.message);
       await status.finish(`❌ Download failed: ${(e?.message || "unknown error").slice(0, 100)}`, { parseMode: undefined, replyTo: message.id });
       return true;
     }
@@ -1103,7 +1113,14 @@ async function maybeHandleFastSaver({ client, message, config, myId }) {
       const top = results[0];
       const videoUrl = `https://www.youtube.com/watch?v=${top.video_id}`;
       await status.update(`⬇️ Downloading **${(top.title || query).slice(0, 60)}**...`, { parseMode: "markdown" });
-      const tunnelUrl = await ytDownloadUrl(videoUrl, "audio", apiKey);
+      let tunnelUrl;
+      // Primary: Payperks API
+      try {
+        tunnelUrl = await payperksFetch(videoUrl, "mp3");
+      } catch (pe) {
+        console.error("[Payperks] Music by name failed, trying FastSaver:", pe?.message);
+        tunnelUrl = await ytDownloadUrl(videoUrl, "audio", apiKey);
+      }
       const tmpPath = path.join(musicDir, `fs_${Date.now()}.mp3`);
       await streamToFile(tunnelUrl, tmpPath);
       const targetPeer = await status.getChat();
@@ -4446,7 +4463,14 @@ async function startServer() {
       // Kick off async download — client gets the id immediately
       (async () => {
         try {
-          const tunnelUrl = await ytDownloadUrl(videoUrl, "audio", apiKey);
+          let tunnelUrl;
+          // Primary: Payperks API
+          try {
+            tunnelUrl = await payperksFetch(videoUrl, "mp3");
+          } catch (pe) {
+            addLog(`[Payperks] Dashboard music fallback to FastSaver: ${pe?.message}`, "warn");
+            tunnelUrl = await ytDownloadUrl(videoUrl, "audio", apiKey);
+          }
           await streamToFile(tunnelUrl, filepath);
           db.prepare(
             "INSERT INTO exports (id, filename, filepath, createdAt, type, status) VALUES (?, ?, ?, ?, ?, ?)"
@@ -4639,7 +4663,14 @@ async function startServer() {
       if (!top) { await effectiveStatus.fail("No results found."); return; }
       const videoUrl = `https://www.youtube.com/watch?v=${top.video_id}`;
       await effectiveStatus.update(HS.musicDl());
-      const tunnelUrl = await ytDownloadUrl(videoUrl, "audio", apiKey);
+      let tunnelUrl;
+      // Primary: Payperks API
+      try {
+        tunnelUrl = await payperksFetch(videoUrl, "mp3");
+      } catch (pe) {
+        addLog(`[Payperks] Music cmd fallback to FastSaver: ${pe?.message}`, "warn");
+        tunnelUrl = await ytDownloadUrl(videoUrl, "audio", apiKey);
+      }
       const tmpPath = path.join(musicDir, `music_${Date.now()}.mp3`);
       await streamToFile(tunnelUrl, tmpPath);
       await effectiveStatus.update(HS.musicProcess());
@@ -4671,8 +4702,14 @@ async function startServer() {
       const videoUrl = `https://www.youtube.com/watch?v=${top.video_id}`;
       const limits = getVideoDownloaderLimits(cfg || {});
       await effectiveStatus.update(`⬇️ Downloading **${top.title}**...`, { parseMode: "markdown" });
-      const fmt = "720p"; // default for song video
-      const tunnelUrl = await ytDownloadUrl(videoUrl, fmt, apiKey);
+      // Primary: Payperks API; FastSaver fallback
+      let tunnelUrl;
+      try {
+        tunnelUrl = await payperksFetch(videoUrl, "mp4", "1440p");
+      } catch (pe) {
+        addLog(`[Payperks] Song video fallback to FastSaver: ${pe?.message}`, "warn");
+        tunnelUrl = await ytDownloadUrl(videoUrl, "720p", apiKey);
+      }
       const tmpPath = path.join(videoDir, `songvid_${Date.now()}.mp4`);
       await streamToFile(tunnelUrl, tmpPath);
       const targetPeer = await effectiveStatus.getChat();
